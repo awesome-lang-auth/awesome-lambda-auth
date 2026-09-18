@@ -694,6 +694,57 @@ Parameters:
   # scripts/build-lambda.sh CONFIG_FILE=… and named here.
   # -----------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------
+  # The tools surface (D9a): track, notify, the telemetry query and the
+  # router's own documentation pair, mounted BESIDE the api prefix at
+  # ToolsBasePath — the reference's createToolsRouter is a second router the
+  # host mounts wherever it likes, and its swaggerBasePath defaults to /tools.
+  # Every one of the variables below is absent while EnableTools is "false",
+  # so an unconfigured stack loads the same configuration it loaded before
+  # this block existed and pays nothing new: the three stores are partitions
+  # of the one table, and the IAM statement below already grants every action
+  # they use. What the block adds when on is one telemetry write per identity
+  # event and one outbound request per matching webhook (docs/cost-model.md
+  # §2.6). The SSE stream is NOT mounted on this runtime whatever the
+  # configuration says — API Gateway buffers the response and cuts it at 29
+  # seconds, which is a reconnect loop that bills, not SSE — and the
+  # transport that carries it is D9c's Function URL (docs/config-reference.md
+  # §17.3).
+  EnableTools:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_TOOLS_ENABLED. "true" mounts POST <ToolsBasePath>/track,
+      POST <ToolsBasePath>/notify and GET <ToolsBasePath>/telemetry behind
+      ToolsAuth, hands the auth core an event bus, and bridges every identity.*
+      event it raises into the telemetry store and every matching outgoing
+      webhook. It also switches the telemetry and webhook stores on, because
+      both are required by the block's own defaults. Off by default.
+  ToolsAuth:
+    Type: String
+    Default: session
+    AllowedValues: [session, apiKey]
+    Description: >-
+      AWESOME_AUTH_TOOLS_AUTH — who may reach the guarded tools routes.
+      "session" is the adapter's own middleware, so a tools call is
+      authenticated exactly as an API call is; "apiKey" is the core's API-key
+      guard over the API-key store, which this parameter also switches on, for
+      a caller that is a service rather than a person. The reference's default,
+      "none", is deliberately not offered here: it lets an anonymous caller
+      attribute an event to any user and have this deployment POST it to third
+      parties in its own name (docs/config-reference.md §17.6). A document in
+      ConfigFile can still say it, by name. "admin" arrives with the admin
+      console (D8).
+  ToolsBasePath:
+    Type: String
+    Default: /tools
+    AllowedPattern: '^/[A-Za-z0-9._~/-]*$'
+    Description: >-
+      AWESOME_AUTH_TOOLS_BASE_PATH — where the tools router mounts, as a
+      sibling of ApiPrefix and never under it. The Angular demo mounts it at
+      <apiPrefix>/tools; set this to "/auth/tools" to follow it.
+
   ConfigFile:
     Type: String
     Default: ''
@@ -1210,6 +1261,11 @@ Conditions:
   HasOAuthGoogle: !Not [!Equals [!Ref OAuthGoogleClientId, '']]
   HasOAuthGithub: !Not [!Equals [!Ref OAuthGithubClientId, '']]
   HasAnyOAuthProvider: !Or [!Condition HasOAuthGoogle, !Condition HasOAuthGithub]
+  # The tools block (D9a). The API-key store is switched on only by the
+  # posture that verifies against it, so a session-guarded deployment does not
+  # carry a store nothing reads.
+  ToolsEnabled: !Equals [!Ref EnableTools, 'true']
+  ToolsAuthApiKey: !And [!Condition ToolsEnabled, !Equals [!Ref ToolsAuth, 'apiKey']]
 
   IdpEnabled: !Equals [!Ref EnableIdp, 'true']
   HasIdpIssuer: !Not [!Equals [!Ref IdpIssuer, '']]
@@ -2028,6 +2084,24 @@ Resources:
           AWESOME_AUTH_RS_ENABLED: !Ref EnableResourceServer
           AWESOME_AUTH_RS_JWKS_URL: !If [ResourceServerEnabled, !Ref ResourceServerJwksUrl, !Ref 'AWS::NoValue']
           AWESOME_AUTH_RS_ISSUER: !If [HasResourceServerIssuer, !Ref ResourceServerIssuer, !Ref 'AWS::NoValue']
+
+          # --- the tools surface -----------------------------------------
+          # Every variable here is absent while EnableTools is "false" (see
+          # the parameter). Inbound webhooks are written off explicitly
+          # because the schema defaults them ON, as the reference does, and
+          # RS-15 refuses that until the script runner (D9d) exists: the
+          # config layer will not silently override a default, so the
+          # template says the line the document would have to say.
+          AWESOME_AUTH_TOOLS_ENABLED: !Ref EnableTools
+          AWESOME_AUTH_TOOLS_AUTH: !If [ToolsEnabled, !Ref ToolsAuth, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_BASE_PATH: !If [ToolsEnabled, !Ref ToolsBasePath, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, 'false', !Ref 'AWS::NoValue']
+          # The two stores the block's defaults require, and the third the
+          # apiKey posture verifies against. All three are partitions of the
+          # one table; no new resource and no new IAM action.
+          AWESOME_AUTH_STORES_ENABLE_TELEMETRY: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_ENABLE_WEBHOOKS: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_ENABLE_API_KEYS: !If [ToolsAuthApiKey, 'true', !Ref 'AWS::NoValue']
 
           # --- migration from Amazon Cognito -----------------------------
           # The source is derived from the pool id rather than being a parameter

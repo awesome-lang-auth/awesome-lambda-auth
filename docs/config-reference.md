@@ -186,28 +186,28 @@ its `SETTINGS` one, the memory driver holds both per execution environment (§5.
 start, by name — a store gap rather than a phase gap.
 
 
-### 4.1 Five `stores.enable.*` flags are real switches now, and one still refuses
+### 4.1 All six optional `stores.enable.*` flags are real switches now
 
-`stores.enable.metadata`, `.rbac`, `.tenants`, `.apiKeys` and `.webhooks` are
-accepted on both drivers since the admin surface, and each one now changes what
-the deployment does: the `admin` slot of the composition root hands the flagged
-store to the core by name (`auth.WithMetadataProvider`, `WithRBACProvider`,
-`WithTenantProvider`, `WithAPIKeyStore`, `WithWebhookStore`), and the console's
-tab for it is drawn — `GET <admin>/api/ping` reports `roles`, `tenants`,
-`metadata`, `apiKeys` and `webhooks` true exactly when the flag is (§16.4). One
-of them reaches an auth route too: with `stores.enable.metadata` on, the profile
-`GET <prefix>/me` renders carries the user's metadata, which is the reference's
-own behaviour with a metadata store passed. The flags default to **off**, so a
-document that says nothing draws no extra tab and reads no extra store.
+`stores.enable.metadata`, `.rbac`, `.tenants`, `.apiKeys`, `.webhooks` and
+`.telemetry` are all accepted on both drivers.
 
-`stores.enable.telemetry` is still refused by `checkStoreSupport` on both
-drivers, on the same rule the other five used to fall under: the DynamoDB store
-implements it, but the telemetry store reaches a route only through the tools
-router's `ToolsOptions.TelemetryStore`, which the `tools` block hands over. Until
-it does, the flag would validate, start cleanly and do nothing — the exact
-misconfiguration §1.17 exists to refuse — so `driverStores` keeps answering the
-narrower question it has always answered, "does turning the flag on change what
-the deployment does", and the refusal names the driver rather than shrugging.
+The admin surface handed five of them over (§16): the `admin` slot of the
+composition root hands the flagged store to the core by name
+(`auth.WithMetadataProvider`, `WithRBACProvider`, `WithTenantProvider`,
+`WithAPIKeyStore`, `WithWebhookStore`), and the console's tab for it is drawn —
+`GET <admin>/api/ping` reports `roles`, `tenants`, `metadata`, `apiKeys` and
+`webhooks` true exactly when the flag is (§16.4). One of them reaches an auth
+route too: with `stores.enable.metadata` on, the profile `GET <prefix>/me`
+renders carries the user's metadata, which is the reference's own behaviour with
+a metadata store passed. The flags default to **off**, so a document that says
+nothing draws no extra tab and reads no extra store.
+
+The tools block (§17) handed over `.telemetry`, `.webhooks` and `.apiKeys`:
+the telemetry store is what `track` and the bridge write and `GET <tools>/telemetry`
+reads, the webhook store is what every event is matched against for outgoing
+delivery, and the API-key store is what `tools.auth: apiKey` verifies against.
+Both drivers back all six — the memory driver per execution environment, as
+it backs everything.
 
 The three admin listers and the two profile flag writers need no flag at all
 and have none: `AdminUserStore`, `SessionLister`, `RoleLister`,
@@ -2031,3 +2031,329 @@ the default driver is `memory`, which RS-12 forbids in production.
   }
 }
 ```
+
+## 17. `tools.*`, knob by knob
+
+The tools surface: `POST <tools>/track/{eventName}`, `POST <tools>/notify/{target}`,
+`GET <tools>/telemetry`, and the router's own documentation pair — the
+reference's `createToolsRouter` (`src/router/tools.router.ts`), which is a
+**second router the host mounts beside the first** (`:114`), not a path under
+the api prefix. This port mounts it where the reference's own
+`swaggerBasePath` default says (`:127`): `tools.basePath`, `/tools`. Every
+route comes from the imported adapter and nothing in this binary mounts one;
+`cmd/auth/tools.go` builds `HTTPConfig.Tools` and the `AuthTools` facade behind
+it, and — new with this block — the **event bus**, which is what makes the auth
+core publish its `identity.*` events at all.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `tools.enabled` | boolean | `false` | `AWESOME_AUTH_TOOLS_ENABLED` |
+| `tools.auth` | `none` / `session` / `apiKey` / `admin` | `none` — **warned at deploy time**; see §17.6 | `AWESOME_AUTH_TOOLS_AUTH` |
+| `tools.basePath` | absolute path | `/tools` | `AWESOME_AUTH_TOOLS_BASE_PATH` |
+| `tools.telemetry.enabled` | boolean | `true` — mounts `track`, and the query when `stores.enable.telemetry` is on | `AWESOME_AUTH_TOOLS_TELEMETRY` |
+| `tools.notify.enabled` | boolean | `true` | `AWESOME_AUTH_TOOLS_NOTIFY` |
+| `tools.stream.enabled` | boolean | `true` — **honoured by nothing on this runtime**, §17.3 | `AWESOME_AUTH_TOOLS_STREAM` |
+| `tools.sse.enabled` | boolean | `false` — builds the in-process manager, which nothing listens to yet, §17.3 | `AWESOME_AUTH_SSE_ENABLED` |
+| `tools.sse.heartbeatIntervalMs` / `.deduplicate` | int / boolean | `30000` / `true` — passed to the manager | `AWESOME_AUTH_TOOLS_SSE_HEARTBEAT_INTERVAL_MS`, `…_DEDUPLICATE` |
+| `tools.sse.distributor.*` | block | `type: none` — **anything else is refused (RS-14)**, §17.3 | — (file-only) |
+| `tools.inboundWebhooks.enabled` | boolean | `true` — **refused (RS-15); write `false`**, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS` |
+| `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — mapped onto the core's `ScriptTimeout` for D9d | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
+| `tools.outboundWebhooks.payloadVersion` | string | `"1"` — the `version` member of every delivered envelope | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION` |
+| `tools.outboundWebhooks.defaults.maxRetries` / `.retryDelayMs` | int | `3` / `1000` — applied to every subscription row that carries no value of its own, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES`, `…_RETRY_DELAY_MS` |
+
+Three stores are consumed, each behind its `stores.enable.*` flag and each now
+listed by `driverStores` for both drivers (§4.1): `telemetry` (what track and
+the bridge write, what the query reads; **required** by `tools.telemetry.enabled`),
+`webhooks` (what every event is matched against for outgoing delivery), and
+`apiKeys` (**required** by `tools.auth: apiKey`). Subscription rows and API
+keys are *data* in those stores, written by the admin API (D8), not
+configuration.
+
+The smallest document that loads on this build, and why each line is there:
+
+```json
+{
+  "tools": {
+    "enabled": true,
+    "auth": "session",
+    "inboundWebhooks": {"enabled": false}
+  },
+  "stores": {"enable": {"telemetry": true, "webhooks": true}}
+}
+```
+
+`auth: session` because the default is the reference's open door (§17.6);
+`inboundWebhooks.enabled: false` because the default is `true` and RS-15
+refuses it until a script runner exists (§17.5); `telemetry` because
+`tools.telemetry.enabled` defaults to `true` and the query route has to have a
+store; `webhooks` because a bridge with nowhere to look up subscriptions
+delivers to nobody.
+
+### 17.1 What the cold start tells you
+
+`tools surface mounted` names the mount, the posture, which of the three stores
+are behind it, which feature routes are on, and — in two lines that exist
+precisely so nobody has to discover them from behaviour — that the stream is
+**not mounted on this runtime** and that outgoing webhooks are **best-effort
+until D9b**. `tools surface not mounted`, the default, says that no bus is
+built either, so the core's `identity.*` events go nowhere.
+
+`the tools routes are unguarded` is the warning for `tools.auth: none`, and
+repeats the price §17.6 puts on it. `the SSE manager reaches no connection on
+this runtime` is what `tools.sse.enabled: true` gets. And the unwired-knob
+report names `tools.stream.enabled` on every tools deployment (and
+`tools.sse.enabled` when set), with the same remedy: leave them, D9c makes them
+live.
+
+### 17.2 The bridge: the core's own events reach the sinks
+
+This is the block's substantive decision, and it is registered
+(`library-events-are-bridged-into-the-tools-fan-out`).
+
+The imported core publishes twenty-three `identity.*` events — a login, a
+failed login, a logout, a rotation, an account created, deleted, linked, and so
+on — onto the bus this block now hands it. By the core's default those events
+reach the bus and **stop**: the `AuthTools` facade's four sinks (the telemetry
+store, the bus, the SSE manager, the outgoing webhooks) are fed by `Track` and
+by nothing else, exactly as in the reference, and the core names the
+consequence *the monitoring gap* — "a deployment can believe it is receiving
+login failures and not be".
+
+This product closes it. With `tools.enabled`, **every event the core raises is
+fanned out exactly as a tracked event is**: persisted to the telemetry store
+when one is enabled, and delivered to every outgoing webhook whose `events`
+list names it, with the same envelope, headers and signature a tracked event
+gets. One login is one telemetry row and one delivery per matching
+subscription. A subscription on `identity.auth.login.failed` receives failed
+logins; `GET <tools>/telemetry?event=identity.auth.login.success` lists logins.
+
+How it is done matters, because the obvious way is wrong. The core exposes
+`AuthTools.Bridge` for this, and it is deliberately **not** used: `Bridge` is a
+wildcard subscription on the facade's own bus, the one `Track` publishes on at
+its second step, so it hears `Track`'s own publication and records **every**
+tracked event twice under two ids — not only events tracked under an
+`identity.*` name, every event `POST <tools>/track` ever tracks. The first
+version of this block did that and its own tests found it. Instead the product
+keeps **two buses**: the core is handed one, the facade is built on a private
+one nothing subscribes to, and a single wildcard subscription on the core's bus
+calls `Track` with the event's own name, payload and identifiers. No loop is
+possible and nothing is doubled. The two buses are both exported for a host
+embedding the package — `App.Events` carries what the library raised,
+`App.Tools.Events` carries everything that was fanned out.
+
+What it costs: one telemetry `PutItem` per `identity.*` event, awaited on the
+request goroutine (about a millisecond against DynamoDB Local, single-digit
+milliseconds in a region), and one outgoing delivery per matching subscription.
+`docs/cost-model.md` §2.6 has the arithmetic.
+
+### 17.3 The stream is not mounted on this runtime
+
+`GET <tools>/stream` answers **404 in every configuration**, whatever
+`tools.stream.enabled` says. This is the registered deviation
+`tools-stream-is-not-mounted-on-api-gateway`, and the reason is the transport,
+not the route.
+
+Server-Sent Events is a response that stays open. API Gateway — the REST API
+and the HTTP API alike — buffers the integration response and enforces a
+29-second integration timeout, so behind it the route would be a response that
+ends every 29 seconds carrying whatever had been buffered. `EventSource`, the
+browser client the reference wrote the route for, reconnects on a dropped
+connection automatically and forever. The steady state would be a reconnect
+loop delivering frames late and in batches while billing a held-open invocation
+per client per 29 seconds — `docs/cost-model.md` §3.1 prices a connection-hour
+at USD 0.024 at 512 MB. That is not SSE, and it is not a degraded SSE either; it
+is a spinner that bills.
+
+So the route is off, and 404 is chosen over any other answer because it is the
+reference's own answer for a route the host did not mount, and because it is
+the one status `EventSource` treats as terminal: the specification fails the
+connection on any status but 200 and does not reconnect. A client learns the
+absence at once.
+
+**`tools.sse.distributor` of any type but `none` is refused at cold start
+(RS-14).** On Lambda a distributor is not an optimisation but the whole feature:
+every concurrent invocation is its own process, so a manager without one
+reaches only the connections of the environment that happened to serve the
+tracking request — which is almost never the environment serving a stream —
+and nothing says so. A document that names `redis` or `sns` has asked for
+cross-instance delivery this build cannot provide, and refusing it is what
+keeps that from being discovered by watching one stream miss events. The rule
+fires under `tools.enabled` whether or not `tools.sse.enabled` is set, because
+the type is the statement of intent.
+
+`tools.sse.enabled: true` is honoured as far as it goes: the in-process manager
+is built, `Track` and `Notify` broadcast into it, and the cold start says that
+nothing is listening. It is not refused, because the manager costs nothing and
+D9c makes it reach somebody.
+
+**What D9c brings:** the stream on a Lambda Function URL with response
+streaming, its own function at its own memory size (the cost model says why),
+and a distributor, mandatory there. That block clears the unconditional
+`DisableStream`, adds the distributor, retires RS-14 and retires the deviation.
+
+### 17.4 Outgoing webhooks: delivered now, best-effort until D9b
+
+Subscriptions live in the webhook store — rows with a `url`, an `events` list,
+a `secret`, and optional `maxRetries` and `retryDelayMs` — written by the admin
+API and matched on every event, tracked or bridged. A delivery is the reference's
+wire exactly: one POST with the envelope
+`{event, timestamp, data, metadata, version}`, headers `X-Webhook-Event`,
+`X-Webhook-Delivery`, `X-Webhook-Timestamp` and, with a secret,
+`X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the body>`. `version` is
+`tools.outboundWebhooks.payloadVersion`. The client is the same correlating
+client every outbound call of this binary goes through, so a delivery carries
+the caller's `X-Correlation-Id`.
+
+`tools.outboundWebhooks.defaults.maxRetries` and `.retryDelayMs` are applied
+to every row that carries **no value of its own** — the row's own value wins,
+which is what §1.15 of the schema means by "per-webhook rows may override
+them". With the schema defaults, which equal the core's built-in `3` and
+`1000`, the knobs change nothing.
+
+**Delivery is best-effort on this runtime**, and that is the registered
+deviation `outgoing-webhook-delivery-races-the-response`. The core delivers on
+a goroutine detached from the request and writes the response without waiting
+— the reference's fire-and-forget, reproduced — and a Lambda freezes the
+execution environment the moment the response is written. A delivery that has
+not completed by then completes, if that environment is ever thawed, during
+some later invocation; the retry schedule of 1 s, 2 s and 4 s between attempts
+is almost never honoured; and no record of the outcome exists anywhere. A
+receiver that answers within the request's own lifetime gets every delivery;
+one that does not may get it late, once, or not at all. Synchronous delivery on
+the request goroutine was rejected — a slow receiver would be a slow login,
+times the schedule, and the function timeout would still lose the tail.
+
+**What D9b brings:** the core's `WebhookDeliverer` seam — which receives a
+fully built, signed, numbered attempt with no secret in it — implemented as an
+SQS enqueue with a dead-letter queue, and a worker that reproduces the schedule
+from the row's `Retries()` and `RetryDelay()`. One field changes in
+`cmd/auth/tools.go`; the deviation retires.
+
+### 17.5 Inbound webhooks are refused until a runner exists
+
+`tools.inboundWebhooks.enabled` defaults to `true`, because the reference
+mounts `POST <tools>/webhook/{provider}` by default, and **a tools document
+that leaves it there is refused at cold start (RS-15)**. It has to say
+`tools.inboundWebhooks.enabled: false` to load. That is the registered
+deviation `inbound-webhooks-are-refused-without-a-runner`.
+
+The reason is what the route does with a subscription row's `jsScript`. The
+reference runs it in an in-process `vm`; the imported core will not
+(`inbound-webhook-script-runs-out-of-process`) and hands script, body and
+action allowlist across an `InboundScriptRunner` seam it fails **closed**
+without: `400`, nothing tracked. Every webhook provider treats a non-2xx as
+undelivered and redelivers — for hours, some for days — so a deployment that
+came up with the route mounted and no runner would answer a retry storm from
+the first event. A row with no script is no better served: the alternative
+handler, `OnWebhook`, is a host callback this product has no configuration
+path into, so such a row would be acknowledged and dropped. Refusing, and
+naming the line to write, is the honest answer; silently overriding the
+default to `false` would be a document that says one thing and deploys
+another.
+
+`tools.inboundWebhooks.scriptTimeoutMs` is mapped onto the core's
+`ScriptTimeout` regardless, and the webhook store is already handed to the
+route as its `InboundWebhookStore`, so the day the runner lands the change is
+one field.
+
+**What D9d brings:** the runner as a Lambda of its own whose IAM role *is* the
+sandbox — the script gets the permissions the role has and no others — invoked
+across the seam with the timeout this knob sets. RS-15 and the deviation
+retire together.
+
+### 17.6 The four postures, priced
+
+The core mounts nothing until the host has said who may reach the guarded
+routes (`tools-router-requires-an-explicit-guard-decision`), and this product
+says it from `tools.auth`. The guard covers track, notify and the telemetry
+query — the routes the reference spreads its `...protect` onto
+(`tools.router.ts:141, :166, :227`) — and **not** the documentation pair, which
+the reference registers with no guard (`:333, :348`) and which therefore
+answers anyone who can reach the mount whenever `docs.swagger` resolves on
+(§12.1 — the same knob, the same `auto`).
+
+**`session`** — the ordinary posture, and the one the SAM template defaults to.
+The guard is the adapter's own middleware, the same one `GET <prefix>/sessions`
+sits behind: a bearer access token or the access-token cookie, verified through
+the core, with the principal put on the request so that a `track` body naming
+no `userId` is attributed to whoever made the call. A tools call is
+authenticated exactly as an API call is.
+
+**`apiKey`** — for a caller that is a service rather than a person. The guard is
+the core's `APIKeyMiddleware`: `X-Api-Key: ak_…` or `Authorization: ApiKey ak_…`,
+looked up by prefix and verified by bcrypt against the API-key store, with the
+key's own IP allowlist and expiry honoured. It requires `stores.enable.apiKeys`
+(`STORE`), and keys are minted through the admin API (D8) — until that lands, a
+posture nobody holds a key for is a guard nobody can pass, which is safe and is
+also a surface that answers `401` to everyone. The core's refusal is a bare
+`401 unauthorized`, not the auth router's envelope.
+
+**`none`** — the reference's own default, asked for by name
+(`auth.ToolsPublic()`), and **warned about at deploy time and at cold start**.
+Priced rather than assumed, because the cost of this door is not smaller than
+the admin console's, only different in kind:
+
+- `POST <tools>/track/{eventName}` takes `userId`, `tenantId` and `sessionId`
+  **from the request body** and only falls back to the principal
+  (`tools.router.ts:143-147`). An anonymous caller therefore attributes an event
+  to any user, and `Track` fans that attribution out to all of the sinks: it is
+  persisted as that user's telemetry, it is broadcast to the SSE connections
+  holding `user:<id>` (none today, §17.3), and **it fires every matching
+  outgoing webhook — the deployment POSTing attacker-chosen content to a third
+  party in its own name, under its own signature, with retries.**
+- `POST <tools>/notify/{target}` broadcasts to any topic. Over HTTP it reaches
+  the SSE channel only — the reference's route never reads `channels`, so mail
+  and SMS are unreachable from the wire (§17.7) — but the topic space is open by
+  construction.
+- `GET <tools>/telemetry` reads every event the store holds, user ids, session
+  ids, client addresses and user agents included.
+
+The client address on a tracked event is not part of that price: it comes from
+the configured seam and never from `X-Forwarded-For`
+(`tools-track-ip-comes-from-the-configured-seam`), so an anonymous caller can
+forge the *who* and not the *where from*.
+
+**`admin`** — the tools routes behind the admin console's own guard. The guard
+is D8's; on this build the posture is **refused at cold start** naming that
+block, and `internal/config` refuses it without `admin.enabled` in any build.
+
+**Rate limiting.** `track` has no name in `rateLimit.scope` (§14.1), and that
+is a decision rather than an omission. The scope vocabulary is "the
+unauthenticated, credential-guessable" flows, and `track` is neither: under
+`session` or `apiKey` it is authenticated, and under `none` the threat is not a
+guessable credential but an open door, which a budget of ten per minute per
+subject does not close — the subject would be the body's own `userId`, which is
+the attacker's to choose, so every guess would get its own budget. The limit
+for `none` is the posture, and the mount: put the tools path on a private
+network path or a WAF rule, or choose a guard. The tools router is also mounted
+bare by the core — no rate-limit constructor is applied to it — so a scope
+name would have to be honoured by a product middleware over the tools path
+rather than by the adapter's slot; nothing prevents that the day a threat model
+asks for it.
+
+### 17.7 What a library caller gets that the wire does not
+
+`App.Tools` is the `AuthTools` facade, exported. Two things are reachable
+through it and not through any route:
+
+- **`Notify`'s email and SMS channels.** The reference's `POST /notify` never
+  reads `channels` (`tools.router.ts:168-176`) — multi-channel notify arrived in
+  1.8.0 and the route was not extended — and the core reproduces that, so over
+  HTTP every notification is SSE-only. The facade's `Mail` and `SMS` are wired
+  anyway, to the same SES and SNS transports the credential routes send on
+  (§5.2), so a host embedding this package sends a user mail or a text with one
+  call. The quirk is also the safer shape: a `channels` array off the wire
+  would let whoever gets past the guard spend the deployment's mail budget.
+- **`Track` under any name.** A host that tracks its own events gets the same
+  fan-out the routes get. Do not track an `identity.*` name from a host that
+  also runs this product's bridge: the bridge forwards the core's events into
+  `Track`, and an `identity.*` event tracked *by the host* is simply a second
+  event with that name, recorded and delivered as such.
+
+### 17.8 What waits for the three blocks that follow
+
+| Block | Seam | What it replaces in `cmd/auth/tools.go` |
+|---|---|---|
+| D9b | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field; retires `outgoing-webhook-delivery-races-the-response` |
+| D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
+| D9d | `InboundScriptRunner` as its own Lambda | `ScriptRunner: nil`, one field; retires RS-15 and `inbound-webhooks-are-refused-without-a-runner` |
