@@ -47,7 +47,17 @@ const (
 	// it unset for the reference demo, which really does run without CSRF.
 	RequireEnv = "AWESOME_AUTH_CONTRACT_REQUIRE"
 
-	defaultPrefix = "/auth"
+	// ToolsPathEnv overrides the tools router's mount point, which is a
+	// sibling of the api prefix and not a path under it: the reference's
+	// createToolsRouter is a second router the host mounts wherever it likes
+	// (tools.router.ts:114) and its own swaggerBasePath defaults to '/tools'
+	// (:127), which is where this port mounts it too (tools.basePath here).
+	// The Angular demo mounts it at <apiPrefix>/tools, so a deployment that
+	// followed it sets this to that.
+	ToolsPathEnv = "AWESOME_AUTH_CONTRACT_TOOLS_PATH"
+
+	defaultPrefix    = "/auth"
+	defaultToolsPath = "/tools"
 )
 
 // Capability is one thing a deployment either offers or does not. It is probed,
@@ -296,7 +306,10 @@ func register(cs ...Case) { registry = append(registry, cs...) }
 type Env struct {
 	BaseURL string
 	Prefix  string
-	Caps    map[Capability]capability
+	// ToolsPath is where the tools router is mounted, beside Prefix rather
+	// than under it. See ToolsPathEnv.
+	ToolsPath string
+	Caps      map[Capability]capability
 }
 
 // URL builds an absolute URL for a path relative to the router mount point.
@@ -306,6 +319,13 @@ func (e *Env) URL(path string) string {
 		return e.BaseURL + path[1:]
 	}
 	return e.BaseURL + e.Prefix + path
+}
+
+// tools spells a path under the tools mount in the form the client takes: an
+// absolute path, because the mount is a sibling of the prefix and URL would
+// otherwise put it underneath.
+func (e *Env) tools(path string) string {
+	return "!" + e.ToolsPath + path
 }
 
 func (e *Env) can(c Capability) bool { return e.Caps[c].state == capOn }
@@ -389,9 +409,14 @@ Override the router mount point with %s (default %q). See test/contract/README.m
 	if prefix == "" {
 		prefix = defaultPrefix
 	}
+	toolsPath := strings.TrimSpace(os.Getenv(ToolsPathEnv))
+	if toolsPath == "" {
+		toolsPath = defaultToolsPath
+	}
 	env := &Env{
-		BaseURL: strings.TrimSuffix(base, "/"),
-		Prefix:  strings.TrimSuffix(prefix, "/"),
+		BaseURL:   strings.TrimSuffix(base, "/"),
+		Prefix:    strings.TrimSuffix(prefix, "/"),
+		ToolsPath: "/" + strings.Trim(toolsPath, "/"),
 	}
 	req := readRequired(t)
 	probe(t, env, req)
