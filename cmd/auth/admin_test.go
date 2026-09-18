@@ -114,7 +114,7 @@ func newAdminSurface(t *testing.T, cfg *config.Config, opts Options, counter rat
 	if err != nil {
 		t.Fatalf("newDelivery: %v", err)
 	}
-	core, err := buildCore(context.Background(), cfg, opts, users, auth.NewMemorySessionStore(), deliver, log)
+	core, err := buildCore(context.Background(), cfg, opts, users, auth.NewMemorySessionStore(), deliver, nil, log)
 	if err != nil {
 		t.Fatalf("buildCore: %v", err)
 	}
@@ -122,7 +122,7 @@ func newAdminSurface(t *testing.T, cfg *config.Config, opts Options, counter rat
 		t.Fatalf("checkAdminMounted: %v", err)
 	}
 	mux := http.NewServeMux()
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log)); err != nil {
+	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), auth.ToolsOptions{}); err != nil {
 		t.Fatalf("mountAuthSurface: %v", err)
 	}
 	logAdminSurface(cfg, httpConfig(cfg), log)

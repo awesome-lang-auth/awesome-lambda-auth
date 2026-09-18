@@ -333,6 +333,118 @@ func WireDeviations() []WireDeviation {
 		// resolving, and nothing replaces it here because a deployment with no
 		// S3 location behaves exactly as the reference does with uploadDir
 		// unset.
+		{
+			ID:      "tools-stream-is-not-mounted-on-api-gateway",
+			Surface: "GET <tools>/stream, and the tools.stream.enabled and tools.sse.distributor knobs behind it",
+			Behaviour: "The stream route is not mounted, in every configuration: HTTPConfig.Tools.DisableStream is set " +
+				"unconditionally, so GET <tools>/stream answers 404 whatever tools.stream.enabled says, and the knob is " +
+				"reported at cold start as one this runtime cannot honour. A tools.sse.distributor of any type but none is " +
+				"refused at cold start (RS-14). tools.sse.enabled is honoured as far as it goes -- the in-process manager " +
+				"is built and Track and Notify broadcast into it -- and the cold start says that nothing is listening. The " +
+				"tools OpenAPI document describes the routes that are mounted and not this one.",
+			Reference: "GET /stream is registered whenever the stream feature is on (tools.router.ts:184-221), which is the " +
+				"default, and serves text/event-stream through SseManager.connect for as long as the client holds the " +
+				"socket; the distributor is an object the host constructs and passes (sse-manager.ts:110-112).",
+			Why: "API Gateway -- the REST API and the HTTP API alike -- buffers the integration response and enforces a " +
+				"29-second integration timeout, so behind it the route would be a response that ends every 29 seconds with " +
+				"whatever had been buffered. EventSource, the client the reference wrote the route for, reconnects on a " +
+				"dropped connection automatically and forever, so the steady state would be a reconnect loop delivering " +
+				"frames late and in batches while billing a held-open invocation per client per 29 seconds " +
+				"(docs/cost-model.md §3.1: USD 0.024 per connection-hour at 512 MB). That is not SSE and not a degraded SSE; " +
+				"it is a spinner that bills. 404 is the reference's own answer for a route the host did not mount, and it is " +
+				"the one status EventSource treats as terminal -- the specification fails the connection on anything but " +
+				"200 and does not reconnect -- so a client learns the absence at once. The distributor is refused rather " +
+				"than ignored because on Lambda it is the whole feature and not an optimisation: every concurrent " +
+				"invocation is its own process, so a manager without one reaches only the environment that happened to " +
+				"serve the tracking request, silently. The transport that makes the route real is a Lambda Function URL " +
+				"with response streaming and a distributor, mandatory there, which is D9c's; that block clears " +
+				"DisableStream, adds WithSseDistributor, retires RS-14 and retires this entry. " +
+				"cmd/auth/tools_test.go TestToolsRoutesComeFromTheAdapter fails the day the route answers.",
+			Spec: "docs/spec/config-schema.md §1.14; docs/config-reference.md §17.3; docs/cost-model.md §3.1; docs/spec/serverless-gap-analysis.md §1.5",
+		},
+		{
+			ID:      "library-events-are-bridged-into-the-tools-fan-out",
+			Surface: "every identity.* event the auth core raises; the telemetry store, GET <tools>/telemetry and every outgoing webhook subscribed to one of those names",
+			Behaviour: "With tools.enabled, every event the core publishes -- a login, a failed login, a logout, a rotation, an " +
+				"account created or deleted, and the rest of the twenty-three -- is fanned out exactly as a tracked event is: " +
+				"persisted to the telemetry store when one is enabled, broadcast to the SSE manager when one is built, and " +
+				"delivered to every matching outgoing webhook with the same envelope, headers and signature a tracked " +
+				"event gets. One login is one telemetry row and one delivery per matching subscription. A tracked event is " +
+				"fanned out once as well.",
+			Reference: "AuthTools is fed by the host calling track and by nothing else: the routers publish onto the event " +
+				"bus and stop, and no part of the package subscribes the bus back into the telemetry store, the stream or " +
+				"the webhooks (src/tools/auth-tools.ts:199-269 against the development line's auth.router.ts:418-433). " +
+				"The published reference publishes no identity events at all. The imported core reproduces that default " +
+				"-- silence -- and exposes AuthTools.Bridge as the opt-in.",
+			Why: "This is a deployment and not a library. An operator who configures an outgoing webhook on " +
+				"identity.auth.login.success expects logins to reach it, and one who enables the telemetry store expects " +
+				"GET <tools>/telemetry to show them; the core names the alternative the monitoring gap -- a deployment can " +
+				"believe it is receiving login failures and not be -- and a product whose documented remedy is one line " +
+				"in the source is not a product. The core's own Bridge is deliberately not used, and the reason is the " +
+				"hazard the core documents on the type, verified here rather than assumed: Bridge is a wildcard " +
+				"subscription on the facade's own bus, the one Track publishes on at step 2, so it hears Track's own " +
+				"publication and records every tracked event twice with two ids -- not merely events tracked under an " +
+				"identity.* name, every event POST <tools>/track ever tracks. The product therefore keeps two buses: the " +
+				"core is handed one, the facade is built on a private one nothing subscribes to, and a single wildcard " +
+				"subscription on the core's bus calls Track with the event's own name, payload and six identifiers. A " +
+				"bridged event and a tracked one are then one kind of thing to every sink, no loop is possible because " +
+				"the only bus with a subscriber is the one Track never publishes on, and nothing is doubled because the " +
+				"only path to the sinks is that subscription. What it gives up is stated: App.Events carries the " +
+				"library's events and App.Tools.Events carries everything fanned out, and the record's timestamp is " +
+				"the fan-out instant rather than the publication instant, microseconds apart on one synchronous chain. " +
+				"cmd/auth/tools_test.go TestBridgeDeliversEachLoginOnce fails the day a login is delivered zero times or " +
+				"twice.",
+			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.6; upstream auth_tools.go (the AuthTools type comment)",
+		},
+		{
+			ID:      "outgoing-webhook-delivery-races-the-response",
+			Surface: "every outgoing webhook delivery, whether the event was tracked or bridged",
+			Behaviour: "Deliveries are made in process by the core's HTTP deliverer, on a goroutine detached from the request, " +
+				"and the response is written without waiting for them. On Lambda the execution environment is frozen the " +
+				"moment the response is written, so a delivery that has not completed by then completes -- if the same " +
+				"environment is ever thawed -- during some later invocation, and the retry schedule of one, two and four " +
+				"seconds between attempts is almost never honoured. A delivery is therefore best-effort: an endpoint that " +
+				"answers within the request's own lifetime receives it, one that does not may receive it late, once, or " +
+				"not at all, and no record of the outcome is kept anywhere.",
+			Reference: "The same code shape on a long-lived process: send is not awaited (src/tools/auth-tools.ts:280) and " +
+				"retries with exponential back-off (src/tools/webhook-sender.ts:18-46), and a Node process that stays up " +
+				"finishes them all.",
+			Why: "Not a decision this product made: the core's WebhookEmitter reproduces the reference's fire-and-forget " +
+				"exactly and its comment says a process that exits drops whatever is in flight; a Lambda freezes rather " +
+				"than exits, which is the same thing on a shorter clock. It is registered rather than left in a comment " +
+				"because wiring the tools block is what makes a delivery happen at all, and an operator reading a " +
+				"receiver's log must be able to learn from the cold-start line why a delivery arrived a minute late or " +
+				"never. The seam the core built for this is WebhookDeliverer, which receives a fully built, signed, numbered " +
+				"attempt with no secret in it; D9b implements it as an SQS enqueue with a dead-letter queue and a worker " +
+				"that reproduces the schedule from Retries() and RetryDelay(), which is when this entry is retired. " +
+				"Delivering synchronously on the request goroutine instead was considered and rejected: it would make a " +
+				"slow receiver a slow login, times the retry schedule, and would still lose the deliveries of the " +
+				"invocation that hit the function timeout.",
+			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.6; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
+		},
+		{
+			ID:      "inbound-webhooks-are-refused-without-a-runner",
+			Surface: "POST <tools>/webhook/{provider}, and the tools.inboundWebhooks.enabled knob behind it",
+			Behaviour: "A tools block with tools.inboundWebhooks.enabled left at its default of true is refused at cold start " +
+				"(RS-15), and the document has to write tools.inboundWebhooks.enabled: false to load. With it off the " +
+				"route is not mounted and answers 404. tools.inboundWebhooks.scriptTimeoutMs is mapped onto the core's " +
+				"ScriptTimeout regardless, so the day the runner lands the knob is already live.",
+			Reference: "The route is mounted by default whenever a webhook store answering findByProvider or an onWebhook " +
+				"callback exists (tools.router.ts:250), and a row's jsScript runs in an in-process vm with a five-second " +
+				"timeout on its synchronous prefix (:269-292).",
+			Why: "The core runs no script in process -- inbound-webhook-script-runs-out-of-process -- and fails closed " +
+				"without an InboundScriptRunner: 400, nothing tracked. That is right for the core and wrong as a deployed " +
+				"outcome, because every webhook provider treats a non-2xx as undelivered and redelivers, for hours and " +
+				"some for days, so a deployment that came up with the route mounted and no runner would answer a retry " +
+				"storm from the first event onwards. A row with no script is no better served: the alternative handler, " +
+				"OnWebhook, is a host callback this product has no configuration path into, so it would be acknowledged " +
+				"and dropped. The runner is D9d's, a Lambda of its own whose IAM role is the sandbox, and until it lands " +
+				"the honest answer is a refusal that names the line to write. The default is not silently overridden to " +
+				"false because a document that says one thing and deploys another is the failure the phase mechanism " +
+				"this rule descends from exists to prevent. internal/config/rules_test.go pins the refusal; D9d retires " +
+				"RS-15 and this entry together.",
+			Spec: "docs/spec/config-schema.md §1.15; docs/config-reference.md §17.5; upstream tools_webhook.go",
+		},
 	}
 }
 
