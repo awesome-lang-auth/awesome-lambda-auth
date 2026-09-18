@@ -938,13 +938,10 @@ func TestDriverStoresListTheConsoleStores(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: unknown driver", driver)
 		}
-		for _, name := range []string{"metadata", "rbac", "tenants", "apiKeys", "webhooks"} {
+		for _, name := range []string{"metadata", "rbac", "tenants", "apiKeys", "webhooks", "telemetry"} {
 			if !supported[name] {
-				t.Errorf("%s: stores.enable.%s is still refused; the admin slot hands it over now", driver, name)
+				t.Errorf("%s: stores.enable.%s is still refused; handed over now", driver, name)
 			}
-		}
-		if supported["telemetry"] {
-			t.Errorf("%s: stores.enable.telemetry is listed, but nothing hands the telemetry store to the core until the tools block does", driver)
 		}
 	}
 	if fmt.Sprint(enabledStores(config.Defaults().Stores.Enable)) != "[sessions tokens users]" {

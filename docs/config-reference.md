@@ -159,7 +159,7 @@ whose surface reads the settings store on every request rather than once at cold
 start; §15.1 says what that costs and what a store failure looks like from
 outside.
 
-`admin` is the latest to go (§16), secret prefix included, and it is the first
+`admin` left the list (§16), secret prefix included, and it was the first
 whose surface is mounted *beside* the api prefix rather than under it: with
 `admin.enabled` set, the imported adapter mounts the core's console at
 `admin.basePath`. `admin.bootstrapSecret` and `admin.rootUser.passwordHash`
@@ -171,8 +171,20 @@ a bootstrap secret, or with a bootstrap secret too short to be one; RS-17 for
 users at all; RS-18 for a session console beside `cookies.sameSite: none`; and
 the `stores.enable.rbac` requirement behind `rbac:<role>` and
 `permission:<perm>`. Two of its knobs are reported rather than honoured (§16.8),
-which is the other mechanism and not this one. **The one left on the list is
-`tools`.**
+which is the other mechanism and not this one.
+
+`tools` left the list (§17), and it was the second domain to leave this
+list that adds a surface: with `tools.enabled` set, the composition root builds
+the event bus the auth core publishes on and the `AuthTools` facade over the
+telemetry, webhook and API-key stores, and the imported adapter mounts track,
+notify, the telemetry query and the router's own documentation pair beside the
+api prefix, behind the posture `tools.auth` names. It leaves two of its knobs
+*refused by rule* rather than by phase — a distributor (RS-14) and inbound
+webhooks (RS-15) — and two *reported* rather than honoured — the stream and the
+SSE manager — because the transports that carry them are D9b, D9c and D9d's;
+§17 says which is which and why.
+
+**Every domain the schema accepts is wired now, and the phase gate is empty.**
 
 `stores.migration` (§13) never appeared on that list and never will: it is new in
 this release and is wired by the same change that declared it, so there was never

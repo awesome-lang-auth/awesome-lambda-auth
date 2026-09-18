@@ -10,14 +10,13 @@ import (
 // configures something that does nothing gets told. Each case touches one domain
 // that P1 validates but does not act on; none of them may load silently.
 func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
+	if len(unwiredDomains()) == 0 {
+		t.Skip("every domain is wired; this test retires with the phase gate")
+	}
 	cases := []struct {
 		domain string
 		mutate func(Document)
-	}{
-		{"tools", func(doc Document) {
-			set(doc, "tools.basePath", "/ops")
-		}},
-	}
+	}{}
 
 	for _, tc := range cases {
 		t.Run(tc.domain, func(t *testing.T) {
@@ -40,17 +39,22 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 // result, so an override supplied through the environment counts exactly as much
 // as one written in the document.
 //
-// It used to say this with AWESOME_AUTH_UI_ENABLED, and moved to the tools
-// block when `ui` was wired. The domain is incidental — what is under test is
-// that the environment layer is compared like the document layer — but a test
-// naming a wired domain would assert nothing at all, so the move is the point
-// rather than a rename.
+// It used to say this with AWESOME_AUTH_UI_ENABLED, moved to the tools block
+// when `ui` was wired, and to the admin block when `tools` was. The domain is
+// incidental — what is under test is that the environment layer is compared
+// like the document layer — but a test naming a wired domain would assert
+// nothing at all, so each move is the point rather than a rename. When D8
+// wires `admin` there is no gated domain left to say it with, and this test
+// retires with the mechanism it exercises.
 func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
+	if len(unwiredDomains()) == 0 {
+		t.Skip("every domain is wired; this test retires with the phase gate")
+	}
 	env := baseEnv()
-	env["AWESOME_AUTH_TOOLS_BASE_PATH"] = "/ops"
+	env["AWESOME_AUTH_ADMIN_LOGIN_PATH"] = "/console/login"
 
 	_, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
-	requireRule(t, err, RuleUnimplemented, "tools")
+	requireRule(t, err, RuleUnimplemented, "admin")
 }
 
 // TestUnwiredDomainViaSecretIsAlsoRefused: a secret supplied through its
@@ -64,6 +68,9 @@ func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 // TestAdminIsWired holds the other side — the bootstrap secret through the same
 // kind of variable loads, because it is read.
 func TestUnwiredDomainViaSecretIsAlsoRefused(t *testing.T) {
+	if len(unwiredDomains()) == 0 {
+		t.Skip("every domain is wired; this test retires with the phase gate")
+	}
 	env := baseEnv()
 	env["AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_PASSWORD"] = "sse-distributor-password-value"
 
@@ -432,8 +439,11 @@ func TestAdminIsWired(t *testing.T) {
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the
 // deployment log, it just no longer refuses. It must never become silence.
 func TestAllowUnimplementedDowngradesToWarning(t *testing.T) {
+	if len(unwiredDomains()) == 0 {
+		t.Skip("every domain is wired; this test retires with the phase gate")
+	}
 	doc := baseDoc()
-	set(doc, "tools.basePath", "/ops")
+	set(doc, "admin.basePath", "/console")
 
 	cfg, err := Load(t.Context(), Options{
 		Document:           doc,
@@ -444,11 +454,144 @@ func TestAllowUnimplementedDowngradesToWarning(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	for _, w := range cfg.Warnings() {
-		if w.Path == "tools" && strings.Contains(w.Problem, "not yet wired") {
+		if w.Path == "admin" && strings.Contains(w.Problem, "not yet wired") {
 			return
 		}
 	}
 	t.Errorf("the phase gap disappeared instead of becoming a warning; warnings: %v", cfg.Warnings())
+}
+
+// TestToolsIsWired is the other side of the refusal table for the domain this
+// block opened: a document that configures the tools surface loads instead of
+// tripping the phase gate.
+//
+// Every case is written the way this build requires it, so the test also pins
+// that un-gating relaxed nothing: the two stores the block's defaults need are
+// on (checkStoreRequirements), inbound webhooks are written off (RS-15), and
+// the apiKey posture brings its store. `false` is in the table for the reason
+// it was in TestDocsIsWired's: it is the value an operator writes to say the
+// surface is deliberately off, and the gate made saying it impossible. What
+// cmd/auth then does with the block — the bus, the facade, the router — is
+// its own tests' business.
+func TestToolsIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"the surface switched off deliberately", func(doc Document) {
+			set(doc, "tools.enabled", false)
+		}, nil},
+		{"the surface switched on behind a session", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "session")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.webhooks", true)
+		}, nil},
+		{"the apiKey posture with its store", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "apiKey")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.apiKeys", true)
+		}, nil},
+		{"the reference's open door, asked for by name", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "none")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "stores.enable.telemetry", true)
+		}, nil},
+		{"the SSE manager without a distributor", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "session")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "tools.sse.enabled", true)
+			set(doc, "tools.sse.heartbeatIntervalMs", 15000)
+			set(doc, "stores.enable.telemetry", true)
+		}, nil},
+		{"a mount of its own and the outbound defaults", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "session")
+			set(doc, "tools.basePath", "/auth/tools")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "tools.outboundWebhooks.payloadVersion", "2")
+			set(doc, "tools.outboundWebhooks.defaults.maxRetries", 5)
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.webhooks", true)
+		}, nil},
+		{"the distributor password in the environment, with the distributor off", func(doc Document) {
+			set(doc, "tools.enabled", false)
+		}, func(env map[string]string) {
+			// The secretPrefix `tools.` went with the domain: a secret under it
+			// is no longer evidence of a configured-but-inert block, so it must
+			// not reopen the gate. RS-14 is what refuses the distributor it
+			// would authenticate to, and only when one is named.
+			env["AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_PASSWORD"] = "distributor-password-value"
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("tools is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "tools" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("tools is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["tools"]; gated {
+				t.Error("tools is still listed by UnwiredDomains")
+			}
+		})
+	}
+}
+
+// TestUnwiredDomainsIsPinned holds the phase-gate list to exactly the domains
+// still waiting, by name, so a domain cannot linger on it unnoticed after its
+// block lands and none can be added to it silently.
+//
+// Today the set is {admin}. The roadmap's definition of done is that the list
+// is empty, with a test that says so; that assertion is this one with an empty
+// want, and the parent flips it — the `want` line below — when D8 merges. The
+// shape is chosen so that the test passes on this branch with `admin` present
+// and on D8's branch with `tools` present, whichever merges second: each block
+// asserts only that its own domain is gone and that everything remaining is
+// one of a named set.
+func TestUnwiredDomainsIsPinned(t *testing.T) {
+	// The domains a block other than this one is still entitled to leave here.
+	// When this reads []string{}, the mechanism has done its job and
+	// unwiredDomains returns nil.
+	want := []string{}
+
+	got := sortedDomainPaths()
+	allowed := map[string]bool{}
+	for _, path := range want {
+		allowed[path] = true
+	}
+	for _, path := range got {
+		if path == "tools" {
+			t.Errorf("tools is still on the phase-gate list; D9a wired it")
+		}
+		if path == "admin" {
+			t.Errorf("admin is still on the phase-gate list; D8 wired it")
+		}
+		if !allowed[path] {
+			t.Errorf("%s is on the phase-gate list and no pending block claims it; the set may only shrink", path)
+		}
+	}
+	if len(want) == 0 && len(got) != 0 {
+		t.Errorf("unwiredDomains = %v, want the empty set: every domain is wired", got)
+	}
 }
 
 // TestWiredDomainsAreNotFlagged: the whole point of the P1 scope is that these

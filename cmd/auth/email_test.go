@@ -656,22 +656,14 @@ func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
 		}
 	}
 
-	// Telemetry is the counter-example: the DynamoDB store implements it, but
-	// nothing hands it to the core until the tools block does, so the flag
-	// would validate and change nothing. It must be refused before anything
-	// is constructed, and the message must name both the key and the driver.
-	// (RBAC used to stand here; the admin surface made it a real switch.)
-	cfg := config.Defaults()
-	cfg.Stores.Driver = config.StoreDriverDynamoDB
-	cfg.Stores.Enable.Telemetry = true
-
-	err := checkStoreSupport(cfg)
-	if err == nil {
-		t.Fatal("stores.enable.telemetry was accepted on dynamodb, but nothing hands the telemetry store to the core yet")
-	}
-	for _, want := range []string{"stores.enable.telemetry", config.StoreDriverDynamoDB} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error = %v, want it to name %q", err, want)
+	// Telemetry was the last counter-example: the tools block (D9a) handed it over,
+	// so it is now accepted on both drivers too.
+	for _, driver := range []string{config.StoreDriverDynamoDB, config.StoreDriverMemory} {
+		cfg := config.Defaults()
+		cfg.Stores.Driver = driver
+		cfg.Stores.Enable.Telemetry = true
+		if err := checkStoreSupport(cfg); err != nil {
+			t.Errorf("%s backs a telemetry store and was refused one: %v", driver, err)
 		}
 	}
 }

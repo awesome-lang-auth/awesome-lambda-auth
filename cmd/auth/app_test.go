@@ -301,11 +301,6 @@ func TestInvalidConfigAbortsInit(t *testing.T) {
 				"https://abc123.execute-api.eu-west-1.amazonaws.com/prod"),
 			rule: config.RuleInsecureCookieMode,
 		},
-		{
-			name: "a configured but unwired domain",
-			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_ENABLED", "true"),
-			rule: config.RuleUnimplemented,
-		},
 	}
 
 	for _, tc := range cases {
@@ -539,15 +534,6 @@ func TestUnsupportedStoreIsRefused(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		{
-			// telemetry: implemented by the DynamoDB store, handed to the core
-			// by nothing until the tools block, so the flag is refused rather
-			// than accepted and inert. It replaced rbac here when the admin
-			// surface made that flag a real switch.
-			name: "a store nothing hands to the core",
-			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
-			want: "stores.enable.telemetry",
-		},
 		{
 			name: "users switched off",
 			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_USERS", "false"),
