@@ -442,6 +442,88 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantPath:    "security.jwt.accessTokenSecret",
 			wantMessage: "literal value",
 		},
+
+		// ── the tools block: what this build cannot serve, refused by name ──
+		//
+		// Every case below writes tools.inboundWebhooks.enabled: false unless
+		// it is the case about that knob, because RS-15 would otherwise fire on
+		// every one of them — the knob defaults to true, as the reference mounts
+		// the route by default — and a case that passes because a *different*
+		// rule refused the document proves nothing about its own.
+		{
+			// RS-14, the redis spelling. The endpoint is supplied so the
+			// validator's own "no endpoint" diagnostic cannot be the one found.
+			name: "RS-14 an SSE distributor this build cannot provide",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.sse.enabled", true)
+				set(doc, "tools.sse.distributor.type", "redis")
+				set(doc, "tools.sse.distributor.endpoint", "redis.internal:6379")
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsSSEDistributor,
+			wantPath:           "tools.sse.distributor.type",
+			wantMessage:        "own execution environment",
+		},
+		{
+			// The type is the statement of intent: a distributor configured
+			// for a manager that is off is still one this build cannot honour
+			// the day the manager is switched on, so tools.sse.enabled does not
+			// gate the rule.
+			name: "RS-14 fires with the SSE manager itself switched off",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.sse.distributor.type", "sns")
+				set(doc, "tools.sse.distributor.topicArn", "example-topic")
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsSSEDistributor,
+			wantPath:           "tools.sse.distributor.type",
+		},
+		{
+			// RS-15 on the default: a document that enables the tools block and
+			// says nothing about inbound webhooks is refused, and the remedy has
+			// to name the line the operator has to write.
+			name: "RS-15 inbound webhooks enabled by default with no runner",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "stores.enable.webhooks", true)
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsInboundWebhooks,
+			wantPath:           "tools.inboundWebhooks.enabled",
+			wantMessage:        "tools.inboundWebhooks.enabled: false",
+		},
+		{
+			// The apiKey posture verifies every key against the API-key store,
+			// so a posture with no store behind it is a guard nobody can pass.
+			name: "the apiKey posture with the API-key store disabled",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.auth", "apiKey")
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleStoreRequired,
+			wantPath:           "stores.enable.apiKeys",
+			wantMessage:        "apiKey",
+		},
+		{
+			// The admin posture names a guard that exists only when the console
+			// is configured.
+			name: "the admin posture with the admin surface off",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.auth", "admin")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.auth",
+			wantMessage:        "admin.enabled is off",
+		},
 	}
 
 	for _, tc := range cases {

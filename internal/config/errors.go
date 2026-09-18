@@ -48,6 +48,25 @@ const (
 	// on RS-5.
 	RuleMigrationIncomplete = "RS-13"
 
+	// RuleToolsSSEDistributor and RuleToolsInboundWebhooks are not in the §2
+	// table for the reason RS-13 is not: the table was extracted from a
+	// reference that either has the capability in process — the SSE
+	// distributor is an object the host constructs, the inbound-webhook script
+	// runs in a vm inside the router — or lets the host mount nothing. On this
+	// runtime both are transports a later block supplies (D9c puts the stream
+	// on a Function URL with a distributor, D9d runs the script in a Lambda of
+	// its own), and until each lands a document that asks for one describes a
+	// deployment this build cannot be. They take the next two free identifiers
+	// because they are the same kind of rule as the thirteen above — a valid
+	// value that would deploy and then be wrong — and are refusals rather than
+	// warnings because the failure each prevents is silent: a manager with no
+	// distributor reaches only its own execution environment, and a webhook
+	// with a script and no runner answers 400 to a provider that redelivers
+	// forever. Both retire on the day their transport lands, and the rule text
+	// names that day.
+	RuleToolsSSEDistributor  = "RS-14"
+	RuleToolsInboundWebhooks = "RS-15"
+
 	// RS-14 to RS-16 belong to the tools block (D9a), which numbered them first
 	// and lands beside this one; the admin surface takes the two after them.
 	//

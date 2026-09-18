@@ -577,6 +577,17 @@ func validateTools(c *Config, d *diagnostics) {
 	if c.Tools.Auth != "" {
 		enum(d, "tools.auth", c.Tools.Auth, ToolsAuthNone, ToolsAuthSession, ToolsAuthAPIKey, ToolsAuthAdmin)
 	}
+	// The admin posture puts the tools routes behind the admin console's own
+	// guard, and that guard exists only when the console is configured: it is
+	// built from admin.accessPolicy and the admin session cookie, neither of
+	// which has a value without admin.enabled. A posture naming a guard that
+	// is not there would have to fall back to something — open, or nothing —
+	// and both are the silent degradation tools.auth exists to rule out.
+	if c.Tools.Enabled && c.Tools.Auth == ToolsAuthAdmin && !c.Admin.Enabled {
+		d.errf("", "tools.auth",
+			fmt.Sprintf("tools.auth is %q, but admin.enabled is off, so there is no admin guard to put the tools routes behind", ToolsAuthAdmin),
+			"enable the admin surface (admin.enabled: true with an access policy), or choose tools.auth: session or apiKey")
+	}
 	absolutePath(d, "tools.basePath", c.Tools.BasePath)
 	enum(d, "tools.sse.distributor.type", c.Tools.SSE.Distributor.Type, DistributorNone, DistributorRedis, DistributorSNS)
 	switch c.Tools.SSE.Distributor.Type {
