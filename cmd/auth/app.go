@@ -1054,6 +1054,14 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// matched against for outgoing delivery, and the API-key store is what
 		// tools.auth: apiKey verifies against (tools.go).
 		//
+		// The listing is about the driver and cannot see the document, so it
+		// reopens the hole above for one combination: a flag switched on while
+		// its one consumer is off — any of the three with tools.enabled off,
+		// or apiKeys under a posture other than apiKey. That combination is
+		// reported by toolsKnobGaps at every cold start rather than refused
+		// here, for the reason given there, and
+		// TestUnwiredKnobsIsExactlyTheDocumentedList pins the rows.
+		//
 		// The three v0.8.0 admin listers and the two profile flag writers need
 		// no flag: AdminUserStore, SessionLister, RoleLister,
 		// UserAdminFlagStore and UserTwoFactorPolicyStore are discovered by

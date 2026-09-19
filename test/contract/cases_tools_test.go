@@ -18,11 +18,13 @@ import (
 // Env.tools so the suite never assumes the router sits under the api prefix.
 //
 // Every guarded call is made with a bearer login rather than the cookie
-// session, and that is a statement about the wire, not a convenience: the
-// tools router carries none of the auth router's middleware — no CSRF
-// double-submit in particular — so a bearer caller with no cookie jar at all
-// is the honest shape of a server-to-server client, which is who this router
-// is for.
+// session: a bearer caller with no cookie jar at all is the honest shape of a
+// server-to-server client, which is who this router is for. A cookie caller is
+// held to the CSRF double-submit on both trees — the reference performs it
+// inside auth.middleware() (auth.middleware.ts:33-41), and this product's
+// session posture reproduces it on the tools mount (cmd/auth/tools.go,
+// toolsDoubleSubmit, pinned in-process by TestSessionPostureDoubleSubmit) —
+// which is why the CapTools probe, a cookie caller, sends it.
 //
 // What is deliberately *not* here: the stream. GET <tools>/stream on this
 // product is the registered deviation tools-stream-is-not-mounted-on-api-gateway
@@ -91,8 +93,9 @@ func init() {
 				if m["ok"] != true || len(m) != 1 {
 					t.Errorf("body = %v, want exactly {\"ok\":true}\n  %s", m, r.where())
 				}
-				// The router carries no CSRF middleware and this is a bearer
-				// caller, so nothing here may set a cookie.
+				// A bearer caller with no cookie jar: the tools router
+				// distributes no CSRF cookie of its own, so nothing here may
+				// set a cookie.
 				if len(r.SetCookie) != 0 {
 					t.Errorf("track set cookies %v on a bearer call; the tools router carries no cookie-setting middleware\n  %s", r.SetCookie, r.where())
 				}
@@ -202,17 +205,23 @@ func init() {
 
 		Case{
 			Name:  "tools/guarded-routes-refuse-a-bare-caller",
-			Doc:   "reference tools.router.ts:135, :141, :166, :227 — track, notify and the telemetry query sit behind the host's auth middleware, so a caller presenting nothing is refused (401 or 403, the middleware's own status) and never answers 202",
-			Needs: []Capability{CapTools},
+			Doc:   "reference tools.router.ts:135, :141, :166 — with an authMiddleware supplied, track and notify sit behind it, so a caller presenting nothing is refused (401 or 403, the middleware's own status) and never answers 202. Needs tools-guarded rather than tools: a deployment with no guard (tools.auth: none, or the reference with authMiddleware unset) is conformant and skips",
+			Needs: []Capability{CapToolsGuarded},
 			Run: func(t *testing.T, e *Env) {
 				for _, path := range []string{"/track/" + trackedEventName("bare"), "/notify/user:nobody"} {
 					r := e.NewClient().POST(t, e.tools(path), body{})
 					r.mustStatusIn(t, 401, 403)
 				}
+			},
+		},
+
+		Case{
+			Name:  "tools/telemetry-query-refuses-a-bare-caller",
+			Doc:   "reference tools.router.ts:227 — the telemetry query sits behind the same guard, so with the route mounted an anonymous GET <tools>/telemetry is 401 or 403: never 200, which would be the store-wide record handed to nobody in particular, and never 404, which is the route not being mounted and is what tools-telemetry exists to tell apart",
+			Needs: []Capability{CapToolsTelemetry, CapToolsGuarded},
+			Run: func(t *testing.T, e *Env) {
 				r := e.NewClient().GET(t, e.tools("/telemetry"))
-				// 404 is the query route not being mounted at all (no store);
-				// with it mounted, the guard answers before the store does.
-				r.mustStatusIn(t, 401, 403, 404)
+				r.mustStatusIn(t, 401, 403)
 			},
 		},
 

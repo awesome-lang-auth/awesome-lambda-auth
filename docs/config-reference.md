@@ -934,8 +934,11 @@ The other two are stored and handed back, and nothing in this build acts on
 them. Both are named, with their paths, in the cold-start log:
 
 - `enabledWebhookActions` is the global allowlist the inbound-webhook sandbox
-  intersects with each webhook's own `allowedActions`. No tools router is
-  mounted here yet (P7), so the list is stored and read by nothing.
+  intersects with each webhook's own `allowedActions`. That sandbox belongs to
+  one route, `POST <tools>/webhook/{provider}`, which this build never mounts —
+  RS-15 refuses it until the script runner lands (D9d, §17.5), whether or not
+  the rest of the tools router is on — so the list is stored and read by
+  nothing.
 - `lazyEmailVerificationGracePeriodDays` is read by nothing **here or in the
   reference**: the reference's admin UI displays it and its server never computes
   a verification deadline from it ([config-schema.md](spec/config-schema.md)
@@ -2048,7 +2051,7 @@ core publish its `identity.*` events at all.
 | Path | Type | Default | Env var |
 |---|---|---|---|
 | `tools.enabled` | boolean | `false` | `AWESOME_AUTH_TOOLS_ENABLED` |
-| `tools.auth` | `none` / `session` / `apiKey` / `admin` | `none` — **warned at deploy time**; see §17.6 | `AWESOME_AUTH_TOOLS_AUTH` |
+| `tools.auth` | `none` / `session` / `apiKey` / `admin` | **none — an enabled block must name one (RS-16)**; `none` is the reference's open door by name and is warned at deploy time; the SAM template defaults to `apiKey`; see §17.6 | `AWESOME_AUTH_TOOLS_AUTH` |
 | `tools.basePath` | absolute path | `/tools` | `AWESOME_AUTH_TOOLS_BASE_PATH` |
 | `tools.telemetry.enabled` | boolean | `true` — mounts `track`, and the query when `stores.enable.telemetry` is on | `AWESOME_AUTH_TOOLS_TELEMETRY` |
 | `tools.notify.enabled` | boolean | `true` | `AWESOME_AUTH_TOOLS_NOTIFY` |
@@ -2067,7 +2070,12 @@ the bridge write, what the query reads; **required** by `tools.telemetry.enabled
 `webhooks` (what every event is matched against for outgoing delivery), and
 `apiKeys` (**required** by `tools.auth: apiKey`). Subscription rows and API
 keys are *data* in those stores, written by the admin API (D8), not
-configuration.
+configuration. A flag switched on while its one consumer is off — any of the
+three with `tools.enabled` off, or `apiKeys` under a posture other than
+`apiKey` — validates and is read by nothing; the unwired-knob report names it
+at cold start (§17.1) rather than refusing it, because that is how a document
+is staged one deploy ahead of the block, and D8 gives all three a second
+consumer.
 
 The smallest document that loads on this build, and why each line is there:
 
@@ -2082,8 +2090,12 @@ The smallest document that loads on this build, and why each line is there:
 }
 ```
 
-`auth: session` because the default is the reference's open door (§17.6);
-`inboundWebhooks.enabled: false` because the default is `true` and RS-15
+`auth` because an enabled block has to say who may reach it — there is no
+default, and a block that names no posture is refused (RS-16) rather than
+resolved to the reference's open door; it says `session` here because it is
+the shortest document that loads, and §17.6 is why a deployed stack should say
+`apiKey`, as the SAM template does. `inboundWebhooks.enabled: false` because
+the default is `true` and RS-15
 refuses it until a script runner exists (§17.5); `telemetry` because
 `tools.telemetry.enabled` defaults to `true` and the query route has to have a
 store; `webhooks` because a bridge with nowhere to look up subscriptions
@@ -2099,11 +2111,19 @@ until D9b**. `tools surface not mounted`, the default, says that no bus is
 built either, so the core's `identity.*` events go nowhere.
 
 `the tools routes are unguarded` is the warning for `tools.auth: none`, and
-repeats the price §17.6 puts on it. `the SSE manager reaches no connection on
-this runtime` is what `tools.sse.enabled: true` gets. And the unwired-knob
-report names `tools.stream.enabled` on every tools deployment (and
-`tools.sse.enabled` when set), with the same remedy: leave them, D9c makes them
-live.
+repeats the price §17.6 puts on it. `the tools routes answer any signed-in
+user, and anyone can sign up` is the warning for `tools.auth: session`, for the
+same reason in a different key: it names the store-wide telemetry read, the
+body-supplied `userId` and the remedy (`apiKey`), and says whether a cookie
+caller is held to the CSRF double-submit. `the tools routes answer any active
+API key` is the `apiKey` line — not a warning — and states the two things the
+core decides: no scope is required, and a refusal is a bare `401`. `the SSE
+manager reaches no connection on this runtime` is what `tools.sse.enabled:
+true` gets. And the unwired-knob report names `tools.stream.enabled` on every
+tools deployment (and `tools.sse.enabled` when set), with the same remedy:
+leave them, D9c makes them live — and any of `stores.enable.telemetry`,
+`.webhooks` or `.apiKeys` that is on while nothing consumes it (the block off,
+or `apiKeys` under a posture other than `apiKey`).
 
 ### 17.2 The bridge: the core's own events reach the sinks
 
@@ -2270,26 +2290,84 @@ query — the routes the reference spreads its `...protect` onto
 (`tools.router.ts:141, :166, :227`) — and **not** the documentation pair, which
 the reference registers with no guard (`:333, :348`) and which therefore
 answers anyone who can reach the mount whenever `docs.swagger` resolves on
-(§12.1 — the same knob, the same `auto`).
+(§12.1 — the same knob, the same `auto`, and the same
+`Content-Security-Policy`: `docs-page-carries-a-content-security-policy` covers
+the tools pair as it covers the auth router's, because a mitigation that
+covered one Swagger page on this origin and not the other would be bypassable
+one path over).
 
-**`session`** — the ordinary posture, and the one the SAM template defaults to.
-The guard is the adapter's own middleware, the same one `GET <prefix>/sessions`
-sits behind: a bearer access token or the access-token cookie, verified through
-the core, with the principal put on the request so that a `track` body naming
-no `userId` is attributed to whoever made the call. A tools call is
-authenticated exactly as an API call is.
+**Unset** — refused. An enabled block that names no posture does not start
+(RS-16, [decisions.md](spec/decisions.md) D-21): there is no default, because
+the only one the reference would supply is its open door, and silence must not
+resolve to that.
 
-**`apiKey`** — for a caller that is a service rather than a person. The guard is
-the core's `APIKeyMiddleware`: `X-Api-Key: ak_…` or `Authorization: ApiKey ak_…`,
-looked up by prefix and verified by bcrypt against the API-key store, with the
-key's own IP allowlist and expiry honoured. It requires `stores.enable.apiKeys`
-(`STORE`), and keys are minted through the admin API (D8) — until that lands, a
-posture nobody holds a key for is a guard nobody can pass, which is safe and is
-also a surface that answers `401` to everyone. The core's refusal is a bare
-`401 unauthorized`, not the auth router's envelope.
+**`apiKey`** — for a caller that is a service rather than a person, and **the
+SAM template's default**. The guard is the core's `APIKeyMiddleware`:
+`X-Api-Key: ak_…` or `Authorization: ApiKey ak_…`, looked up by prefix and
+verified by bcrypt against the API-key store, with the key's own IP allowlist
+and expiry honoured. It requires `stores.enable.apiKeys` (`STORE`), and keys
+are minted through the admin API (D8) — until that lands, a posture nobody
+holds a key for is a guard nobody can pass, which is safe and is also a surface
+that answers `401` to everyone. Two things about it are the core's and are
+stated rather than assumed. **It requires no scope**: the schema has no
+vocabulary for one, so *every* active key in the store passes — including one
+an administrator minted with a narrow scope for another purpose — because
+`nil` is "no requirement" to the core's scope check, not "no scope". Today the
+tools guard is the store's only consumer in this product, so every key is a
+tools key by construction; on the day D8 gives the store a second consumer,
+this is the sentence to remember. **And its refusal is a bare `text/plain 401
+unauthorized`** for every reason alike — no key, an unknown, revoked or expired
+one, a caller outside the IP allowlist — where the reference answers an
+`{error, code}` envelope with five distinct codes and a `403` for a blocked IP.
+Registered as `tools-api-key-refusal-is-the-cores-bare-401`; a client must
+treat any `401` from these routes as the whole family and not parse the body.
 
-**`none`** — the reference's own default, asked for by name
-(`auth.ToolsPublic()`), and **warned about at deploy time and at cold start**.
+**`session`** — the adapter's own session guard, the same one
+`GET <prefix>/sessions` sits behind: a bearer access token or the access-token
+cookie, verified through the core, with the principal put on the request so
+that a `track` body naming no `userId` is attributed to whoever made the call.
+A cookie caller is also held to the **CSRF double-submit**, exactly where the
+reference holds it — inside its auth middleware (`auth.middleware.ts:33-41`) —
+so a cookie-authenticated `POST` with no matching `X-CSRF-Token` is
+`403 CSRF_INVALID` on both trees, and a bearer caller is exempt on both. The
+core mounts the tools router outside its own CSRF chain and leaves this to the
+host's middleware; this product is that host (`cmd/auth/tools.go`,
+`toolsDoubleSubmit`, pinned by `TestSessionPostureDoubleSubmit`). With
+`cookies.sameSite: none` a front end on another site cannot read the
+`csrf-token` cookie and has to call the tools routes with the bearer token; the
+loader warns about that combination.
+
+**`session` is not the ordinary posture, and it is not the template's default,
+because of who holds a session.** `POST <prefix>/register` is always mounted
+(upstream `register-route-is-always-mounted`), so under `session`
+"authenticated" means any self-registered user, and what such a user can do is
+the reference's own shape, reproduced rather than narrowed:
+
+- `GET <tools>/telemetry` is **store-wide**: `?userId=someone-else` is honoured
+  and no filter returns everyone's rows (the core's `tools_telemetry.go` says
+  so at length) — and the bridge (§17.2) writes every `identity.*` event into
+  that store, so the rows hold the email every account was created with, both
+  addresses of every email change, whatever was typed into the email field of
+  every failed login, and the IP address, user agent and session id of each.
+- `POST <tools>/track/{eventName}` reads `userId` from the body first and the
+  principal second (`tools.router.ts:147`), so a session attributes an event to
+  any user, under any name, and fires every matching outgoing webhook — the
+  deployment POSTing caller-chosen content to a third party in its own name,
+  under its own signature.
+- `POST <tools>/notify/{target}` broadcasts to any topic.
+
+Scoping the query to the caller and pinning the body's `userId` were both
+considered and rejected: each is an auth semantic the reference does not have
+and would silently change what a client written against the reference gets
+back, and neither closes the door, since the event name and the payload stay
+the caller's. So the posture is **priced** — here, in a cold-start warning
+(§17.1), and in the template, whose default is `apiKey`. Choose `session` for a
+deployment whose registration is closed, or whose end users are the intended
+readers of each other's login history.
+
+**`none`** — the reference's own default, asked for by name and only by name
+(`auth.ToolsPublic()`; a silent block is refused, see **Unset**), and **warned
+about at deploy time and at cold start**.
 Priced rather than assumed, because the cost of this door is not smaller than
 the admin console's, only different in kind:
 

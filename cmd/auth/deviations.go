@@ -133,15 +133,17 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID: "docs-page-carries-a-content-security-policy",
-			Surface: "the response headers of GET <prefix>/docs and GET <prefix>/openapi.json, and -- with admin.enabled -- " +
-				"of GET <admin>/api/docs and GET <admin>/api/openapi.json",
+			Surface: "the response headers of GET <prefix>/docs and GET <prefix>/openapi.json, and -- with admin.enabled and tools.enabled -- " +
+				"of GET <admin>/api/docs, GET <admin>/api/openapi.json, GET <tools>/docs and GET <tools>/openapi.json",
 			Behaviour: "Both documentation responses carry a Content-Security-Policy, X-Content-Type-Options: nosniff " +
 				"and Referrer-Policy: no-referrer. The page's policy pins the one CDN origin the reference's HTML " +
 				"loads from and denies everything else -- no fetch or XHR off this origin, no image beacon, no form " +
 				"action, no nested frame, no framing of the page itself, no rewritten base URL. The document's policy " +
 				"is default-src 'none' with the same framing and base-URI denial. The routes, their bodies and their " +
-				"status codes are untouched.",
-			Reference: "Neither route sets any header beyond Content-Type (auth.router.ts:1658-1677), so the Swagger " +
+				"status codes are untouched. The tools router's own pair is the same page under the same docs.swagger knob, " +
+				"and carries the same two policies: a mitigation that covered one Swagger page and not the other would " +
+				"be bypassable one path over.",
+			Reference: "Neither route sets any header beyond Content-Type (auth.router.ts:1658-1677; tools.router.ts:332-352 for the tools pair), so the Swagger " +
 				"page runs swagger-ui-dist@5 from the unpkg CDN, unpinned and without subresource integrity, with " +
 				"no policy of any kind (openapi.ts:1646-1669).",
 			Why: "That script runs same-origin with this deployment's auth cookies, and the CSRF cookie is readable " +
@@ -154,12 +156,13 @@ func WireDeviations() []WireDeviation {
 				"cookie and still leak it through a top-level navigation, which no CSP directive in any shipping " +
 				"browser prevents. What it removes are the silent channels. cmd/auth/docs_test.go " +
 				"TestDocsPolicyCoversEveryOriginTheCorePageLoads fails the day the core's page loads from anywhere " +
-				"else, which is when this policy would otherwise break the page instead of protecting it. The admin " +
-				"console's pair joined the surface with the admin block for the same reason and with the same two " +
+				"else, which is when this policy would otherwise break the page instead of protecting it, and " +
+				"cmd/auth/tools_test.go TestToolsDocsPairCarriesTheDocsPolicy fails the day the tools pair is served without it. " +
+				"The admin console's pair joined the surface with the admin block for the same reason and with the same two " +
 				"policies: the core serves the console's page with SwaggerUIHandler unchanged -- the same HTML, the " +
 				"same CDN -- and its document describes the most privileged surface in the deployment; both follow " +
 				"docs.swagger, so one switch turns both pairs and both policies on.",
-			Spec: "docs/spec/config-schema.md §1.18; docs/config-reference.md §12 and §16; upstream deviation docs-routes-are-opt-in",
+			Spec: "docs/spec/config-schema.md §1.18; docs/config-reference.md §12, §16 and §17; upstream deviation docs-routes-are-opt-in",
 		},
 		{
 			ID:      "oauth-callback-skips-the-second-factor",
@@ -392,8 +395,13 @@ func WireDeviations() []WireDeviation {
 				"only path to the sinks is that subscription. What it gives up is stated: App.Events carries the " +
 				"library's events and App.Tools.Events carries everything fanned out, and the record's timestamp is " +
 				"the fan-out instant rather than the publication instant, microseconds apart on one synchronous chain. " +
-				"cmd/auth/tools_test.go TestBridgeDeliversEachLoginOnce fails the day a login is delivered zero times or " +
-				"twice.",
+				"What the store then holds is also stated, because the bridge is what puts it there: every identity.* " +
+				"payload -- the email an account was created with, both addresses of an email change, whatever was typed " +
+				"into the email field of a failed login -- with the IP address, user agent and session id of each, and " +
+				"GET <tools>/telemetry reads all of it, store-wide, to whoever passes tools.auth. Under `session` that " +
+				"is any self-registered user (docs/config-reference.md §17.6), which is why the SAM template defaults " +
+				"to `apiKey` and the cold start warns. cmd/auth/tools_test.go TestBridgeDeliversEachLoginOnce fails the " +
+				"day a login is delivered zero times or twice, or arrives without the caller's X-Correlation-Id.",
 			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.6; upstream auth_tools.go (the AuthTools type comment)",
 		},
 		{
@@ -406,7 +414,7 @@ func WireDeviations() []WireDeviation {
 				"seconds between attempts is almost never honoured. A delivery is therefore best-effort: an endpoint that " +
 				"answers within the request's own lifetime receives it, one that does not may receive it late, once, or " +
 				"not at all, and no record of the outcome is kept anywhere.",
-			Reference: "The same code shape on a long-lived process: send is not awaited (src/tools/auth-tools.ts:280) and " +
+			Reference: "The same code shape on a long-lived process: send is not awaited (src/tools/auth-tools.ts:266) and " +
 				"retries with exponential back-off (src/tools/webhook-sender.ts:18-46), and a Node process that stays up " +
 				"finishes them all.",
 			Why: "Not a decision this product made: the core's WebhookEmitter reproduces the reference's fire-and-forget " +
@@ -444,6 +452,30 @@ func WireDeviations() []WireDeviation {
 				"this rule descends from exists to prevent. internal/config/rules_test.go pins the refusal; D9d retires " +
 				"RS-15 and this entry together.",
 			Spec: "docs/spec/config-schema.md §1.15; docs/config-reference.md §17.5; upstream tools_webhook.go",
+		},
+		{
+			ID:      "tools-api-key-refusal-is-the-cores-bare-401",
+			Surface: "every refusal of POST <tools>/track, POST <tools>/notify and GET <tools>/telemetry under tools.auth: apiKey",
+			Behaviour: "A request the API-key guard refuses is answered 401 with the text/plain body `unauthorized`, " +
+				"whatever the reason: no key, an unknown key, a revoked or expired one, a caller outside the key's IP " +
+				"allowlist. There is no JSON envelope, no code, and no 403.",
+			Reference: "createApiKeyMiddleware answers res.status(err.statusCode).json({ error, code }) " +
+				"(src/middleware/api-key.middleware.ts:50), and the strategy tells the reasons apart: 401 API_KEY_MISSING, " +
+				"API_KEY_INVALID, API_KEY_REVOKED and API_KEY_EXPIRED, and 403 API_KEY_IP_BLOCKED " +
+				"(src/strategies/api-key/api-key.strategy.ts:80-112).",
+			Why: "Not a choice this product made: the refusal is written by the imported core's APIKeyMiddleware " +
+				"(api_keys.go), which answers http.Error(w, \"unauthorized\", 401) for a missing key and for every " +
+				"verification failure alike, and the core is not forked. It is registered here because selecting " +
+				"tools.auth: apiKey is what puts that response on a deployment's wire -- nothing in this product mounted " +
+				"the middleware before the tools block. Rewriting it in a product middleware was considered and " +
+				"rejected: the core's guard does not say why it refused, so the reference's five codes could only be " +
+				"recovered by verifying the key a second time beside it, which doubles a bcrypt comparison per refused " +
+				"request and puts a second copy of the key check beside the one that decides, where the two can drift. Collapsing the reasons is also the safer half of the difference: the " +
+				"reference tells a caller whether a key exists but is revoked. A client written against the reference " +
+				"must therefore treat any 401 from these routes as the whole family of refusals and must not parse the " +
+				"body. The fix is upstream's (an envelope and a 403 in APIKeyMiddleware), and this entry retires with it. " +
+				"cmd/auth/tools_test.go TestToolsAccessPostures pins the status and the body.",
+			Spec: "docs/config-reference.md §17.6; upstream api_keys.go (APIKeyMiddleware)",
 		},
 	}
 }

@@ -571,7 +571,50 @@ func init() {
 			// telemetry can tell a probe from traffic. A body-less POST is the
 			// reference's own accepted shape: express.json leaves req.body {}
 			// and the route tracks an event with no payload (:143-158).
-			p.Set(CapTools, classifyTools(p.LoggedIn(t).POST(t, p.Env.tools("/track/contract-probe"), body{})))
+			//
+			// With the double-submit, because this is a cookie caller on a
+			// mutating method: the reference performs the CSRF check inside
+			// auth.middleware() (auth.middleware.ts:33-41) and this product's
+			// session posture reproduces it on the tools mount, so a
+			// csrf-enabled deployment answers a header-less cookie POST 403
+			// CSRF_INVALID — which classifyTools would misread as a guard this
+			// credential cannot pass. CSRF() sends nothing when the client
+			// holds no csrf-token cookie, which is what a csrf-disabled
+			// deployment should see.
+			p.Set(CapTools, classifyTools(p.LoggedIn(t).POST(t, p.Env.tools("/track/contract-probe"), body{}, CSRF())))
+		},
+	})
+}
+
+// CapToolsGuarded is the tools router's guard itself: an anonymous POST
+// <tools>/track is refused. It is probed separately from CapTools because the
+// reference's own default is no guard at all — `const protect = authMiddleware ?
+// [authMiddleware] : []` (tools.router.ts:135) — and this product offers the
+// same door as tools.auth: none, so a deployment on which anonymous track
+// answers 202 is conformant, and the case that asserts the guard has to skip
+// there rather than fail. Probed with a fresh client holding nothing: the
+// question is what a caller presenting no credential gets, and p.Anon carries
+// the provisioned account's cookies by this stage.
+const CapToolsGuarded Capability = "tools-guarded"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapToolsGuarded,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			r := p.Env.NewClient().POST(t, p.Env.tools("/track/contract-probe"), body{})
+			switch r.Status {
+			case 401, 403:
+				p.Set(CapToolsGuarded, capability{state: capOn, why: fmt.Sprintf("%s answered %d to a caller presenting nothing", r.Target, r.Status)})
+			case 202:
+				p.Set(CapToolsGuarded, capability{state: capAbsent, why: fmt.Sprintf(
+					"%s answered 202 to a caller presenting nothing — the router has no guard (tools.auth is none here; authMiddleware unset in the reference)", r.Target)})
+			case 404:
+				p.Set(CapToolsGuarded, capability{state: capAbsent, why: fmt.Sprintf("%s answered 404 — the tools router is not mounted", r.Target)})
+			default:
+				p.Set(CapToolsGuarded, capability{state: capBroken, why: fmt.Sprintf(
+					"%s answered %d %s to a caller presenting nothing, which is neither a guard, the open door nor an unmounted router", r.Target, r.Status, r.snippet())})
+			}
 		},
 	})
 }

@@ -32,20 +32,13 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-<<<<<<< HEAD
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential,tools,tools-guarded,tools-telemetry,tools-docs`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 | `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_PATH` | Where the admin console is mounted, as an absolute path. Default `/admin`, the same default the reference's swagger base and this product's `admin.basePath` use. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` + `AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` | An account the console admits — the configured root user, or a user the operator promoted. **Opt-in and unset by default**, because the suite cannot mint an administrator. Both or neither: one without the other is a fault. See below. |
+| `AWESOME_AUTH_CONTRACT_TOOLS_PATH` | Where the tools router is mounted. Default `/tools`, the reference's own `swaggerBasePath` default, beside the api prefix; a deployment that followed the Angular demo and mounted it under the prefix at `<apiPrefix>/tools` sets this to `/auth/tools`. |
 
 All of them are passed through `scripts/toolchain.sh` into the container.
-=======
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,tools,tools-telemetry,tools-docs`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
-| `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
-| `AWESOME_AUTH_CONTRACT_TOOLS_PATH` | Where the tools router is mounted. Default `/tools`, the reference's own `swaggerBasePath` default; it is a **sibling** of the api prefix, not a path under it, so a deployment that followed the Angular demo and mounted it at `<apiPrefix>/tools` sets this to `/auth/tools`. |
-
-All five are passed through `scripts/toolchain.sh` into the container.
->>>>>>> e5261cd (feat(contract): the tools, tools-telemetry and tools-docs capabilities)
 
 **Set `AWESOME_AUTH_CONTRACT_REQUIRE` for anything that is supposed to be
 complete.** Absence is unfalsifiable from outside: a session store the operator
@@ -353,7 +346,6 @@ deviation `rate-limited-routes-answer-429`
 ([deviations.md](../../docs/deviations.md)) rather than a clause of the wire
 contract, which is why its `Doc` cites the register.
 
-<<<<<<< HEAD
 **The admin console is `admin`, and the credential to enter it is the
 operator's to declare.** The reference's admin router
 (`src/router/admin.router.ts`) is mounted by the host *beside* the auth router
@@ -434,23 +426,33 @@ to **off** here (`tools.enabled`), so an unconfigured stack answers 404 across
 the whole router and the eight cases skip.
 
 The probe is `POST <tools>/track/contract-probe` with an empty body, made
-**with the account's session**, because the ordinary posture puts every feature
-route behind the host's auth middleware (`tools.router.ts:135`) and an anonymous
-probe would report a guarded router as absent. Its "on" is a `202`, not a
-`200`. A `401` or `403` is recorded `absent` with its own reason — the router is
-mounted behind a guard this suite holds no credential for (`tools.auth: apiKey`
-or `admin`), which is a deployment posture and not a fault — and the cases skip
-rather than fail a working stack. `tools-telemetry` is probed separately on
-`GET <tools>/telemetry`, because the reference mounts the query route only
+**with the account's session and the CSRF double-submit**, because the ordinary
+posture puts every feature route behind the host's auth middleware
+(`tools.router.ts:135`) and an anonymous probe would report a guarded router as
+absent — and because that middleware performs the CSRF check on a cookie caller
+(`auth.middleware.ts:33-41`), so a header-less probe would be answered `403
+CSRF_INVALID` and misread as a guard the session cannot pass. Its "on" is a
+`202`, not a `200`. A `401` or `403` is recorded `absent` with its own reason —
+the router is mounted behind a guard this suite holds no credential for
+(`tools.auth: apiKey` or `admin`), which is a deployment posture and not a
+fault — and the cases skip rather than fail a working stack. `tools-guarded` is
+the guard itself, probed **with a client holding nothing** on the same route:
+`401`/`403` is `on`, `202` is `absent` with the reason that the router has no
+guard — the reference's own default (`authMiddleware` unset) and this product's
+`tools.auth: none` — so the two cases that assert a refusal skip on a conformant
+open deployment instead of failing it. `tools-telemetry` is probed separately
+on `GET <tools>/telemetry`, because the reference mounts the query route only
 when a telemetry store is configured (`:226`) and a deployment can offer track
 without it; `tools-docs` is probed **anonymously** on `GET <tools>/openapi.json`,
 for the reason `docs` is.
 
-Every guarded call in the cases is a **bearer** login with no cookie jar. That
-is the wire being asserted: the tools router carries none of the auth router's
-middleware — no CSRF double-submit in particular — so a bearer client with no
-cookies is the honest shape of the server-to-server caller the router exists
-for.
+Every guarded call in the cases is a **bearer** login with no cookie jar: the
+honest shape of the server-to-server caller the router exists for, and one the
+double-submit does not apply to on either tree. A cookie caller is held to it
+on both — the reference inside `auth.middleware()`, this product's `session`
+posture on the tools mount (`cmd/auth/tools.go`, pinned in-process by
+`TestSessionPostureDoubleSubmit`, since a case here would have to hold a cookie
+session against a tools router and the reference demo runs without CSRF).
 
 | Case | Pins | Needs |
 |---|---|---|
@@ -459,7 +461,8 @@ for.
 | `tools/telemetry-filters-by-user` | two users track the same event name; `?event=<name>` returns both rows and `?event=<name>&userId=<a>` returns exactly the first user's | `tools`, `tools-telemetry` |
 | `tools/notify-answers-202-ok` | `POST <tools>/notify/{target}` is `202 {"ok":true}` whether or not anyone holds the topic | `tools` |
 | `tools/wrongly-typed-body-is-400` | `{"userId":5}` is `400` with the tools router's bare `{"error":"Invalid request body"}` envelope and nothing else — the core deviation `tools-request-bodies-are-typed`, which the reference answers `202` to | `tools` |
-| `tools/guarded-routes-refuse-a-bare-caller` | track, notify and the telemetry query refuse a caller presenting nothing with the guard's own `401`/`403`, and never `202`; the query may also be `404` when no store mounts it | `tools` |
+| `tools/guarded-routes-refuse-a-bare-caller` | track and notify refuse a caller presenting nothing with the guard's own `401`/`403`, and never `202` | `tools-guarded` |
+| `tools/telemetry-query-refuses-a-bare-caller` | with the query route mounted, an anonymous `GET <tools>/telemetry` is `401`/`403` — never `200`, and never the `404` that would mean the route is not there | `tools-telemetry`, `tools-guarded` |
 | `tools/openapi-document-is-served-anonymously` | `200 application/json`, `openapi: "3.0.3"`, every path item under the one base the `/track/{eventName}` item sits under | `tools-docs` |
 | `tools/swagger-page-points-at-the-document-beside-it` | `200 text/html; charset=utf-8` carrying a Swagger UI shell whose spec `url:` is fetched from this same deployment and serves an OpenAPI document | `tools-docs` |
 

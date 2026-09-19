@@ -76,13 +76,14 @@ func newToolsApp(t *testing.T, env map[string]string, bundle *toolsBundle) *App 
 func TestBridgeDeliversEachLoginOnce(t *testing.T) {
 	t.Parallel()
 
+	type delivery struct{ event, correlation string }
 	var (
 		mu         sync.Mutex
-		deliveries []string // X-Webhook-Event per POST
+		deliveries []delivery // X-Webhook-Event and X-Correlation-Id per POST
 	)
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		deliveries = append(deliveries, r.Header.Get("X-Webhook-Event"))
+		deliveries = append(deliveries, delivery{r.Header.Get("X-Webhook-Event"), r.Header.Get("X-Correlation-Id")})
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -99,7 +100,13 @@ func TestBridgeDeliversEachLoginOnce(t *testing.T) {
 
 	app := newToolsApp(t, toolsEnv(), bundle)
 	invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
-	login := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(testEmail))
+	// The login carries a correlation id, because the register promises a
+	// bridged delivery "the same headers" a tracked one gets, and the one
+	// header that has to be carried across from the request to the outbound
+	// POST is this one (logging.go, correlatingTransport).
+	const correlation = "bridge-test-7f3a"
+	login := invoke(t, app, http.MethodPost, "/auth/login",
+		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer, "x-correlation-id", correlation), nil, registerBody(testEmail))
 	if login.StatusCode != http.StatusOK {
 		t.Fatalf("login status = %d (body %s)", login.StatusCode, login.Body)
 	}
@@ -120,10 +127,17 @@ func TestBridgeDeliversEachLoginOnce(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 	mu.Lock()
-	got := append([]string(nil), deliveries...)
+	got := append([]delivery(nil), deliveries...)
 	mu.Unlock()
-	if len(got) != 1 || got[0] != auth.EventAuthLoginSuccess {
+	if len(got) != 1 || got[0].event != auth.EventAuthLoginSuccess {
 		t.Errorf("the login reached the webhook %d time(s) as %v, want exactly once as %q", len(got), got, auth.EventAuthLoginSuccess)
+	}
+	// A bridged delivery is made from the cold-start context, which has no
+	// request carrier; the bridge rebuilds one from the event's own provenance
+	// so the outbound request carries the caller's id like a tracked event's
+	// does. Without that, this header would be empty.
+	if len(got) == 1 && got[0].correlation != correlation {
+		t.Errorf("the bridged delivery carried X-Correlation-Id %q, want the login's %q", got[0].correlation, correlation)
 	}
 
 	rows, err := bundle.bundle.telemetry.Query(context.Background(), auth.TelemetryFilter{EventName: auth.EventAuthLoginSuccess})
@@ -188,13 +202,23 @@ func TestToolsRoutesComeFromTheAdapter(t *testing.T) {
 		}
 	})
 
-	t.Run("the session guard is the adapter's", func(t *testing.T) {
-		resp := invoke(t, app, http.MethodPost, "/tools/track/order.paid", jsonHeaders(), nil, `{}`)
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("anonymous track = %d %s, want the adapter's 403", resp.StatusCode, resp.Body)
-		}
-		if body := decodeBody(t, resp); body["error"] != "No access token provided" {
-			t.Errorf("anonymous track body = %v, want the adapter's refusal", body)
+	t.Run("the session guard is the adapter's, on all three guarded routes", func(t *testing.T) {
+		// Track, notify and the telemetry query — the query in particular,
+		// because it is the one route that hands back stored PII and the one
+		// a test that covered track alone would leave unpinned.
+		for _, tc := range []struct{ method, path string }{
+			{http.MethodPost, "/tools/track/order.paid"},
+			{http.MethodPost, "/tools/notify/user:someone"},
+			{http.MethodGet, "/tools/telemetry"},
+		} {
+			resp := invoke(t, app, tc.method, tc.path, jsonHeaders(), nil, `{}`)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("anonymous %s %s = %d %s, want the adapter's 403", tc.method, tc.path, resp.StatusCode, resp.Body)
+				continue
+			}
+			if body := decodeBody(t, resp); body["error"] != "No access token provided" {
+				t.Errorf("anonymous %s %s body = %v, want the adapter's refusal", tc.method, tc.path, body)
+			}
 		}
 	})
 
@@ -227,6 +251,11 @@ func TestToolsRoutesComeFromTheAdapter(t *testing.T) {
 
 // TestToolsOffMountsNothing: with the block off, no route under the tools path
 // exists, no bus is built, and the App exposes no facade.
+//
+// Each route is probed on its own method. The core's router answers 404 to a
+// POST on the four GET-only routes even when it is fully mounted, so a probe
+// that POSTed everywhere would pass for those four whether or not the router
+// existed — an assertion that cannot fail is not one.
 func TestToolsOffMountsNothing(t *testing.T) {
 	t.Parallel()
 
@@ -234,12 +263,152 @@ func TestToolsOffMountsNothing(t *testing.T) {
 	if app.Tools != nil {
 		t.Errorf("App.Tools is set with tools.enabled off")
 	}
-	for _, path := range []string{"/tools/track/x", "/tools/notify/x", "/tools/telemetry", "/tools/stream", "/tools/openapi.json"} {
-		resp := invoke(t, app, http.MethodPost, path, jsonHeaders(), nil, `{}`)
+	if app.Events != nil {
+		t.Errorf("App.Events is set with tools.enabled off: a bus was built that nothing consumes")
+	}
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/tools/track/x"},
+		{http.MethodPost, "/tools/notify/x"},
+		{http.MethodGet, "/tools/telemetry"},
+		{http.MethodGet, "/tools/stream"},
+		{http.MethodGet, "/tools/openapi.json"},
+		{http.MethodGet, "/tools/docs"},
+	} {
+		resp := invoke(t, app, tc.method, tc.path, jsonHeaders(), nil, `{}`)
 		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("%s = %d with tools.enabled off, want 404", path, resp.StatusCode)
+			t.Errorf("%s %s = %d with tools.enabled off, want 404", tc.method, tc.path, resp.StatusCode)
 		}
 	}
+}
+
+// TestSessionPostureDoubleSubmit: under tools.auth: session a cookie caller is
+// held to the reference's CSRF double-submit (auth.middleware.ts:33-41) — a
+// mutating request on the access-token cookie with no matching X-CSRF-Token is
+// the reference's 403 CSRF_INVALID, not a 202 — while a bearer caller, a safe
+// method and a caller with no credential at all pass through to the guard
+// behind it. The core mounts the tools router outside its CSRF chain and says
+// the host's auth middleware is where this belongs; this pins that the product
+// is that host.
+func TestSessionPostureDoubleSubmit(t *testing.T) {
+	t.Parallel()
+
+	app := newToolsApp(t, toolsEnv(), nil)
+	reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
+	if reg.StatusCode != http.StatusCreated {
+		t.Fatalf("cookie-mode register = %d %s", reg.StatusCode, reg.Body)
+	}
+	jar := map[string]string{}
+	for _, c := range reg.Cookies {
+		name, rest, _ := strings.Cut(c, "=")
+		value, _, _ := strings.Cut(rest, ";")
+		jar[name] = value
+	}
+	access, csrf := jar[auth.AccessTokenCookieName], jar[auth.CSRFTokenCookieName]
+	if access == "" || csrf == "" {
+		t.Fatalf("register set no access-token or csrf-token cookie: %v", reg.Cookies)
+	}
+	accessCookie := auth.AccessTokenCookieName + "=" + access
+	csrfCookie := auth.CSRFTokenCookieName + "=" + csrf
+
+	t.Run("a cookie POST with no header is the reference's 403 CSRF_INVALID", func(t *testing.T) {
+		for _, path := range []string{"/tools/track/order.paid", "/tools/notify/user:someone"} {
+			resp := invoke(t, app, http.MethodPost, path, jsonHeaders(), []string{accessCookie, csrfCookie}, `{}`)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("cookie POST %s with no X-CSRF-Token = %d %s, want 403", path, resp.StatusCode, resp.Body)
+				continue
+			}
+			body := decodeBody(t, resp)
+			if body["error"] != "CSRF token validation failed" || body["code"] != "CSRF_INVALID" {
+				t.Errorf("cookie POST %s refusal = %v, want the reference's CSRF_INVALID envelope", path, body)
+			}
+		}
+	})
+
+	t.Run("a mismatched header is refused too", func(t *testing.T) {
+		resp := invoke(t, app, http.MethodPost, "/tools/track/order.paid",
+			jsonHeaders(auth.CSRFHeaderName, "not-the-cookie"), []string{accessCookie, csrfCookie}, `{}`)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("cookie POST with a wrong X-CSRF-Token = %d %s, want 403", resp.StatusCode, resp.Body)
+		}
+	})
+
+	t.Run("the double-submit passes", func(t *testing.T) {
+		resp := invoke(t, app, http.MethodPost, "/tools/track/order.paid",
+			jsonHeaders(auth.CSRFHeaderName, csrf), []string{accessCookie, csrfCookie}, `{}`)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("cookie POST with the matching X-CSRF-Token = %d %s, want 202", resp.StatusCode, resp.Body)
+		}
+	})
+
+	t.Run("a safe method needs no header", func(t *testing.T) {
+		resp := invoke(t, app, http.MethodGet, "/tools/telemetry", nil, []string{accessCookie}, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("cookie GET /tools/telemetry = %d %s, want 200", resp.StatusCode, resp.Body)
+		}
+	})
+
+	t.Run("a bearer caller is exempt", func(t *testing.T) {
+		// The same token, presented as a bearer: a cross-site page cannot set
+		// an Authorization header, which is why the reference exempts it.
+		resp := invoke(t, app, http.MethodPost, "/tools/track/order.paid", jsonHeaders("authorization", "Bearer "+access), nil, `{}`)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("bearer POST with no X-CSRF-Token = %d %s, want 202", resp.StatusCode, resp.Body)
+		}
+	})
+
+	t.Run("no credential at all is the guard's refusal, not the CSRF one", func(t *testing.T) {
+		// The reference answers "No access token provided" before it reaches
+		// its CSRF branch; a caller with no cookie is passed through to the
+		// authenticating guard for exactly that literal.
+		resp := invoke(t, app, http.MethodPost, "/tools/track/order.paid", jsonHeaders(), nil, `{}`)
+		if body := decodeBody(t, resp); resp.StatusCode != http.StatusForbidden || body["error"] != "No access token provided" {
+			t.Errorf("anonymous POST = %d %v, want the adapter's 403 No access token provided", resp.StatusCode, body)
+		}
+	})
+}
+
+// TestToolsDocsPairCarriesTheDocsPolicy: the tools router's Swagger page and
+// document are the same page under the same knob as the auth router's, and
+// carry the same Content-Security-Policy and companion headers — registered as
+// docs-page-carries-a-content-security-policy, whose surface names both pairs.
+// A mitigation that covered one Swagger page on this origin and not the other
+// would be bypassable one path over.
+func TestToolsDocsPairCarriesTheDocsPolicy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("at the default mount", func(t *testing.T) {
+		t.Parallel()
+		app := newToolsApp(t, toolsEnv(), nil)
+		page := invoke(t, app, http.MethodGet, "/tools/docs", nil, nil, "")
+		if page.StatusCode != http.StatusOK || page.Headers["Content-Security-Policy"] != docsPageCSP {
+			t.Errorf("GET /tools/docs = %d with policy %q, want 200 with the page policy", page.StatusCode, page.Headers["Content-Security-Policy"])
+		}
+		assertDocsCompanionHeaders(t, page.Headers)
+		spec := invoke(t, app, http.MethodGet, "/tools/openapi.json", nil, nil, "")
+		if spec.StatusCode != http.StatusOK || spec.Headers["Content-Security-Policy"] != docsSpecCSP {
+			t.Errorf("GET /tools/openapi.json = %d with policy %q, want 200 with the document policy", spec.StatusCode, spec.Headers["Content-Security-Policy"])
+		}
+		assertDocsCompanionHeaders(t, spec.Headers)
+		// And no other tools route is decorated: the middleware matches the
+		// two documentation paths and nothing else under the mount.
+		track := invoke(t, app, http.MethodPost, "/tools/track/x", jsonHeaders(), nil, `{}`)
+		if policy := track.Headers["Content-Security-Policy"]; policy != "" {
+			t.Errorf("POST /tools/track/x carries a Content-Security-Policy (%q); the docs policy must decorate the documentation pair and nothing else", policy)
+		}
+	})
+
+	t.Run("follows a moved tools.basePath", func(t *testing.T) {
+		t.Parallel()
+		app := newToolsApp(t, toolsEnv("AWESOME_AUTH_TOOLS_BASE_PATH", "/auth/tools"), nil)
+		moved := invoke(t, app, http.MethodGet, "/auth/tools/docs", nil, nil, "")
+		if moved.StatusCode != http.StatusOK || moved.Headers["Content-Security-Policy"] != docsPageCSP {
+			t.Errorf("GET /auth/tools/docs = %d with policy %q, want 200 with the page policy", moved.StatusCode, moved.Headers["Content-Security-Policy"])
+		}
+		old := invoke(t, app, http.MethodGet, "/tools/docs", nil, nil, "")
+		if old.StatusCode != http.StatusNotFound || old.Headers["Content-Security-Policy"] != "" {
+			t.Errorf("GET /tools/docs = %d with policy %q after the mount moved, want a bare 404", old.StatusCode, old.Headers["Content-Security-Policy"])
+		}
+	})
 }
 
 // TestToolsAccessPostures resolves each spelling of tools.auth against a live
@@ -308,6 +477,21 @@ func TestToolsAccessPostures(t *testing.T) {
 		}
 	})
 
+	t.Run("an unset posture is refused at load, by RS-16", func(t *testing.T) {
+		t.Parallel()
+		env := toolsEnv()
+		delete(env, "AWESOME_AUTH_TOOLS_AUTH")
+		_, err := New(context.Background(), Options{Getenv: envFunc(env), Logger: discardLogger(), Stores: memoryStores})
+		if err == nil {
+			t.Fatal("a tools block with no tools.auth came up: silence resolved to a posture")
+		}
+		for _, want := range []string{config.RuleToolsAuthUnset, "tools.auth", "tools.auth: none"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not say %q:\n%v", want, err)
+			}
+		}
+	})
+
 	t.Run("checkToolsSupport names D8", func(t *testing.T) {
 		t.Parallel()
 		cfg := config.Defaults()
@@ -322,6 +506,30 @@ func TestToolsAccessPostures(t *testing.T) {
 			t.Errorf("checkToolsSupport(session) = %v, want nil", err)
 		}
 	})
+}
+
+// TestToolsAccessRefusesAnUnsetPosture is the second lock on the door RS-16
+// closes: toolsAccess itself, handed an empty posture, returns an error and
+// never auth.ToolsPublic(). internal/config refuses the document first, so this
+// branch is not a code path a deployment can reach — which is exactly why it
+// is pinned: a default branch that mounted the open door would be invisible
+// until the day the validator was loosened.
+func TestToolsAccessRefusesAnUnsetPosture(t *testing.T) {
+	t.Parallel()
+
+	for _, posture := range []string{"", "Session", "public"} {
+		cfg := config.Defaults()
+		cfg.Tools.Enabled = true
+		cfg.Tools.Auth = posture
+		access, err := toolsAccess(cfg, nil, auth.HTTPConfig{}, nil)
+		if err == nil || access != nil {
+			t.Errorf("toolsAccess(%q) = %v, %v; want a refusal and no guard", posture, access, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "tools.auth") || !strings.Contains(err.Error(), "tools.auth: none") {
+			t.Errorf("toolsAccess(%q) refusal does not name the knob and the spelling of the open door: %v", posture, err)
+		}
+	}
 }
 
 // TestInboundWebhooksAreRefusedByDefault: a tools document that says nothing
@@ -402,13 +610,70 @@ func TestToolsColdStartLogSaysWhatTheRuntimeDoesNotDo(t *testing.T) {
 		"outgoing-webhook-delivery-races-the-response",
 		"the tools routes are unguarded",
 		"the SSE manager reaches no connection on this runtime",
-		"tools.stream.enabled",
-		"tools.sse.enabled",
+		// The two knob-gap rows, by their remedies. The knob paths alone would
+		// not discriminate: logToolsSurface names both paths in its own lines,
+		// so a report that dropped the rows would still contain them.
+		"the stream lands on a Lambda Function URL",
+		"nothing here is lost, and nothing here is delivered either",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the cold-start log does not say %q:\n%s", want, out)
 		}
 	}
+}
+
+// TestGuardedPosturesArePricedAtColdStart: the session posture's price — any
+// self-registered user reads the store-wide telemetry and attributes events to
+// anyone — is a cold-start warning naming the remedy, and the apiKey posture's
+// two core-inherited facts are stated. A deployment must not have to discover
+// either from behaviour.
+func TestGuardedPosturesArePricedAtColdStart(t *testing.T) {
+	t.Parallel()
+
+	logOf := func(t *testing.T, env map[string]string) string {
+		t.Helper()
+		var buf bytes.Buffer
+		app, err := New(context.Background(), Options{Getenv: envFunc(env), Logger: newLogger(&buf, slog.LevelDebug), Stores: memoryStores})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(app.Close)
+		return buf.String()
+	}
+
+	t.Run("session", func(t *testing.T) {
+		t.Parallel()
+		out := logOf(t, toolsEnv())
+		for _, want := range []string{
+			`"level":"WARN"`,
+			"the tools routes answer any signed-in user, and anyone can sign up",
+			"read every user's rows",
+			"any userId in the body",
+			"tools.auth: apiKey",
+			"X-CSRF-Token double-submit",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the session cold start does not say %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("apiKey", func(t *testing.T) {
+		t.Parallel()
+		out := logOf(t, toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"))
+		for _, want := range []string{
+			"the tools routes answer any active API key",
+			"no scope is required",
+			"tools-api-key-refusal-is-the-cores-bare-401",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the apiKey cold start does not say %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "the tools routes answer any signed-in user") {
+			t.Errorf("the apiKey cold start carries the session posture's warning:\n%s", out)
+		}
+	})
 }
 
 // TestUnwiredKnobsIsExactlyTheDocumentedList pins the whole of unwiredKnobs
@@ -462,6 +727,28 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			name: "the tools block with the stream off",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_STREAM", "false"),
 			want: []string{"security.jwt.refreshTokenSecret"},
+		},
+		{
+			// A tools store switched on with the block off: driverStores lists
+			// it as supported, so it validates, and nothing reads it. Reported,
+			// not refused (toolsKnobGaps).
+			name: "a tools store with the block off",
+			env: with(baseEnv(),
+				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
+				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
+			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "stores.enable.telemetry"},
+		},
+		{
+			// The API-key store under a posture that never opens it.
+			name: "the apiKey store under the session posture",
+			env:  toolsEnv("AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
+			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "tools.stream.enabled"},
+		},
+		{
+			// And under the posture that does: consumed, so not a gap.
+			name: "the apiKey store under the apiKey posture",
+			env:  toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
 		},
 	}
 	for _, tc := range cases {
@@ -590,4 +877,23 @@ func TestDynamoDBTelemetryRoundTrip(t *testing.T) {
 			t.Errorf("row %v is not the tracked event", row)
 		}
 	}
+}
+
+// lockedBuffer is a bytes.Buffer safe to read while a detached goroutine — an
+// outgoing webhook delivery, here — is still writing log lines into it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

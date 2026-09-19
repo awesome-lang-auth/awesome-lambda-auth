@@ -279,9 +279,11 @@ func runtimeSettingsKnobGaps(cfg *config.Config) []knobGap {
 		gaps = append(gaps, knobGap{
 			Path: "runtimeSettings.enabledWebhookActions",
 			Problem: "this is the global allowlist the inbound-webhook sandbox intersects with each webhook's own allowedActions " +
-				"(tools.router.ts:261-266), and this build mounts no tools router, so the list is stored and read by nothing",
-			Remedy: "leave it set -- it is seeded into the settings store and becomes live when the tools surface lands (P7); " +
-				"nothing in this build reads it today",
+				"(tools.router.ts:261-266), and this build never mounts that one route -- POST <tools>/webhook/{provider} is refused at " +
+				"cold start until a script runner exists (RS-15, deviation inbound-webhooks-are-refused-without-a-runner), whether or " +
+				"not the rest of the tools router is mounted -- so the list is stored and read by nothing",
+			Remedy: "leave it set -- it is seeded into the settings store and becomes live when the inbound-webhook runner lands (D9d), " +
+				"which retires RS-15; nothing in this build reads it today",
 		})
 	}
 	if rs.LazyEmailVerificationGracePeriodDays != defaults.LazyEmailVerificationGracePeriodDays {

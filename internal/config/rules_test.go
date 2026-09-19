@@ -456,6 +456,7 @@ func TestRefuseToStartRules(t *testing.T) {
 			name: "RS-14 an SSE distributor this build cannot provide",
 			mutate: func(doc Document) {
 				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
 				set(doc, "tools.inboundWebhooks.enabled", false)
 				set(doc, "tools.sse.enabled", true)
 				set(doc, "tools.sse.distributor.type", "redis")
@@ -474,6 +475,7 @@ func TestRefuseToStartRules(t *testing.T) {
 			name: "RS-14 fires with the SSE manager itself switched off",
 			mutate: func(doc Document) {
 				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
 				set(doc, "tools.inboundWebhooks.enabled", false)
 				set(doc, "tools.sse.distributor.type", "sns")
 				set(doc, "tools.sse.distributor.topicArn", "example-topic")
@@ -489,6 +491,7 @@ func TestRefuseToStartRules(t *testing.T) {
 			name: "RS-15 inbound webhooks enabled by default with no runner",
 			mutate: func(doc Document) {
 				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
 				set(doc, "stores.enable.webhooks", true)
 			},
 			allowUnimplemented: true,
@@ -523,6 +526,80 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantRule:           "",
 			wantPath:           "tools.auth",
 			wantMessage:        "admin.enabled is off",
+		},
+		{
+			// An enabled tools block that never says who may reach it. There is
+			// no default posture: the reference's is the open door, and silence
+			// must not resolve to it (validateTools, RS-16).
+			name: "RS-16 the tools block enabled with no access posture",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "stores.enable.telemetry", true)
+				set(doc, "stores.enable.webhooks", true)
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsAuthUnset,
+			wantPath:           "tools.auth",
+			wantMessage:        "tools.auth: none",
+		},
+		{
+			// The same validator, from the admin side: the console's mount on
+			// the api prefix itself (validateMounts).
+			name: "the admin console mounted on the api prefix itself",
+			mutate: func(doc Document) {
+				set(doc, "admin.enabled", true)
+				set(doc, "admin.basePath", "/auth")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "admin.basePath",
+			wantMessage:        "http.apiPrefix itself",
+		},
+		{
+			// The tools router as the deployment's catch-all.
+			name: "the tools router mounted at the root",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.basePath", "/")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.basePath",
+			wantMessage:        "mounted at the root",
+		},
+		{
+			// Under the prefix is supported (TestToolsIsWired loads
+			// /auth/tools); the prefix itself is not, trailing slash or no.
+			name: "the tools router mounted on the api prefix itself",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.basePath", "/auth/")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.basePath",
+			wantMessage:        "http.apiPrefix itself",
+		},
+		{
+			// Two subtree routers on one mount is a duplicate ServeMux pattern,
+			// which is a panic inside the adapter rather than a diagnostic.
+			name: "the tools router mounted on the admin console's path",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "admin.enabled", true)
+				set(doc, "tools.basePath", "/admin/tools")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.basePath",
+			wantMessage:        "admin.basePath",
 		},
 	}
 
@@ -1071,4 +1148,53 @@ func TestKMSPreviousKeyIDsAreValidated(t *testing.T) {
 		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
 		requireRule(t, err, "", "idProvider.kmsPreviousKeyIds")
 	})
+}
+
+// TestSessionPostureWithCrossSiteCookiesWarns: tools.auth: session together
+// with cookies.sameSite: none is a working configuration — the product's
+// session guard performs the reference's double-submit for a cookie caller on
+// the tools mount — so it loads, and it warns, because a front end on another
+// site cannot read the csrf-token cookie and has to call the tools routes with
+// the bearer token instead (collectWarnings).
+func TestSessionPostureWithCrossSiteCookiesWarns(t *testing.T) {
+	cases := []struct {
+		name, posture, sameSite string
+		want                    bool
+	}{
+		{"session with sameSite none", "session", "none", true},
+		{"session with sameSite lax", "session", "lax", false},
+		{"apiKey with sameSite none", "apiKey", "none", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", tc.posture)
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.webhooks", true)
+			set(doc, "stores.enable.apiKeys", true)
+			set(doc, "cookies.sameSite", tc.sameSite)
+			set(doc, "cookies.secure", true)
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv()), AllowUnimplemented: true})
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			var got *Diagnostic
+			for i, w := range cfg.Warnings() {
+				if w.Path == "tools.auth" && strings.Contains(w.Problem, "cookies.sameSite") {
+					got = &cfg.Warnings()[i]
+				}
+			}
+			if tc.want && got == nil {
+				t.Fatalf("no cross-site warning on tools.auth; got %v", cfg.Warnings())
+			}
+			if !tc.want && got != nil {
+				t.Fatalf("tools.auth %q with sameSite %q warned: %s", tc.posture, tc.sameSite, got.Error())
+			}
+			if got != nil && !strings.Contains(got.Remedy, "bearer") {
+				t.Errorf("the remedy does not name the bearer token: %s", got.Remedy)
+			}
+		})
+	}
 }

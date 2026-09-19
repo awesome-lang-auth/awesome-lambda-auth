@@ -687,20 +687,16 @@ Parameters:
       Cognito per miss on unauthenticated routes. Turn it back to import-only
       once the import has been verified. docs/cognito-migration.md §4.
 
-  # -----------------------------------------------------------------------
-  # Configuration document. File-only knobs (templates directory, extra claims,
-  # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
-  # variable by design; they arrive as a JSON document baked into the artifact by
-  # scripts/build-lambda.sh CONFIG_FILE=… and named here.
-  # -----------------------------------------------------------------------
-
   # ---------------------------------------------------------------------
   # The tools surface (D9a): track, notify, the telemetry query and the
-  # router's own documentation pair, mounted BESIDE the api prefix at
-  # ToolsBasePath — the reference's createToolsRouter is a second router the
-  # host mounts wherever it likes, and its swaggerBasePath defaults to /tools.
-  # Every one of the variables below is absent while EnableTools is "false",
-  # so an unconfigured stack loads the same configuration it loaded before
+  # router's own documentation pair, mounted at ToolsBasePath — the
+  # reference's createToolsRouter is a second router the host mounts wherever
+  # it likes, and its swaggerBasePath defaults to /tools. Every variable
+  # below but AWESOME_AUTH_TOOLS_ENABLED is absent while EnableTools is
+  # "false"; that one is always set, so it is this parameter and not a
+  # ConfigFile document that decides whether the block is on (the environment
+  # layer overrides the document, docs/config-reference.md §1). An
+  # unconfigured stack therefore loads the same configuration it loaded before
   # this block existed and pays nothing new: the three stores are partitions
   # of the one table, and the IAM statement below already grants every action
   # they use. What the block adds when on is one telemetry write per identity
@@ -720,30 +716,51 @@ Parameters:
       ToolsAuth, hands the auth core an event bus, and bridges every identity.*
       event it raises into the telemetry store and every matching outgoing
       webhook. It also switches the telemetry and webhook stores on, because
-      both are required by the block's own defaults. Off by default.
+      both are required by the block's own defaults. Off by default, and
+      always set: a ConfigFile document cannot turn the block on or off, this
+      parameter does.
   ToolsAuth:
     Type: String
-    Default: session
-    AllowedValues: [session, apiKey]
+    Default: apiKey
+    AllowedValues: [apiKey, session]
     Description: >-
-      AWESOME_AUTH_TOOLS_AUTH — who may reach the guarded tools routes.
-      "session" is the adapter's own middleware, so a tools call is
-      authenticated exactly as an API call is; "apiKey" is the core's API-key
-      guard over the API-key store, which this parameter also switches on, for
-      a caller that is a service rather than a person. The reference's default,
-      "none", is deliberately not offered here: it lets an anonymous caller
-      attribute an event to any user and have this deployment POST it to third
-      parties in its own name (docs/config-reference.md §17.6). A document in
-      ConfigFile can still say it, by name. "admin" arrives with the admin
-      console (D8).
+      AWESOME_AUTH_TOOLS_AUTH — who may reach the guarded tools routes. The
+      default, "apiKey", is the core's API-key guard over the API-key store,
+      which this parameter also switches on, for a caller that is a service;
+      keys are minted through the admin API (D8), and until one exists the
+      guard admits nobody, which is safe. Any active key passes — no scope is
+      required — and a refusal is the core's bare text/plain 401. "session" is
+      the adapter's own session middleware, and its price has to be read
+      before it is chosen: POST <ApiPrefix>/register is always mounted, so any
+      self-registered user holds a session, and a session reads the
+      STORE-WIDE telemetry (every identity.* event the bridge records, emails,
+      IP addresses, user agents and session ids included), attributes tracked
+      events to any userId in the body and so fires signed outgoing webhooks,
+      and notifies any topic (docs/config-reference.md §17.6). A cookie caller
+      is held to the CSRF double-submit; a bearer caller is not. The
+      reference's default, "none", is not offered here and is not reachable
+      through this template at all: this variable is set whenever EnableTools
+      is "true", and the environment layer overrides ConfigFile, so a
+      document's tools.auth is never in force on a stack deployed from here.
+      "admin" arrives with the admin console (D8).
   ToolsBasePath:
     Type: String
     Default: /tools
     AllowedPattern: '^/[A-Za-z0-9._~/-]*$'
     Description: >-
-      AWESOME_AUTH_TOOLS_BASE_PATH — where the tools router mounts, as a
-      sibling of ApiPrefix and never under it. The Angular demo mounts it at
-      <apiPrefix>/tools; set this to "/auth/tools" to follow it.
+      AWESOME_AUTH_TOOLS_BASE_PATH — where the tools router mounts: beside
+      ApiPrefix by default, and it may be placed under it — the Angular demo
+      mounts it at <apiPrefix>/tools; set this to "/auth/tools" to follow it.
+      It may not be "/", ApiPrefix itself, or the admin console's mount or a
+      path inside it; each of those is refused at cold start rather than
+      mounted (internal/config, validateMounts).
+
+  # -----------------------------------------------------------------------
+  # Configuration document. File-only knobs (templates directory, extra claims,
+  # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
+  # variable by design; they arrive as a JSON document baked into the artifact by
+  # scripts/build-lambda.sh CONFIG_FILE=… and named here.
+  # -----------------------------------------------------------------------
 
   ConfigFile:
     Type: String
@@ -2086,8 +2103,12 @@ Resources:
           AWESOME_AUTH_RS_ISSUER: !If [HasResourceServerIssuer, !Ref ResourceServerIssuer, !Ref 'AWS::NoValue']
 
           # --- the tools surface -----------------------------------------
-          # Every variable here is absent while EnableTools is "false" (see
-          # the parameter). Inbound webhooks are written off explicitly
+          # Every variable here but the first is absent while EnableTools is
+          # "false". AWESOME_AUTH_TOOLS_ENABLED itself is always set, so the
+          # parameter decides and a ConfigFile document cannot override it —
+          # nor, with the block on, AWESOME_AUTH_TOOLS_AUTH: the environment
+          # layer wins over the document (see the parameters). Inbound
+          # webhooks are written off explicitly
           # because the schema defaults them ON, as the reference does, and
           # RS-15 refuses that until the script runner (D9d) exists: the
           # config layer will not silently override a default, so the

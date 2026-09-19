@@ -28,6 +28,9 @@ func validate(c *Config, d *diagnostics) {
 	validateRateLimit(c, d)
 	validateStores(c, d)
 	validateHTTPAndDocs(c, d)
+	// Last, because it reads three paths the validators above have already
+	// checked for shape.
+	validateMounts(c, d)
 }
 
 func validateDeployment(c *Config, d *diagnostics) {
@@ -577,6 +580,24 @@ func validateTools(c *Config, d *diagnostics) {
 	if c.Tools.Auth != "" {
 		enum(d, "tools.auth", c.Tools.Auth, ToolsAuthNone, ToolsAuthSession, ToolsAuthAPIKey, ToolsAuthAdmin)
 	}
+	// An enabled tools block has to say who may reach it. There is no default,
+	// on purpose: the only value the reference would supply for a silent
+	// document is its own — no authMiddleware, the open door — and the house
+	// rule that forgetting tightens rather than loosens (Defaults) has no
+	// tighter reading of an absent guard than refusing to guess one.
+	// Defaulting to `session` instead was considered and rejected: the posture
+	// decides whether a server-to-server caller can reach track at all, so a
+	// silent default is a silent 403 for the deployment that meant apiKey, and
+	// the imported core takes the same view of its own zero value
+	// (tools-router-requires-an-explicit-guard-decision mounts nothing until
+	// the host has chosen). `none` stays available, by name and only by name.
+	// With the block off the knob is inert and an empty one is left alone.
+	if c.Tools.Enabled && c.Tools.Auth == "" {
+		d.errf(RuleToolsAuthUnset, "tools.auth",
+			"tools.enabled is on and tools.auth is not set, so nothing says who may reach POST <tools>/track, POST <tools>/notify and GET <tools>/telemetry",
+			fmt.Sprintf("write tools.auth: %s, %s or %s -- or tools.auth: %s to get the reference's unguarded routes, by name",
+				ToolsAuthSession, ToolsAuthAPIKey, ToolsAuthAdmin, ToolsAuthNone))
+	}
 	// The admin posture puts the tools routes behind the admin console's own
 	// guard, and that guard exists only when the console is configured: it is
 	// built from admin.accessPolicy and the admin session cookie, neither of
@@ -769,6 +790,88 @@ func ttl(d *diagnostics, path string, v Duration, required bool) {
 			fmt.Sprintf("%q resolves to a non-positive duration", v.String()),
 			"a token whose lifetime is zero or negative is never valid; use a positive span")
 	}
+}
+
+// validateMounts is the one place the three path-bearing knobs — http.apiPrefix,
+// admin.basePath and tools.basePath — are checked against each other. It refuses
+// the values that make two routers one subtree, or one router the whole server.
+//
+// The auth router is a set of method-bearing routes under the api prefix. The
+// admin console and the tools router are each registered as a subtree — the
+// mount and everything below it — and each may sit *under* the prefix: the
+// Angular demo mounts the tools router at <apiPrefix>/tools, the contract suite
+// has a knob for exactly that, and http.ServeMux resolves the overlap the right
+// way round, because every auth route is a more specific pattern than the
+// subtree. What a subtree mount may not be is:
+//
+//   - "/": the router becomes the deployment's catch-all, so every path no other
+//     route claims is answered by a router that was asked for none of them.
+//   - http.apiPrefix itself: the same happens to the api prefix — a misspelled
+//     or wrong-method auth request stops being the mux's own 404 or 405 and
+//     becomes that router's 404.
+//   - equal to, above or below the other subtree mount: equal is a duplicate
+//     ServeMux pattern, which is a panic inside the adapter at cold start with a
+//     stack trace and no knob named; nested is one router swallowing part of the
+//     other. Checked only when both blocks are on, since a mount that is not
+//     registered collides with nothing.
+//
+// One validator for the three rather than one per block, because a collision
+// has two sides and a diagnostic that named only the knob its block happened to
+// own would send the operator to whichever side was written second. Compared
+// after trimming slashes, which is how the core resolves a mount
+// (HTTPConfig.ToolsPath), so "/tools/" and "/tools" are one value here as there.
+// A value that is not an absolute path is left to absolutePath, which has
+// already refused it.
+func validateMounts(c *Config, d *diagnostics) {
+	norm := func(p string) string { return "/" + strings.Trim(strings.TrimSpace(p), "/") }
+	prefix := norm(c.HTTP.APIPrefix)
+
+	type subtree struct {
+		knob, raw, mount string
+	}
+	var mounts []subtree
+	if c.Admin.Enabled && strings.HasPrefix(c.Admin.BasePath, "/") {
+		mounts = append(mounts, subtree{"admin.basePath", c.Admin.BasePath, norm(c.Admin.BasePath)})
+	}
+	if c.Tools.Enabled && strings.HasPrefix(c.Tools.BasePath, "/") {
+		mounts = append(mounts, subtree{"tools.basePath", c.Tools.BasePath, norm(c.Tools.BasePath)})
+	}
+
+	for _, m := range mounts {
+		switch m.mount {
+		case "/":
+			d.errf("", m.knob,
+				"the router cannot be mounted at the root: it would answer every path no other route claims",
+				fmt.Sprintf("use a path of its own, for example %s", Defaults().mountDefault(m.knob)))
+		case prefix:
+			d.errf("", m.knob,
+				fmt.Sprintf("%q is http.apiPrefix itself, so this router would answer every path under the api prefix that no auth route claims", m.raw),
+				fmt.Sprintf("mount it beside the prefix (%s) or below it (%s%s)", Defaults().mountDefault(m.knob), prefix, Defaults().mountDefault(m.knob)))
+		}
+	}
+	if len(mounts) == 2 {
+		a, b := mounts[0], mounts[1]
+		if a.mount == b.mount || strings.HasPrefix(a.mount, b.mount+"/") || strings.HasPrefix(b.mount, a.mount+"/") {
+			// Reported once, on the tools knob: the admin console is the older
+			// mount and the one the hosted UI's pages are written against, so
+			// it is the tools router that moves.
+			d.errf("", b.knob,
+				fmt.Sprintf("%q and %s %q are the same subtree or one inside the other, so two routers would claim the same paths", b.raw, a.knob, a.raw),
+				fmt.Sprintf("give each its own mount, for example %s and %s", Defaults().mountDefault(a.knob), Defaults().mountDefault(b.knob)))
+		}
+	}
+}
+
+// mountDefault is the schema default of a subtree mount, by knob, for the
+// remedy text of validateMounts.
+func (c *Config) mountDefault(knob string) string {
+	switch knob {
+	case "admin.basePath":
+		return c.Admin.BasePath
+	case "tools.basePath":
+		return c.Tools.BasePath
+	}
+	return "/" + strings.TrimSuffix(knob, ".basePath")
 }
 
 func absolutePath(d *diagnostics, path, got string) {

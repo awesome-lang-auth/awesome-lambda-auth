@@ -209,15 +209,25 @@ func docsOptions(cfg *config.Config) auth.DocsOptions {
 	}
 }
 
-// docsSecurityHeaders decorates the two documentation responses with a
+// docsSecurityHeaders decorates the documentation responses with a
 // Content-Security-Policy and the two headers that go with it.
 //
-// It is a middleware over the whole mux that acts on exactly two paths, and that
-// shape is the point: it registers no pattern, so the adapter still owns the
-// surface and the rule against adding a route under the api prefix is untouched.
-// It matches on the resolved prefix and the core's own path constants, so a
-// customised http.apiPrefix moves the policy with the routes, and an upstream
-// change to either path moves it too.
+// It is a middleware over the whole mux that acts on exactly two paths — four
+// when the tools router is mounted — and that shape is the point: it registers
+// no pattern, so the adapter still owns the surface and the rule against adding
+// a route under the api prefix or the tools path is untouched. It matches on
+// the resolved prefix and the core's own path constants, so a customised
+// http.apiPrefix moves the policy with the routes, and an upstream change to
+// either path moves it too.
+//
+// **The tools router's pair is the same page and gets the same policy.** With
+// tools.enabled the core serves a second Swagger UI at <tools>/docs — the same
+// SwaggerUIHandler, the same unpinned CDN bundle, on the same origin as the auth
+// cookies, under the same docs.swagger knob (toolsHTTPOptions). The hazard the
+// policy exists for does not care which of the two paths the operator opened,
+// so a mitigation that covered one would be bypassable one path over. The tools
+// pair is matched on toolsPath, the mount the adapter resolves, and the page
+// fetches its document from beside itself, which connect-src 'self' allows.
 //
 // **What the policy buys, exactly.** It does not make an untrusted CDN safe. A
 // compromised bundle still executes same-origin, can still read document.cookie,
@@ -256,6 +266,14 @@ func docsSecurityHeaders(cfg *config.Config) func(http.Handler) http.Handler {
 	if spec, page, ok := adminDocsPaths(cfg); ok {
 		policies[spec] = docsSpecCSP
 		policies[page] = docsPageCSP
+	}
+	// The tools router's pair, mounted by the core under the same knob whenever
+	// the router is (toolsHTTPOptions sets Docs.Enabled from docsEnabled and
+	// leaves BasePath empty, so the pair sits at the mount itself).
+	if cfg.Tools.Enabled {
+		mount := toolsPath(cfg)
+		policies[mount+auth.DocsUIPath] = docsPageCSP
+		policies[mount+auth.DocsSpecPath] = docsSpecCSP
 	}
 
 	return func(next http.Handler) http.Handler {
