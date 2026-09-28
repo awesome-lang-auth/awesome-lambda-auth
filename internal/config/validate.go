@@ -568,7 +568,8 @@ func validateAdmin(c *Config, d *diagnostics) {
 	if mb := c.Admin.Upload.MaxFileSizeMb; mb < 1 || mb > 50 {
 		d.errf("", "admin.upload.maxFileSizeMb",
 			fmt.Sprintf("%d MB is outside the supported range 1-50", mb),
-			"the API Gateway payload limit makes anything larger undeliverable; use 5")
+			"use 5, the reference's own limit and the only value the core honours; the effective ceiling through this API is lower still, "+
+				"about 4.4 MiB, because a multipart body arrives base64-encoded inside a 6 MB invocation event (config-reference.md §16.5)")
 	}
 }
 

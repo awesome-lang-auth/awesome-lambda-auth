@@ -471,6 +471,17 @@ func collectWarnings(cfg *Config) {
 			"the tools endpoints are unauthenticated, reproducing the reference's default",
 			"set tools.auth to session, apiKey or admin unless the endpoints are deliberately public")
 	}
+	// The open console. Not refused, because it is the reference's own default
+	// and a stack really can sit behind a network boundary this loader cannot
+	// see; but every front door the SAM template offers is internet-facing, so
+	// the operator hears it here, where the deployment tooling reads before an
+	// upload, and again at cold start (cmd/auth/admin.go logAdminSurface, at
+	// Warn). The template no longer offers `open` as a parameter value at all.
+	if cfg.Admin.Enabled && cfg.Admin.AccessPolicy == AdminAccessPolicyOpen {
+		cfg.warn("admin.accessPolicy",
+			"the admin console admits every request with no credential at all -- the user listing, the API-key and webhook-secret routes and promote included -- which is the reference's default and is only for a stack nobody outside your network can reach",
+			"set admin.accessPolicy: is-admin-flag and get in with admin.rootUser, or accept this on a stack behind a network boundary of your own")
+	}
 	if cfg.IsProduction() {
 		for _, path := range sortedKeys(cfg.secrets) {
 			resolved := cfg.secrets[path]

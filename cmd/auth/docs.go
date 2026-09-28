@@ -234,22 +234,34 @@ func docsOptions(cfg *config.Config) auth.DocsOptions {
 // Off when the routes are not mounted, because a policy on a 404 is a claim
 // about a surface this deployment does not have, and because an operator reading
 // headers should be able to tell the two states apart.
+//
+// The admin console's own pair — GET <admin>/api/openapi.json and
+// GET <admin>/api/docs — gets the same two policies when the console is mounted
+// with its documentation on, because it is the same hazard on the same origin:
+// the core serves the console's page with SwaggerUIHandler unchanged, the very
+// HTML that loads swagger-ui-dist@5 from the CDN this file pins, and the
+// console's document describes the most privileged surface this deployment has.
+// It follows docs.swagger exactly as the auth router's pair does (admin.go,
+// adminHTTPOptions), so one switch turns both pairs and both policies on.
 func docsSecurityHeaders(cfg *config.Config) func(http.Handler) http.Handler {
 	if !docsEnabled(cfg) {
 		return func(next http.Handler) http.Handler { return next }
 	}
 
 	prefix := httpConfig(cfg).Prefix()
-	specPath := prefix + auth.DocsSpecPath
-	pagePath := prefix + auth.DocsUIPath
+	policies := map[string]string{
+		prefix + auth.DocsSpecPath: docsSpecCSP,
+		prefix + auth.DocsUIPath:   docsPageCSP,
+	}
+	if spec, page, ok := adminDocsPaths(cfg); ok {
+		policies[spec] = docsSpecCSP
+		policies[page] = docsPageCSP
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case pagePath:
-				setDocsHeaders(w, docsPageCSP)
-			case specPath:
-				setDocsHeaders(w, docsSpecCSP)
+			if policy, ok := policies[r.URL.Path]; ok {
+				setDocsHeaders(w, policy)
 			}
 			next.ServeHTTP(w, r)
 		})

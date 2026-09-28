@@ -148,6 +148,36 @@ type domain struct {
 // does nothing at all, and a knob inside a wired domain is reported while
 // nothing can act on it.
 //
+// The admin console (P6's fifth and last block) closed `admin`, secret prefix
+// included, and it is the first domain to leave this list whose surface is
+// mounted *beside* the api prefix rather than under it: with `admin.enabled`
+// set, the imported adapter mounts the core's fifty-one console routes at
+// `admin.basePath` from HTTPConfig.Admin, which cmd/auth admin.go builds out of
+// the block knob by knob. `admin.accessPolicy` becomes the core's
+// AdminAccessPolicy — three of the five spellings are the core's own
+// constructors, and `rbac:<role>` and `permission:<perm>` compile to an
+// AdminPredicate over the RBAC store in which a store error is a denial, the
+// reference's `catch { granted = false }` (admin.router.ts:378-380).
+// `admin.bootstrapSecret` and `admin.rootUser.passwordHash` are read now, so a
+// secret supplied through its documented environment variable no longer needs
+// a secretPrefix to be noticed — the same end `oauth.` and `idProvider.` came
+// to. The refusal that outlives the gate is RS-6 (rules.go): an enabled console
+// with neither a policy nor a bootstrap secret still refuses the cold start,
+// because the reference serves that configuration unguarded.
+//
+// The block is also what made five `stores.enable` flags mean something
+// (metadata, rbac, tenants, apiKeys, webhooks: the `admin` slot of
+// coreOptionSets hands each flagged store to the core by name), and what
+// closed the `ui.uploadDir` paragraph above: the four upload routes are the
+// writer that paragraph said did not exist, `ui.uploadDir` names an S3 location
+// one auth.UploadStore is built from, and the deviation it cites is retired in
+// the register rather than deleted from it. Two knobs of this block are
+// reported rather than honoured, by the rule the next paragraph states:
+// `admin.sessionTtl` and `admin.upload.maxFileSizeMb` both reach constants in
+// the core — the reference's fixed `expiresIn: '24h'` (admin.router.ts:585) and
+// its 5 MiB multer limit — so unwiredKnobs names either one that differs from
+// the value the core applies.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -160,12 +190,6 @@ type domain struct {
 // Everything below is defined, validated and refused.
 func unwiredDomains() []domain {
 	return []domain{
-		{
-			path:         "admin",
-			phase:        "P6 (admin surface)",
-			get:          func(c *Config) any { return c.Admin },
-			secretPrefix: "admin.",
-		},
 		{
 			path:         "tools",
 			phase:        "P7 (tools, telemetry, SSE, webhooks)",

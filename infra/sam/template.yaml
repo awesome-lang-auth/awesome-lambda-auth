@@ -84,6 +84,8 @@ Metadata:
         Parameters: [MemorySize, Timeout, ReservedConcurrentExecutions, SessionCheckOn]
       - Label: {default: Content delivery (CloudFront)}
         Parameters: [EnableCloudFront, CloudFrontAliases, CloudFrontCertificateArn, CloudFrontPriceClass]
+      - Label: {default: Admin console}
+        Parameters: [EnableAdminConsole, AdminAccessPolicy, AdminRootEmail, AdminRootPasswordHashArn, EnableAdminUploads]
       - Label: {default: Observability and alarms}
         Parameters:
           - LogRetentionDays
@@ -792,7 +794,11 @@ Parameters:
     AllowedValues: [allcalls, refresh, none]
     Description: >-
       AWESOME_AUTH_SESSIONS_CHECK_ON. "allcalls" costs one strongly-consistent
-      GetItem on every authenticated request and buys immediate revocation.
+      GetItem on every authenticated request and buys immediate revocation on
+      the auth routes. It does not reach the admin console: its guard verifies
+      the token and never consults the session store, so a revoked session's
+      access token, and the console's own 24-hour admin token, stay admin
+      credentials until they expire.
 
   # -----------------------------------------------------------------------
   # Content delivery. The hosted UI is served by the function, from assets
@@ -861,6 +867,140 @@ Parameters:
       because nothing here is cached — a distant edge buys a shorter TLS
       handshake and nothing else, so paying for one is paying for latency
       smoothing, not for hit rate.
+
+  # -----------------------------------------------------------------------
+  # Admin console (config-schema.md §1.13, config-reference.md §16).
+  #
+  # The reference's admin router, mounted by the function at /admin beside
+  # the auth routes, guarded by an access policy the operator names. Off by
+  # default: with EnableAdminConsole "false" nothing under /admin is mounted,
+  # no variable below is set, and the stack is the stack it was.
+  #
+  # THREE THINGS TO DO BEFORE TURNING IT ON, in this order:
+  #
+  #   1. Run `migrate backfill-users --table <TableName output> --region
+  #      <region> --profile <yours>` once. The console's user tab and the
+  #      first-user policy read a sparse index that only accounts created
+  #      since the D6 release are in; older accounts are found by every
+  #      other route and missing from those two, and nothing looks wrong
+  #      from outside. The sweep is idempotent and safe while serving. It is
+  #      an operator command because it is a Scan, which the execution role
+  #      below deliberately does not grant.
+  #   2. Decide who gets in. AdminAccessPolicy is the whole of that decision
+  #      and there is no unguarded default: the function refuses to start
+  #      with the console on and no policy (RS-6), and the core refuses to
+  #      mount one (admin-console-requires-an-explicit-policy). This template
+  #      offers ONE value, is-admin-flag. The reference's two others are
+  #      ConfigFile-only here, deliberately: "open" admits every request with
+  #      no credential and is for a stack behind a network boundary, which
+  #      nothing in this template provides (no WAF, no allow-list, no private
+  #      endpoint), so it is accepted only from a document and warned about;
+  #      "first-user" is refused at cold start on every driver (RS-17),
+  #      because on this product ids are random and the policy would hand the
+  #      console to whoever drew the lowest one.
+  #   3. Give yourself a way in. Under is-admin-flag nobody is flagged on day
+  #      one, so the root user below is how the first administrator logs in
+  #      and promotes the second. It is an email and a bcrypt hash in Secrets
+  #      Manager -- a hash, never a password, and never in this template.
+  #
+  # The rbac:<role> and permission:<perm> forms are ConfigFile-only: they
+  # need stores.enable.rbac, which is a document knob, and a Rule cannot see
+  # the document. The stores behind the console's tabs (metadata, rbac,
+  # tenants, apiKeys, webhooks) are likewise switched on in the document.
+  #
+  # The console is served from the same origin as the auth routes and the
+  # hosted UI, so the KNOWN LIMITATION at the top of this file applies to its
+  # 24-hour session cookie exactly as it applies to the auth cookies, and one
+  # thing more: the console sits outside the CSRF chain by design and its
+  # guard accepts the ordinary access-token cookie, so that cookie's SameSite
+  # attribute is the only defence its writes have against a cross-site form
+  # post. The Rule AdminConsoleNeedsSameSiteCookies refuses the console beside
+  # CookieSameSite "none" at changeset time, as RS-18 does at cold start.
+  #
+  # What the console's session is NOT: revocable. The guard verifies signature,
+  # type, issuer and expiry and never consults the session store, so
+  # SessionCheckOn "allcalls" buys nothing on this surface, POST /admin/logout
+  # only clears the cookie, and an admin token lives its 24 hours whatever
+  # happens to the account -- rotating the access-token secret is the one kill
+  # switch. Clearing an isAdmin flag has no route on either line; it is a table
+  # edit. And the console's own POST /admin/login is password-only: it does not
+  # enforce a second factor the deployment requires (config-reference.md §16.2).
+  # -----------------------------------------------------------------------
+
+  EnableAdminConsole:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_ADMIN_ENABLED. "true" mounts the admin console at /admin,
+      guarded by AdminAccessPolicy. Run `migrate backfill-users` against the
+      table once before turning this on (see the comment above): the user tab
+      reads an index that pre-existing accounts are not in until it runs. The
+      console's session is a 24-hour token the session store never sees:
+      SessionCheckOn does not apply to it, logout only clears the cookie, and
+      rotating the access-token secret is the only way to end one early. Its
+      own POST /admin/login does not enforce a second factor.
+
+  AdminAccessPolicy:
+    Type: String
+    Default: is-admin-flag
+    AllowedValues: [is-admin-flag]
+    Description: >-
+      AWESOME_AUTH_ADMIN_ACCESS_POLICY — who the console admits. "is-admin-flag"
+      admits a user whose isAdmin flag is set (POST /admin/users/{id}/promote
+      sets it; the root user below is how the first one gets set). It is the
+      one value this template offers. "open" (everyone, no credential — the
+      reference's default) is ConfigFile-only and only for a stack nobody
+      outside your network can reach; "first-user" is refused at cold start
+      (RS-17: ids are random here, so it would admit whoever drew the lowest
+      one). The rbac:<role> and permission:<perm> forms are set in ConfigFile,
+      where stores.enable.rbac can be switched on beside them.
+
+  AdminRootEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: >-
+      AWESOME_AUTH_ADMIN_ROOT_EMAIL — the bootstrap administrator's address,
+      matched exactly at POST /admin/login. It lives in configuration, not in
+      the user table, bypasses the access policy, and is how the first
+      administrator gets in under is-admin-flag. Requires
+      AdminRootPasswordHashArn; the function refuses to start with one and not
+      the other. Empty — the default — configures no root user. Placeholder
+      is deliberately empty; never commit an address.
+
+  AdminRootPasswordHashArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the root user's bcrypt
+      PASSWORD HASH — the output of bcrypt, beginning $2a$/$2b$/$2y$, never the
+      password. Nothing is generated for you: hash the password yourself
+      (`htpasswd -nBC 12 x | cut -d: -f2`, which prompts for the password
+      so it never lands in shell history or the process list — never the -b
+      form, which takes it on the command line — or any bcrypt tool) and
+      store the hash. REQUIRED whenever AdminRootEmail is set. Append
+      #<jsonKey> to select one key of a JSON secret document. The function
+      reads it at cold start; the value never enters the template.
+
+  EnableAdminUploads:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create a private, encrypted S3 bucket for the logos and backgrounds the
+      console uploads, and point AWESOME_AUTH_UI_UPLOAD_DIR at it. "false" —
+      the default — creates no bucket, grants no S3 permission, and leaves the
+      console's upload tab off and the hosted UI's two asset paths answering
+      404, which is the reference's behaviour with uploadDir unset. On, the
+      bucket costs its storage (cents for a few logos; ~USD 0.023 per GB-month)
+      plus ~USD 0.0004 per thousand requests for every page view that fetches
+      the logo — see docs/cost-model.md §2.6. The largest file the console can
+      take through this API is about 4.4 MiB, not the reference's 5 MiB: a
+      multipart body reaches the function base64-encoded inside a 6 MB
+      invocation event, and past that API Gateway answers its own 413 body
+      before the function runs (config-reference.md §16.5).
 
   # -----------------------------------------------------------------------
   # Observability, alarms and budget
@@ -1112,6 +1252,24 @@ Conditions:
   HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
   HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
 
+  # The admin console. The switch gates every admin variable, the root user's
+  # pair included: HasAdminRootPasswordHash carries the switch as its first
+  # term, so a console turned off leaves no root-user variable behind and no
+  # IAM read of the hash -- a function that fetched a secret at cold start for
+  # a console it does not mount would be a permission it does not need. The
+  # root user's two halves are conditioned together so that a hash ARN without
+  # an email is inert (no variable, no IAM read) rather than half-configured,
+  # and the Rule below refuses the other half-shape. The bucket is its own
+  # switch: it is the UI's read side as much as the console's write side, and
+  # a deployment may keep serving uploaded logos with the console turned off.
+  AdminConsoleEnabled: !Equals [!Ref EnableAdminConsole, 'true']
+  HasAdminRootEmail: !Not [!Equals [!Ref AdminRootEmail, '']]
+  HasAdminRootPasswordHash: !And
+    - !Condition AdminConsoleEnabled
+    - !Condition HasAdminRootEmail
+    - !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
+  AdminUploadsEnabled: !Equals [!Ref EnableAdminUploads, 'true']
+
   # Observability. HasAlarmTarget is the one every notifying resource is gated
   # on: with neither parameter set, no topic is created, no subscription exists,
   # no address appears anywhere, and the alarms carry no AlarmActions at all.
@@ -1300,6 +1458,35 @@ Rules:
   # over the other is how an operator ends up watching a topic nothing publishes
   # to. Refusing the pair costs one redeploy and removes a whole class of "the
   # alarm never fired" — which is the only failure mode of an alarm that matters.
+  # Parameter-only: the hash arrives as an ARN this template hands to the
+  # function and to IAM, so the pairing is knowable here. An email with no
+  # hash is a root login that is served and can never succeed; the function
+  # refuses it at cold start too (cmd/auth/admin.go, checkAdminRootUser), but
+  # a Rule refuses it before anything is touched.
+  AdminRootUserNeedsItsPasswordHash:
+    RuleCondition: !Not [!Equals [!Ref AdminRootEmail, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
+        AssertDescription: >-
+          AdminRootEmail is set, so AdminRootPasswordHashArn must name the
+          Secrets Manager secret holding that user's bcrypt password hash.
+          Without it the root login is served and can never succeed.
+
+  # RS-18 at changeset time. The console sits outside the CSRF chain and its
+  # guard accepts the ordinary access-token cookie, so that cookie's SameSite
+  # attribute is the only thing between a cross-site form post and every admin
+  # write, promote included. Parameter-only: both knobs are parameters here,
+  # and the function refuses the same pair at cold start for a document.
+  AdminConsoleNeedsSameSiteCookies:
+    RuleCondition: !Equals [!Ref EnableAdminConsole, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CookieSameSite, 'none']]
+        AssertDescription: >-
+          EnableAdminConsole is true, so CookieSameSite cannot be "none": the
+          admin console has no CSRF check by design and accepts the access-token
+          cookie, so SameSite is the only defence its writes have against a
+          cross-site form post. Use lax (the default) or strict.
+
   AlarmEmailAndTopicAreExclusive:
     Assertions:
       - Assert: !Or
@@ -1855,6 +2042,42 @@ Resources:
           AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID: !If [HasCognitoAppClient, !Ref CognitoAppClientId, !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_MIGRATION_MODE: !If [MigratingFromCognito, !Ref CognitoMigrationMode, !Ref 'AWS::NoValue']
 
+          # --- admin console ---------------------------------------------
+          # Every variable here is absent while EnableAdminConsole is
+          # "false" -- the root user's pair through HasAdminRootPasswordHash,
+          # whose first term is the switch -- so an unconfigured stack loads
+          # the configuration it loaded before this block existed and reads
+          # no secret for a console it does not mount. The root user's hash
+          # is a REFERENCE with the _SECRETSMANAGER suffix, like the signing
+          # secrets: the function fetches the value at cold start and the
+          # bcrypt hash never enters the template or the environment.
+          #
+          # The console's JWT secret is deliberately NOT a variable: the
+          # binary leaves AdminOptions.JWTSecret empty so the core verifies
+          # admin sessions with security.jwt.accessTokenSecret, which is the
+          # integration the reference documents and the reason an ordinary
+          # login also opens the console (config-reference.md §16).
+          AWESOME_AUTH_ADMIN_ENABLED: !If [AdminConsoleEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_ADMIN_ACCESS_POLICY: !If [AdminConsoleEnabled, !Ref AdminAccessPolicy, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_ADMIN_ROOT_EMAIL: !If
+            - HasAdminRootPasswordHash
+            - !Ref AdminRootEmail
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH_SECRETSMANAGER: !If
+            - HasAdminRootPasswordHash
+            - !Ref AdminRootPasswordHashArn
+            - !Ref 'AWS::NoValue'
+          # The upload location, as the S3 form ui.uploadDir takes on this
+          # product: the bucket this stack owns, under one prefix, so the
+          # IAM statement below can be scoped to that prefix and nothing
+          # else in the bucket. Present whenever the bucket is, console or
+          # not, because it is also where the hosted UI serves uploaded
+          # logos from.
+          AWESOME_AUTH_UI_UPLOAD_DIR: !If
+            - AdminUploadsEnabled
+            - !Sub 's3://${AdminUploadsBucket}/uploads'
+            - !Ref 'AWS::NoValue'
+
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
           # the reproducible zip, so what the function reads is what was built.
@@ -2216,6 +2439,73 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${CognitoRegion}:${AWS::AccountId}:userpool/${CognitoUserPoolId}'
           - !Ref 'AWS::NoValue'
 
+        # -----------------------------------------------------------------
+        # The root administrator's password hash, on the same terms as the
+        # webhook signing keys: its own statement, present only when an ARN
+        # was named beside an email, scoped to that one secret with the
+        # '#<jsonKey>' selector stripped.
+        # -----------------------------------------------------------------
+        - !If
+          - HasAdminRootPasswordHash
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadAdminRootPasswordHash
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Select [0, !Split ['#', !Ref AdminRootPasswordHashArn]]
+          - !Ref 'AWS::NoValue'
+
+        # -----------------------------------------------------------------
+        # The upload bucket: exactly the calls the store makes, on exactly
+        # the prefix it writes under. The list is the S3API interface in
+        # internal/integration/aws/s3_uploads.go — PutObject, GetObject,
+        # HeadObject, DeleteObject, ListObjectsV2 — and HeadObject is
+        # authorised by s3:GetObject, ListObjectsV2 by s3:ListBucket.
+        #
+        # Two statements because IAM scopes them to two different ARNs: the
+        # object actions to the objects under uploads/, the listing to the
+        # bucket itself. The listing grant carries NO s3:prefix condition,
+        # and that is load-bearing for the 404s rather than a loosening: S3
+        # answers a GetObject or HeadObject for an absent key with 404 only
+        # to a caller that holds s3:ListBucket for that request, and with
+        # 403 AccessDenied otherwise, so that the absence of a key is not
+        # disclosed to somebody who may not enumerate them. A GetObject
+        # request carries no s3:prefix context key, so a listing grant
+        # conditioned on one does not apply to it, and every missing logo
+        # and every delete of an absent file would come back 403 -- which
+        # the store deliberately reads as the failure it is and never as
+        # "not found" (s3_uploads.go isS3NotFound,
+        # TestS3AccessDeniedIsAFailureNotAMiss), so the hosted UI would
+        # answer 500 where the reference answers 404. The bucket is
+        # stack-owned and holds nothing but this prefix, so listing it whole
+        # discloses nothing the prefix would not. No s3:PutObjectAcl, no
+        # s3:DeleteBucket, no s3:PutBucketPolicy: an auth router that can
+        # make its own bucket public is a bad example that propagates.
+        #
+        # Absent entirely while EnableAdminUploads is "false". An empty
+        # parameter adds no statement and no cost.
+        # -----------------------------------------------------------------
+        - !If
+          - AdminUploadsEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: AdminUploadObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${AdminUploadsBucket.Arn}/uploads/*'
+              - Sid: AdminUploadListing
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                # Unconditioned on purpose; see the comment above.
+                Resource: !GetAtt AdminUploadsBucket.Arn
+          - !Ref 'AWS::NoValue'
+
       Events:
         Root:
           Type: HttpApi
@@ -2231,6 +2521,80 @@ Resources:
             Path: /{proxy+}
             Method: ANY
             PayloadFormatVersion: '2.0'
+
+  # ---------------------------------------------------------------------
+  # Admin uploads
+  #
+  # One private bucket for the logos and background images the console
+  # uploads, and that the hosted UI serves back under <ApiPrefix>/ui/assets.
+  # Created only when EnableAdminUploads is "true"; with it "false" there is
+  # no bucket, no IAM statement and no variable, and the console's upload tab
+  # is off — which is the reference's own behaviour with uploadDir unset.
+  #
+  # Private in every sense the service has: every public-access block set,
+  # ACLs disabled outright (BucketOwnerEnforced, so no object can be made
+  # public by an ACL even by a principal with PutObjectAcl), and encrypted at
+  # rest with SSE-S3, which costs nothing and needs no key to manage. The
+  # objects are served to browsers by the FUNCTION, through the store, not by
+  # S3 — there is no website configuration and no public read, so a logo is
+  # reachable at <ApiPrefix>/ui/assets/uploads/<name> and nowhere else.
+  #
+  # No explicit BucketName: a fixed name would collide with a bucket left
+  # behind by a previous stack of the same name, and the generated one is
+  # reported in the AdminUploadsBucketName output. DeletionPolicy is left at
+  # the default so the quickstart tears down cleanly; a bucket that is not
+  # empty fails the delete, which is CloudFormation's own protection against
+  # losing uploads, and `scripts/teardown.sh` says so.
+  #
+  # No lifecycle rule and no versioning. The objects are a handful of images
+  # replaced by an administrator on purpose; versioning would keep every
+  # replaced logo forever and bill for it, and there is nothing to expire.
+  # ---------------------------------------------------------------------
+
+  AdminUploadsBucket:
+    Type: AWS::S3::Bucket
+    Condition: AdminUploadsEnabled
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: awesome-lambda-auth
+          Value: admin-uploads
+
+  # The one bucket policy, and it grants nothing: it refuses every request
+  # that did not arrive over TLS, for every principal, the function's role
+  # included. The SDK the store uses speaks https and never trips it; what it
+  # closes is an operator's `aws s3 --endpoint-url http://` or a future
+  # reader configured carelessly, and it costs nothing. BlockPublicPolicy
+  # above still applies: a Deny statement is not a public grant.
+  AdminUploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: AdminUploadsEnabled
+    Properties:
+      Bucket: !Ref AdminUploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AdminUploadsBucket.Arn
+              - !Sub '${AdminUploadsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   # ---------------------------------------------------------------------
   # Content delivery
@@ -3049,6 +3413,44 @@ Outputs:
     Value: !Ref AuthFunction
     Export:
       Name: !Sub '${AWS::StackName}-FunctionName'
+
+  # The console's front door and, when it exists, the bucket behind its upload
+  # tab. The URL is the API's own; behind the distribution the same path is
+  # served under the CloudFront hostname, with the stage segment gone -- and
+  # the stage segment is the whole problem for the console: the shell injects
+  # base "/admin" and loads /admin/assets/admin.js root-absolute, exactly as
+  # the reference's shell uses req.baseUrl, so on a named stage the browser
+  # asks for paths the API does not serve. The KNOWN LIMITATION at the top of
+  # this file names the cookie half; this is the other half, and the
+  # Description says so.
+  AdminConsoleUrl:
+    Condition: AdminConsoleEnabled
+    Description: >-
+      Where the admin console answers. GET here serves the login shell; the
+      API beneath it is under /admin/api and answers 401 to anyone the access
+      policy has not admitted. Run `migrate backfill-users` once before
+      relying on the user tab. On a named stage without CloudFront this URL
+      serves the shell but the shell is unusable: it links its assets and
+      its API root-absolute (/admin/assets/…, /admin/api/…) without the
+      stage segment, so the browser's follow-up requests never reach the
+      function. Use the $default stage, the distribution, or a custom domain
+      mapping.
+    Value: !If
+      - IsDefaultStage
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/admin'
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/admin'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminConsoleUrl'
+
+  AdminUploadsBucketName:
+    Condition: AdminUploadsEnabled
+    Description: >-
+      The private bucket the console's uploads live in, under the uploads/
+      prefix. Nothing in it is public; the function serves the objects under
+      <ApiPrefix>/ui/assets/uploads. Empty it before tearing the stack down.
+    Value: !Ref AdminUploadsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminUploadsBucketName'
 
   # The two URLs a relying party is configured with. They are outputs rather
   # than something to assemble by hand because getting either wrong is a

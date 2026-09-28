@@ -50,6 +50,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | **Cost anomaly detection** | **0.00** | Free |
 | S3 artifact bucket | cents | A few MB per deployed version |
 | KMS key, `EnableIdp=true` only | 1.00 | Billed whether or not it signs, **including its 7-day deletion window** |
+| Admin uploads bucket, `EnableAdminUploads=true` only | cents | S3 Standard storage for a handful of images, USD 0.023 per GB-month; an empty bucket is free. Requests are §2.6 |
 
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
@@ -156,6 +157,70 @@ tokens signed**, and it is on `/token` and nowhere else: `/login` and `/refresh`
 sign HS256 in process. `kms:GetPublicKey` is called once per execution
 environment, not once per token. With the key's USD 1.00 a month, a million OIDC
 tokens is about USD 4.00 — see the README's KMS table for the full breakdown.
+
+### 2.6 Uploaded assets — one `GetObject` per logo fetch, misses included
+
+D8 puts an S3 bucket behind `ui.uploadDir` (`internal/integration/aws/s3_uploads.go`),
+and the read side is the part with a per-request cost: the hosted UI serves
+`<prefix>/ui/assets/uploads/<name>` through the core's `UploadFS`, whose only
+operation is `Open`, so **every request for an uploaded asset is one `GetObject`
+— and a miss is a `GetObject` that answers 404**, billed the same. The write
+side is an administrator's occasional click.
+
+S3 Standard in eu-west-1, order of magnitude:
+
+| operation | price | which route |
+|---|---|---|
+| `GetObject` | USD 0.0004 per 1 000 | every page view that fetches the logo or background, through the function |
+| `PutObject` | USD 0.005 per 1 000 | `POST <admin>/api/upload/logo` and `/bg-image` |
+| `ListObjectsV2` | USD 0.005 per 1 000 | `GET <admin>/api/upload/files` |
+| `HeadObject` + `DeleteObject` | USD 0.0004 + free | `DELETE <admin>/api/upload/{name}` |
+| storage | USD 0.023 per GB-month | a handful of images — cents |
+
+A million page views that each fetch one logo are **USD 0.40 of S3** on top of
+the platform floor, plus the function's own duration for the proxied bytes.
+Per million requests that is a little more than the log-ingestion line and
+about a thirtieth of a login's DynamoDB — worth knowing, not worth designing
+around. There is no standing charge: the bucket costs nothing when empty and
+the IAM statement nothing at all.
+
+What was deliberately *not* done about it: caching the object per execution
+environment, which would trade the `GetObject` for an upload that does not
+appear until the next cold start, and setting an edge cache in front of the
+path, which the CloudFront block refuses for every response from this origin
+([infra/sam/README.md](../infra/sam/README.md), "The distribution is a front
+door, not a cache"). Nor does a browser absorb it: the core answers an uploaded
+asset with the reference's `Cache-Control: public, max-age=0`, so every view
+revalidates, and a revalidation is an `Open` — a `GetObject` — whether or not
+the bytes are sent again. The store therefore records no `Cache-Control` on the
+object; nothing on this path would ever serve it.
+
+### 2.7 The admin console — a profile read per guarded request, and an offset that is paid for
+
+Administrator traffic, so none of this is a line on a bill; it is here because
+the shape is not the obvious one. Counted off the core's `admin.go` and
+`internal/store/dynamodb`:
+
+| what | operations | units |
+|---|---|---|
+| every guarded request, any policy but `open`, non-root token | `GetUserByID`, strongly consistent | 1 RRU |
+| …under `first-user`, additionally | `ListUsers(1, 0)`: one GSI1 Query page + one `BatchGetItem` of one item | 0.5 + 1 RRU |
+| …under `rbac:` / `permission:`, additionally | the role assignments of one user, and for a permission the role definitions they name | 1 RRU and up |
+| `GET <admin>/api/users`, one page of *n* | GSI1 Query over `offset + n` three-attribute entries, then `BatchGetItem` of *n* profiles, strongly consistent | ~0.5 RRU per 4 KB of entries + *n* RRU |
+| `POST <admin>/users/{id}/promote` | the limiter's conditional write (§2.3) + one conditional `UpdateItem` on the profile | 2 WCU |
+
+**The offset is index-only but it is not free**: page 10 of the users tab reads
+the nine pages of index entries before it (`paging.go` `pagedIndexQuery`), which
+is why the store caps `limit + offset`. A search filter is worse by
+construction — the core reads 500 users and filters in process, as the reference
+does — and costs ~500 RRU a keystroke-settled query. At administrator volumes
+that is fractions of a cent a day.
+
+The one-off `migrate backfill-users` sweep is a `Scan` of the whole table —
+0.5 RRU per 4 KB scanned, every item type included, not only profiles — plus
+1 WCU for the profile and 1 for its new GSI1 entry per user it fixes. A table
+of a million items of ~1 KB is about USD 0.03 of reads; a hundred thousand
+pre-D6 users about USD 0.25 of writes. It runs once.
 
 ---
 

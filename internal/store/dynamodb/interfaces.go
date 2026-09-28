@@ -64,7 +64,10 @@ package dynamodb
 // list used to name — UserMetadataStore, RolesPermissionsStore, TenantStore,
 // APIKeyStore, TelemetryStore — landed in D6 together with the three v0.8.0
 // admin listers (AdminUserStore, SessionLister, RoleLister), the four narrow
-// API-key companions, and the three webhook stores.
+// API-key companions, and the three webhook stores. The two one-flag profile
+// writers the console needs — UserAdminFlagStore and UserTwoFactorPolicyStore
+// — landed with the admin surface (user_flags.go), because that is the first
+// block with a route that writes either flag.
 //
 // The rule they were listed under still stands and is why this register is kept
 // rather than deleted: a stub returning "not implemented" would be worse than an

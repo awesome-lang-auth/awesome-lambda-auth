@@ -448,9 +448,17 @@ var idpMountedEndpoints = []string{
 // pass-through. This is also the only place the value is needed — the adapter
 // calls it once per route from here — so passing it down one call is cheaper
 // than making every other caller of httpConfig say it has none.
-func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl func(http.Handler) http.Handler) (err error) {
+//
+// adminRL is the same thing for the console's own slot, AdminOptions.RateLimiter,
+// which the core applies to exactly one route — POST <admin>/users/{id}/promote
+// — and which the auth router's limiter cannot serve because it matches paths
+// under the api prefix (ratelimit.go, newAdminPromoteLimiter). Two parameters
+// rather than one, because they are two budgets with two subjects, and nil
+// means the same thing for both.
+func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl, adminRL func(http.Handler) http.Handler) (err error) {
 	hc := httpConfig(cfg)
 	hc.RateLimiter = rl
+	hc.Admin.RateLimiter = adminRL
 	if core.IDP() == nil {
 		nethttp.MountWithConfig(mux, core, hc)
 		return nil

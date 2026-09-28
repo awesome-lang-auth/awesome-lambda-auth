@@ -1,6 +1,9 @@
 package main
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 // The CORS response headers the reference hardcodes. docs/spec/config-schema.md
 // §1.18 records them as "hardcoded, preserved without knobs", and
@@ -31,7 +34,12 @@ const (
 // Access-Control-Allow-Origin echoes the request origin rather than emitting a
 // list: the header takes exactly one origin, and Allow-Credentials is true, so
 // the wildcard is not an option here even if the allowlist has one entry.
-func corsMiddleware(origins []string) func(http.Handler) http.Handler {
+//
+// exempt names mounts the layer leaves entirely alone — no Vary, no
+// Allow-Origin, no OPTIONS short-circuit — because the reference mounts its CORS
+// layer inside the auth router and its sibling routers carry none of it
+// (corsExemptMounts, app.go). A path is exempt when it is the mount or below it.
+func corsMiddleware(origins []string, exempt ...string) func(http.Handler) http.Handler {
 	if len(origins) == 0 {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -40,9 +48,21 @@ func corsMiddleware(origins []string) func(http.Handler) http.Handler {
 	for _, o := range origins {
 		allowed[o] = struct{}{}
 	}
+	outside := func(path string) bool {
+		for _, mount := range exempt {
+			if path == mount || strings.HasPrefix(path, mount+"/") {
+				return true
+			}
+		}
+		return false
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if outside(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			w.Header().Add("Vary", "Origin")
 
 			if origin := r.Header.Get("Origin"); origin != "" {

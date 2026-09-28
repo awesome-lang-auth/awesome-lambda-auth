@@ -105,6 +105,18 @@ type Options struct {
 	// Injected so a test can point any of them at a TLS httptest server it
 	// trusts; like Mail and SMS, injecting it switches nothing on.
 	HTTPClient *http.Client
+
+	// UploadStore injects the store the admin console's upload routes write
+	// through and the hosted UI serves uploaded assets from, for the reason
+	// Mail and SMS are injectable: a composition that keeps logos in a bucket
+	// has to be provable without one. Nil builds the real S3-backed store
+	// (awsintegration.NewS3UploadStore), lazily. Injecting it switches nothing
+	// on — whether an upload store is built at all is a question about
+	// ui.uploadDir naming an S3 location (admin.go, newUploadStore).
+	//
+	// It is auth.UploadStore and not awsintegration.S3API, for the reason
+	// IDPKeySource is not KMSAPI: the SDK stays under internal/integration/aws.
+	UploadStore auth.UploadStore
 }
 
 // App is one cold start's worth of state.
@@ -262,22 +274,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	coreOpts := coreOptions(cfg, users, sessions, log)
-	for _, set := range coreOptionSets(ctx, cfg, opts, users, deliver, log) {
-		if set.build == nil {
-			// A reserved slot. See coreOptionSets.
-			continue
-		}
-		sub, err := set.build()
-		if err != nil {
-			return nil, err
-		}
-		coreOpts = append(coreOpts, sub...)
+	core, err := buildCore(ctx, cfg, opts, users, sessions, deliver, log)
+	if err != nil {
+		return nil, err
 	}
 
-	core, err := auth.New(coreOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("auth core: %w", err)
+	// The core recommends this assertion to every host, and RS-6 makes it
+	// unreachable for a document the loader accepted; it stays because a test
+	// that bypasses the loader should meet a message and not a 404 (admin.go).
+	if err := checkAdminMounted(cfg, httpConfig(cfg)); err != nil {
+		return nil, err
 	}
 
 	mux := http.NewServeMux()
@@ -307,61 +313,23 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		counter = provider
 	}
 	logRateLimitSurface(cfg, counter, log)
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log)); err != nil {
+	// Two limiters from one block and one counter: the auth router's, over the
+	// routes rateLimit.scope names, and the console's, over the one route the
+	// core's AdminOptions.RateLimiter covers (ratelimit.go,
+	// newAdminPromoteLimiter). Both are built here for the reason above.
+	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log)); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
 	logUISurface(cfg, log)
+	logAdminSurface(cfg, httpConfig(cfg), log)
 
-	var handler http.Handler = mux
-	// The documentation responses carry a Content-Security-Policy. It is a
-	// middleware and not a route — it registers no pattern, so the adapter still
-	// owns every path under the api prefix — and it is the only thing this
-	// binary can do about the reference's Swagger page loading an unpinned
-	// third-party bundle onto the auth origin. docs.go argues what that buys and
-	// what it does not; with the routes unmounted it is the identity wrapper.
-	handler = docsSecurityHeaders(cfg)(handler)
-	// Refresh-token rotation replay detection needs a per-request precondition
-	// carrier installed on the request context: the DynamoDB store fills it in
-	// GetSessionByRefreshTokenHash and consumes it in UpdateSession so that two
-	// concurrent refreshes of one token resolve to a single winner and a replay is
-	// revoked immediately instead of one request later. rotation.go documents this
-	// as "the HTTP layer must call it once per request"; without it the store logs
-	// warnDegradedRotation and falls back to attribute_not_exists(revokedAt). Only
-	// the DynamoDB store consumes the scope — the memory store ignores it — so the
-	// wrap is gated on the driver to avoid a pointless allocation per request.
-	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
-		handler = rotationScopeMiddleware(handler)
-	}
-	// The migration marker travels from the store's profile read to the password
-	// verifier through a second per-request carrier, of exactly the same shape and
-	// for a closely related reason: a ctx cannot be mutated by the callee, so the
-	// HTTP layer installs an empty scope and the two ends fill and consume it.
-	// What is different is the motive — here it is so that the marker never has to
-	// live on auth.User, which auth.NewPublicUser serialises. See
-	// migrationScopeMiddleware.
-	if cfg.Stores.Migration.Active() {
-		handler = migrationScopeMiddleware(handler)
-	}
-	handler = corsMiddleware(cfg.HTTP.CORS.Origins)(handler)
-	handler = accessLog(log, handler)
-	// The last two wraps are the observability pair, and their order is the
-	// argument: the carrier has to exist before anything can read it, and the
-	// access log is one of the things that reads it. So correlationScope sits
-	// between them, and auth.EventContextMiddleware ends up outermost — ahead of
-	// CORS, ahead of the access log, ahead of everything.
-	//
-	// EventContextMiddleware is the core's, not a re-implementation, and
-	// httpConfig(cfg) is the same pure function of the same document that
-	// mountAuthSurface hands the adapter. The adapter installs the carrier again
-	// inside its own guard chain (awesome-go-auth adapter/nethttp/nethttp.go:257)
-	// for the routes it owns; that install recomputes the identical value, so
-	// this one costs a context value on those routes and buys the carrier on the
-	// ones the adapter does not own — GET /healthz today, whatever a later block
-	// mounts outside the api prefix tomorrow. See the correlation section of
-	// logging.go for why this binary never reads the header itself.
-	handler = correlationScope(log)(handler)
-	handler = auth.EventContextMiddleware(httpConfig(cfg))(handler)
+	// The middleware chain is one function, assembleHandler, so that the test
+	// harness (admin_test.go newAdminSurface) builds the very chain New builds
+	// and a header this binary adds -- or must not add -- is seen where it is
+	// asserted. The console's login limiter is built here for the reason the
+	// other two are: it counts with the shared counter.
+	handler := assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log))
 
 	app := &App{Config: cfg, Logger: log, Handler: handler}
 
@@ -394,9 +362,127 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.Bool("cookiesSecure", cfg.Cookies.Secure),
 		slog.String("sessionCheckOn", cfg.Sessions.CheckOn),
 		slog.Bool("identityProvider", core.IDP() != nil),
-		slog.Bool("resourceServer", cfg.ResourceServer.Enabled))
+		slog.Bool("resourceServer", cfg.ResourceServer.Enabled),
+		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()))
 
 	return app, nil
+}
+
+// assembleHandler wraps the mounted mux in every middleware this binary adds,
+// in the order New has always applied them. It is a function of the same
+// document and the same mux so that a test can build the exact handler the
+// binary serves — admin_test.go's newAdminSurface used to omit the CORS layer
+// and could not see that the console had been put behind it (review finding #1).
+//
+// Innermost to outermost:
+//
+//   - The console's login limiter, matching one route (POST <admin>/login) and
+//     nothing else; identity when the console or the block is off.
+//   - The two header middlewares. Neither registers a pattern, so the adapter
+//     still owns every path under the api prefix — that is the only thing this
+//     binary can do about the reference's Swagger page loading an unpinned
+//     third-party bundle onto the auth origin (docs.go), and about the
+//     reference serving uploaded SVGs same-origin with the auth cookies
+//     (admin.go, uploadAssetHeaders). Both are the identity wrapper when their
+//     routes are not mounted.
+//   - Refresh-token rotation replay detection needs a per-request precondition
+//     carrier installed on the request context: the DynamoDB store fills it in
+//     GetSessionByRefreshTokenHash and consumes it in UpdateSession so that two
+//     concurrent refreshes of one token resolve to a single winner and a replay
+//     is revoked immediately instead of one request later. rotation.go
+//     documents this as "the HTTP layer must call it once per request"; without
+//     it the store logs warnDegradedRotation and falls back to
+//     attribute_not_exists(revokedAt). Only the DynamoDB store consumes the
+//     scope, so the wrap is gated on the driver.
+//   - The migration marker travels from the store's profile read to the
+//     password verifier through a second per-request carrier of the same shape:
+//     a ctx cannot be mutated by the callee, so the HTTP layer installs an empty
+//     scope and the two ends fill and consume it. See migrationScopeMiddleware.
+//   - CORS, everywhere but the admin mount (corsExemptMounts).
+//   - The observability pair, whose order is the argument: the carrier has to
+//     exist before anything can read it, and the access log is one of the
+//     things that reads it. So correlationScope sits between them, and
+//     auth.EventContextMiddleware ends up outermost — ahead of CORS, ahead of
+//     the access log, ahead of everything. EventContextMiddleware is the core's,
+//     and httpConfig(cfg) is the same pure function of the same document that
+//     mountAuthSurface hands the adapter. The adapter installs the carrier again
+//     inside its own guard chain (awesome-go-auth adapter/nethttp/nethttp.go:257)
+//     for the routes it owns; that install recomputes the identical value, so
+//     this one costs a context value on those routes and buys the carrier on the
+//     ones the adapter does not own — GET /healthz today, whatever a later block
+//     mounts outside the api prefix tomorrow. See the correlation section of
+//     logging.go for why this binary never reads the header itself.
+func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adminLoginRL func(http.Handler) http.Handler) http.Handler {
+	handler := mux
+	if adminLoginRL != nil {
+		handler = adminLoginRL(handler)
+	}
+	handler = docsSecurityHeaders(cfg)(handler)
+	handler = uploadAssetHeaders(cfg)(handler)
+	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
+		handler = rotationScopeMiddleware(handler)
+	}
+	if cfg.Stores.Migration.Active() {
+		handler = migrationScopeMiddleware(handler)
+	}
+	handler = corsMiddleware(cfg.HTTP.CORS.Origins, corsExemptMounts(cfg)...)(handler)
+	handler = accessLog(log, handler)
+	handler = correlationScope(log)(handler)
+	handler = auth.EventContextMiddleware(httpConfig(cfg))(handler)
+	return handler
+}
+
+// corsExemptMounts names the mounts the CORS layer must not touch: today the
+// admin console, when it is mounted.
+//
+// The reference's CORS layer is `router.use(cors(...))` INSIDE the auth router
+// (auth.router.ts:512-527); createAdminRouter is a separate Express router
+// (admin.router.ts:503-510) and sets no Access-Control header of any kind. A
+// product-wide layer would therefore have put the console behind credentialed
+// CORS the reference never grants it — and the console has no CSRF check, so an
+// allow-listed SPA origin would have gained readable, credentialed cross-origin
+// access to the most privileged API in the deployment, with any origin able to
+// use a bearer. Exempting the mount rather than narrowing the layer to the api
+// prefix keeps every other path where it was (GET /healthz, and an
+// idProvider.jwksPath a document may place outside the prefix, whose discovery
+// document a browser client does fetch). The tools router is the reference's
+// other sibling router and will want the same exemption when its block lands.
+func corsExemptMounts(cfg *config.Config) []string {
+	hc := httpConfig(cfg)
+	if !hc.AdminMounted() {
+		return nil
+	}
+	return []string{hc.AdminPath()}
+}
+
+// buildCore turns the validated configuration and the opened stores into the
+// auth core: the base options, then every option set in coreOptionSets' order.
+//
+// It is split out of New for one reason: so that a test can build the core the
+// binary builds — every slot, in order — from a Config it loaded itself, which
+// is how a block still behind the phase gate is exercised end to end before
+// the gate comes down (config.Options.AllowUnimplemented; the gate removal is
+// its own last commit by convention). Nothing about the composition is
+// different from New's: it is New's middle, named.
+func buildCore(ctx context.Context, cfg *config.Config, opts Options, users auth.UserStore, sessions auth.SessionStore, deliver *delivery, log *slog.Logger) (*auth.Auth, error) {
+	coreOpts := coreOptions(cfg, users, sessions, log)
+	for _, set := range coreOptionSets(ctx, cfg, opts, users, deliver, log) {
+		if set.build == nil {
+			// A reserved slot. See coreOptionSets.
+			continue
+		}
+		sub, err := set.build()
+		if err != nil {
+			return nil, err
+		}
+		coreOpts = append(coreOpts, sub...)
+	}
+
+	core, err := auth.New(coreOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("auth core: %w", err)
+	}
+	return core, nil
 }
 
 // Handle is the lambda.Start entrypoint.
@@ -530,6 +616,9 @@ type coreOptionSet struct {
 // stays empty on purpose rather than being filled with an option invented to
 // fill it. That is a decision and not an omission, which is why the entry below
 // says so and why TestCoreOptionSetsAreOrderedAndReserved still lists it.
+// `admin` is the first of the reserved slots to turn out genuinely non-empty:
+// the console's tabs are drawn from five stores the core takes by name and
+// cannot discover, and the upload store is a sixth (admin.go).
 func coreOptionSets(
 	ctx context.Context,
 	cfg *config.Config,
@@ -637,8 +726,20 @@ func coreOptionSets(
 		// of its own. The slot stays, recording that it was filled with nothing
 		// on purpose.
 		{name: "ui"},
-		// admin.* — the admin router and its access policy.
-		{name: "admin"},
+		{
+			// admin.* — the admin console. The router itself, its access
+			// policy, its cookie and its documentation pair all reach the core
+			// through HTTPConfig.Admin, the way `docs` and `ui` do; what this
+			// slot holds is the part that cannot: the five stores the console's
+			// tabs are drawn from and the core takes by name behind their
+			// stores.enable flags — metadata, rbac, tenants, apiKeys, webhooks —
+			// and the upload store the file picker writes through. No I/O: the
+			// S3 client is built on the first upload. It refuses for a flag the
+			// driver's store cannot honour and for a root user that could never
+			// log in (admin.go, adminOptions).
+			name:  "admin",
+			build: func() ([]auth.Option, error) { return adminOptions(cfg, opts, users, log) },
+		},
 		// tools.* — telemetry, SSE and the inbound-webhook sandbox.
 		{name: "tools"},
 	}
@@ -677,6 +778,15 @@ func coreOptionSets(
 // the one field here that is not a straight copy, because `docs.swagger` is
 // three-valued and DocsOptions.Enabled is a bool.
 //
+// Admin is the whole `admin` block bar its stores: the mount, the access
+// policy, the bootstrap credentials, the cookie prefix and the console's own
+// documentation pair. admin.go builds the value and argues every field; the
+// one to know about here is JWTSecret, which is left empty so that the core
+// verifies the console's tokens with the access-token secret — the integration
+// the reference documents and config-schema.md §1.13 folds into RS-7. The
+// adapter mounts the console at AdminPath(), beside the api prefix, when
+// AdminMounted() is true, and nothing when it is not.
+//
 // RateLimiter is the one field of HTTPConfig this function deliberately leaves
 // nil, and the reason is that it is not a function of the document. It is a
 // middleware constructor closing over a shared counter and an in-process table,
@@ -686,7 +796,8 @@ func coreOptionSets(
 // sets it on the way to the adapter, which is the only place it is read
 // (ratelimit.go, idp.go). A nil RateLimiter is exactly "no limiter" to the core,
 // which composes a pass-through for it, so the omission is also the correct
-// value for every caller that is not mounting.
+// value for every caller that is not mounting. Admin.RateLimiter is left nil
+// for the same reason and filled in the same place.
 func httpConfig(cfg *config.Config) auth.HTTPConfig {
 	return auth.HTTPConfig{
 		APIPrefix: cfg.HTTP.APIPrefix,
@@ -710,6 +821,10 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 		// middleware, registered by the adapter and by nothing here. docs.go
 		// resolves the three-valued docs.swagger knob onto this bool.
 		Docs: docsOptions(cfg),
+		// The admin console, mounted by the adapter at AdminPath() — a sibling
+		// of the api prefix, as the reference's separate router is — when
+		// admin.enabled is on and an access decision exists. admin.go.
+		Admin: adminHTTPOptions(cfg),
 	}
 }
 
@@ -764,14 +879,16 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 }
 
 // memoryStoreBundle is the in-memory user store plus the stores the core cannot
-// find by type assertion — the two OAuth stores and the template store — so
-// that the development driver reaches the account-linking routes and the
-// stored templates the same way the DynamoDB one does.
+// find by type assertion — the two OAuth stores, the template store, the
+// settings store, the authorization-code store, and the five the admin console
+// is drawn from — so that the development driver reaches the account-linking
+// routes, the stored templates and the console's tabs the same way the
+// DynamoDB one does.
 //
 // The embedded pointer is what keeps the rest working: every optional interface
 // the core *does* discover on the user store — MagicLinkStore, SMSStore,
-// TOTPStore and the rest — is satisfied by method promotion, so wrapping it
-// cannot quietly narrow the feature set.
+// TOTPStore, the admin listers and the two profile flag writers — is satisfied
+// by method promotion, so wrapping it cannot quietly narrow the feature set.
 type memoryStoreBundle struct {
 	*auth.MemoryUserStore
 	links     auth.LinkedAccountStore
@@ -779,6 +896,19 @@ type memoryStoreBundle struct {
 	templates auth.TemplateStore
 	settings  auth.SettingsStore
 	codes     auth.AuthCodeStore
+
+	// The five stores behind the console's tabs, each the core's own in-memory
+	// implementation and each per execution environment like everything else
+	// on this driver: a role assigned through one environment is unknown to
+	// the next, so an rbac:<role> policy on the memory driver admits a user on
+	// one cold start and refuses them on another. RS-12 already refuses this
+	// driver in production; internal/store/dynamodb is what makes the console
+	// consistent across instances.
+	metadata auth.UserMetadataStore
+	rbac     auth.RolesPermissionsStore
+	tenants  auth.TenantStore
+	apiKeys  auth.APIKeyStore
+	webhooks auth.WebhookStore
 }
 
 // newMemoryStoreBundle is the one place the development driver's bundle is
@@ -805,6 +935,14 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		// dynamodb store (internal/store/dynamodb/auth_codes.go) is what makes
 		// the flow work across instances.
 		codes: auth.NewMemoryAuthCodeStore(),
+		// The console's five, so that the same document that draws a tab on
+		// the DynamoDB driver draws it here (driverStores lists the flags for
+		// both drivers, and adminOptions hands each store over by accessor).
+		metadata: auth.NewMemoryMetadataStore(),
+		rbac:     auth.NewMemoryRolesPermissionsStore(),
+		tenants:  auth.NewMemoryTenantStore(),
+		apiKeys:  auth.NewMemoryAPIKeyStore(),
+		webhooks: auth.NewMemoryWebhookStore(),
 	}
 }
 
@@ -813,6 +951,11 @@ func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.p
 func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
 func (m memoryStoreBundle) Settings() auth.SettingsStore            { return m.settings }
 func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.codes }
+func (m memoryStoreBundle) Metadata() auth.UserMetadataStore        { return m.metadata }
+func (m memoryStoreBundle) Roles() auth.RolesPermissionsStore       { return m.rbac }
+func (m memoryStoreBundle) Tenants() auth.TenantStore               { return m.tenants }
+func (m memoryStoreBundle) APIKeys() auth.APIKeyStore               { return m.apiKeys }
+func (m memoryStoreBundle) Webhooks() auth.WebhookStore             { return m.webhooks }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
 // back. A key that is enabled and absent from its driver's set is a knob that
@@ -829,42 +972,52 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// administrator switches on is seen by every execution environment and
 		// survives a redeploy.
 		//
-		// **This set is deliberately narrower than what the driver implements.**
-		// internal/store/dynamodb now also implements UserMetadataStore,
+		// **This set answers a narrower question than "what does the driver
+		// implement".** It answers "does enabling the flag change what the
+		// deployment does", and a flag is listed only once the composition root
+		// hands its store to the core. D6 implemented UserMetadataStore,
 		// RolesPermissionsStore, TenantStore, APIKeyStore, the three webhook
-		// stores and TelemetryStore, with item types and tests for all of them.
-		// None of them is listed here, because this map answers a different
-		// question: not "can the driver store this" but "does enabling the flag
-		// change what the deployment does". The core takes every one of those six
-		// by name — auth.WithMetadataProvider, auth.WithRBACProvider,
-		// auth.WithTenantProvider, and the API key, webhook and telemetry stores
-		// through their own callers — so none of them reaches a route until this
-		// composition root hands it over, and that happens with the admin surface.
-		// Listing them now would let an operator turn on a knob that validates
-		// and then does nothing, which is exactly the misconfiguration this map
-		// exists to refuse.
+		// stores and TelemetryStore, and deliberately listed none of them,
+		// because the core takes each by name and nothing handed them over.
+		// The admin surface is what hands five of them over (admin.go,
+		// adminOptions), so those five are listed now: metadata reaches
+		// GET <prefix>/me and the console's metadata tab, rbac reaches the
+		// roles tab and the rbac:/permission: access policies, tenants the
+		// tenants tab, apiKeys and webhooks the two credential tabs.
 		//
-		// The three v0.8.0 admin listers are the exception that proves the rule
-		// and need no flag: AdminUserStore, SessionLister and RoleLister are
-		// discovered by type assertion on the user, session and RBAC stores, so
-		// they are live the moment those are, and there is no separate
-		// stores.enable key for them.
+		// "telemetry" is still absent, on the same rule. The telemetry store
+		// reaches a route only through ToolsOptions.TelemetryStore, which the
+		// tools block hands over; until it does, the flag would validate and
+		// do nothing. That block adds the key here.
+		//
+		// The three v0.8.0 admin listers and the two profile flag writers need
+		// no flag: AdminUserStore, SessionLister, RoleLister,
+		// UserAdminFlagStore and UserTwoFactorPolicyStore are discovered by
+		// type assertion on the user, session and RBAC stores, so they are live
+		// the moment those are, and there is no separate stores.enable key for
+		// them.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 			"settings": true,
+			"metadata": true, "rbac": true, "tenants": true,
+			"apiKeys": true, "webhooks": true,
 		}, true
 	case config.StoreDriverMemory:
-		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks,
-		// MemoryTemplateStore and MemorySettingsStore, and newMemoryStoreBundle
-		// hangs all four off the user store, so the development driver backs the
-		// same set as the production one. A driver that backs fewer is still
-		// refused by name in emailOptions and settingsOptions, which is why those
-		// refusals exist.
+		// awesome-go-auth ships an in-memory implementation of every one of
+		// these — MemoryLinkedAccounts, MemoryPendingLinks, MemoryTemplateStore,
+		// MemorySettingsStore, MemoryMetadataStore, MemoryRolesPermissionsStore,
+		// MemoryTenantStore, MemoryAPIKeyStore and MemoryWebhookStore — and
+		// newMemoryStoreBundle hangs all of them off the user store, so the
+		// development driver backs the same set as the production one. A driver
+		// that backs fewer is still refused by name in emailOptions,
+		// settingsOptions and adminOptions, which is why those refusals exist.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 			"settings": true,
+			"metadata": true, "rbac": true, "tenants": true,
+			"apiKeys": true, "webhooks": true,
 		}, true
 	default:
 		return nil, false
@@ -1011,6 +1164,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, oauthKnobGaps(cfg)...)
 	gaps = append(gaps, idpKnobGaps(cfg)...)
 	gaps = append(gaps, runtimeSettingsKnobGaps(cfg)...)
+	gaps = append(gaps, adminKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

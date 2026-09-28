@@ -29,6 +29,7 @@ Inside the stack:
 | `JwtRefreshSecretSeed` | A second `AWS::SecretsManager::Secret` that exists only to make AWS generate the *second* random value. Not in the function's environment, not in its IAM policy, never read at runtime. [Why it exists.](#why-there-are-two-secret-resources-for-one-secret) |
 | `AuthDistribution` + `AuthCachePolicy` + `AuthOriginRequestPolicy` | **Only when `EnableCloudFront=true`.** A CloudFront distribution in front of the HTTP API, so the hosted UI and the auth routes share one hostname a custom domain can be attached to. It caches **nothing** — see [The distribution is a front door, not a cache](#the-distribution-is-a-front-door-not-a-cache). **No fixed monthly charge**; the two policies are free. |
 | `IdpSigningKey` + `IdpSigningKeyAlias` | **Only when `EnableIdp=true` and `IdpKmsKeyId` is empty.** An `AWS::KMS::Key`, `KeySpec: RSA_2048`, `KeyUsage: SIGN_VERIFY`, plus `alias/<stack>-idp`. The private half never leaves KMS; the function is granted `kms:Sign` and `kms:GetPublicKey` on this one ARN, and `kms:GetPublicKey` on any ARN in `IdpPreviousKmsKeyArns` — nothing else in the account. **USD 1.00 per month** — see [Cost at rest](#cost-at-rest). |
+| `AdminUploadsBucket` | **Only when `EnableAdminUploads=true`.** A private `AWS::S3::Bucket` for the logos and backgrounds the admin console uploads: every public-access block on, ACLs disabled (`BucketOwnerEnforced`), SSE-S3 at rest, no website configuration. The function is granted `s3:GetObject`/`PutObject`/`DeleteObject` under `uploads/*` and `s3:ListBucket` on the bucket — unconditioned, because S3 answers a missing key 404 only to a caller that may list, and 403 to everyone else — and nothing else in S3; a bucket policy refuses every request that is not over TLS; it serves the objects itself under `<ApiPrefix>/ui/assets/uploads`. **Storage only** — cents — see [Admin console](#admin-console). |
 
 Both secret resources are skipped when you supply both of `JwtAccessSecretArn` and
 `JwtRefreshSecretArn`. The KMS key is skipped when you supply `IdpKmsKeyId`, and
@@ -524,6 +525,64 @@ redirect allowlist, `?lang=` on the UI routes and the whole OAuth and OIDC
 callback vocabulary elsewhere. `Host` is the exception because API Gateway
 routes on it and rejects the viewer's.
 
+## Admin console
+
+`EnableAdminConsole=true` mounts the reference's admin console at `/admin`,
+beside the auth routes, guarded by `AdminAccessPolicy`. Off by default, and
+off means nothing under `/admin` is mounted and no variable is set. The whole
+mapping from the `admin` block onto the console, and what each policy grants,
+is [docs/config-reference.md §16](../../docs/config-reference.md).
+
+| Parameter | Meaning |
+|---|---|
+| `EnableAdminConsole` | `true` mounts the console. Off by default. |
+| `AdminAccessPolicy` | `is-admin-flag`, the one value the template offers. `open` (everyone, no credential) is `ConfigFile`-only and warned about, because every front door here is internet-facing; `first-user` is refused at cold start on every driver (RS-17: ids are random on this product, so the policy would admit whoever drew the lowest one). The `rbac:<role>` and `permission:<perm>` forms need `stores.enable.rbac`, which is a document knob, so they are set in `ConfigFile`. |
+| `AdminRootEmail` + `AdminRootPasswordHashArn` | The bootstrap administrator: an address and a Secrets Manager secret holding that user's **bcrypt hash** — the output of bcrypt, never the password. Required together; a changeset with one and not the other is refused by a Rule. The root user bypasses the policy, which is how the first administrator gets in under `is-admin-flag` and promotes the second. |
+| `EnableAdminUploads` | Creates the private bucket above and points `ui.uploadDir` at `s3://<bucket>/uploads`. Off by default. |
+
+**Run the backfill first.** The console's user tab reads a sparse index that
+only accounts created since the D6 release are in; every older account is found
+by every other route and missing from that one, and nothing looks wrong from
+outside. Before turning the console on against a table that predates that
+release:
+
+```sh
+./scripts/toolchain.sh go run ./cmd/migrate backfill-users \
+  --table <TableName output> --region eu-west-1 --profile lambda-auth
+```
+
+It is idempotent, resumable (`--start-key`, printed on interruption) and safe
+while the table is serving: every write is a conditional `UpdateItem` on the
+two index attributes. It is an operator command rather than something the
+function does because it is a `Scan`, which the execution role deliberately
+does not grant. `--dry-run` reports what it would index and writes nothing.
+
+**What the console's session is.** Logging in at `/admin/login` sets a
+24-hour cookie under the same name as the auth access token, signed with
+`security.jwt.accessTokenSecret` — the integration the reference documents —
+so an ordinary `POST /auth/login` session also opens the console for a user
+the policy admits. The 2FA step-up token does **not**: the core accepts only
+`typ:"admin"` and `typ:"access"` (`admin-guard-accepts-only-typed-session-tokens`).
+The cookie is subject to the KNOWN LIMITATION at the top of the template
+exactly as the auth cookies are. Three things the session is not, all of them
+the reference's: it is **not revocable** — the guard never consults the session
+store, so `SessionCheckOn=allcalls` does not reach it, `/admin/logout` only
+clears the cookie, and rotating the access-token secret is the one kill switch;
+`/admin/login` **does not enforce a second factor** — password alone opens the
+console for an account the deployment would otherwise challenge, so a
+deployment that requires 2FA points `admin.loginPath` at the hosted login,
+whose flow does (`admin-login-skips-the-second-factor`); and it has **no CSRF
+check**, so the Rule refuses the console beside `CookieSameSite=none` (RS-18).
+The function rate-limits `/admin/login` under the same `rateLimit` block as the
+auth login.
+
+**The documentation pair.** With `docs.swagger` resolving to on (the default
+outside production), `GET /admin/api/openapi.json` and `GET /admin/api/docs`
+are served **unguarded**, as the reference registers them: an anonymous caller
+reads the whole documented admin surface. Both carry the same
+`Content-Security-Policy` as the auth router's pair. Set `docs.swagger: false`
+in `ConfigFile` for a stack that should not publish it.
+
 ## Observability
 
 Nine alarms, an optional notification target, an optional budget and one rule
@@ -716,6 +775,10 @@ at rest or billed per request:
   two, and cost anomaly detection is free. In an account that has already spent
   its ten alarm metrics elsewhere, $0.90/month.
 - S3 artifact bucket: a few megabytes per deployed version. Cents.
+- Admin uploads bucket (`EnableAdminUploads=true`): storage at ~$0.023 per
+  GB-month — cents for a handful of logos — plus ~$0.0004 per thousand
+  `GetObject`s, one per page view that fetches an uploaded logo, misses
+  included. No standing charge. [docs/cost-model.md §2.6](../../docs/cost-model.md).
 
 Under traffic the shape is roughly $1 per million API requests, $0.20 per
 million Lambda invocations plus GB-seconds, and $1.25 per million DynamoDB

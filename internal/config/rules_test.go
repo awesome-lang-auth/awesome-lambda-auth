@@ -166,6 +166,49 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage:        "enumerate users",
 		},
 		{
+			// Two rules fire on this document, RS-10 above for the driver and
+			// RS-17 for the ids, and each names its own reason.
+			name: "RS-17 first-user policy elects the lowest random id, on every driver",
+			mutate: func(doc Document) {
+				set(doc, "admin.enabled", true)
+				set(doc, "admin.accessPolicy", "first-user")
+			},
+			allowUnimplemented: true,
+			capabilities:       func(string) StoreCapabilities { return StoreCapabilities{ListUsers: true} },
+			wantRule:           RuleFirstUserRandomIDs,
+			wantPath:           "admin.accessPolicy",
+			wantMessage:        "lowest random id",
+		},
+		{
+			name: "RS-18 admin console under a session policy with sameSite none",
+			mutate: func(doc Document) {
+				set(doc, "cookies.sameSite", "none")
+				set(doc, "cookies.secure", true)
+				set(doc, "admin.enabled", true)
+				set(doc, "admin.accessPolicy", "is-admin-flag")
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleAdminCrossSiteCookie,
+			wantPath:           "cookies.sameSite",
+			wantMessage:        "promote",
+		},
+		{
+			name: "RS-6 a bootstrap secret too short to be one",
+			mutate: func(doc Document) {
+				set(doc, "admin.enabled", true)
+				set(doc, "admin.accessPolicy", "is-admin-flag")
+			},
+			env: map[string]string{
+				"AWESOME_AUTH_JWT_ACCESS_SECRET":      strings.Repeat("a", 40),
+				"AWESOME_AUTH_JWT_REFRESH_SECRET":     strings.Repeat("b", 40),
+				"AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET": "hunter2",
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleAdminUnguarded,
+			wantPath:           "admin.bootstrapSecret",
+			wantMessage:        "below the 32-character minimum",
+		},
+		{
 			name: "RS-11 incomplete oauth provider block",
 			mutate: func(doc Document) {
 				set(doc, "email.siteUrls", []any{"https://app.example.com"})

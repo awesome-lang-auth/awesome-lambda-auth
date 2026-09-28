@@ -38,7 +38,70 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS11OAuthProviders(c, d)
 	checkRS12MemoryStore(c, d)
 	checkRS13Migration(c, capabilities, d)
+	checkRS17FirstUserRandomIDs(c, d)
+	checkRS18AdminCrossSiteCookie(c, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS17FirstUserRandomIDs: the first-user policy does not elect the first
+// user here, so it is refused on every driver.
+//
+// The reference's evaluation is `listUsers(1, 0)` and compare the first id
+// (src/router/admin.router.ts:372-374), which the core reproduces (admin.go
+// evaluate), and its doc string calls the result "the first registered user".
+// That is true under monotonic ids and false under these: the core's newID is
+// prefix + "_" + hex(16 random bytes) (security.go), the DynamoDB lister orders
+// by its <tenant>#<id> sort key and the memory lister by id, so the account the
+// policy admits is whoever holds the lowest random id today. Every registration
+// redraws: with one existing user a single POST <prefix>/register takes the
+// console with probability one half, and the incumbent is locked out of it in
+// the same moment. The register route is public and the guard accepts the
+// newcomer's ordinary access token, so this is not a misconfiguration an
+// operator could compensate for -- it is a policy whose premise the store does
+// not provide, and the honest answer is to refuse it and name the way in.
+//
+// Not conditioned on admin.enabled, like RS-10: a policy that would be wrong
+// the day the switch is flipped is wrong in the document today.
+func checkRS17FirstUserRandomIDs(c *Config, d *diagnostics) {
+	if c.Admin.AccessPolicy != AdminAccessPolicyFirstUser {
+		return
+	}
+	d.errf(RuleFirstUserRandomIDs, "admin.accessPolicy",
+		"accessPolicy first-user admits the user whose id sorts first in ListUsers(1, 0), and on this product ids are 128 random bits, "+
+			"so the console goes to whoever holds the lowest random id and changes hands whenever a later registrant draws a lower one -- "+
+			"any caller of POST <prefix>/register can take it",
+		"use is-admin-flag, get the first administrator in with admin.rootUser (or admin.bootstrapSecret) and flag the next with "+
+			"POST <admin>/users/{id}/promote {\"method\":\"flag\"}; or rbac:<role> / permission:<perm> beside stores.enable.rbac")
+}
+
+// checkRS18AdminCrossSiteCookie: the console and SameSite=None are exclusive.
+//
+// The admin router is mounted outside the auth router's CSRF chain, by the
+// reference's design and the core's (admin.go, "What is not wrapped around
+// it"): the vendored admin.js posts to <admin>/login as JSON with no CSRF
+// header, so a double-submit check there would refuse every login the shipped
+// SPA makes. The guard accepts the ordinary access-token cookie as an admin
+// credential, and the promote handler decodes its body loosely with no
+// Content-Type check and a default method (core admin_promote.go), so a plain
+// cross-site <form method=POST> needs no preflight. What stands between that
+// form and a new administrator is the SameSite attribute on the cookie, and
+// cookies.sameSite is a knob. RS-5 already makes `none` require Secure; this
+// rule says that, with a console mounted under a session policy, `none` is not
+// available at all. The legacy bootstrap-secret guard reads only the
+// Authorization header and `open` reads nothing, so neither is in scope.
+func checkRS18AdminCrossSiteCookie(c *Config, d *diagnostics) {
+	if !c.Admin.Enabled || c.Cookies.SameSite != SameSiteNone {
+		return
+	}
+	policy := strings.TrimSpace(c.Admin.AccessPolicy)
+	if policy == "" || policy == AdminAccessPolicyOpen {
+		return
+	}
+	d.errf(RuleAdminCrossSiteCookie, "cookies.sameSite",
+		"the admin console is mounted under a session policy and sameSite is none: the console sits outside the CSRF chain by design "+
+			"(the vendored SPA posts to <admin>/login with no CSRF header) and its guard accepts the ordinary access-token cookie, "+
+			"so SameSite is the only thing that keeps a cross-site form post from reaching every admin write, POST <admin>/users/{id}/promote included",
+		"set cookies.sameSite to lax or strict; a deployment whose own clients need sameSite none cannot also host the console on those cookies")
 }
 
 // checkRS13Migration: a migration block must describe a migration that can
@@ -294,22 +357,40 @@ func checkRS5SameSite(c *Config, d *diagnostics) {
 		"set cookies.secure: true, or use sameSite: lax if the clients are same-site")
 }
 
-// checkRS6AdminGuard: a deployed admin surface must have a guard.
+// checkRS6AdminGuard: a deployed admin surface must have a guard, and a guard
+// made of a secret must be a secret.
 //
 // With neither an access policy nor a bootstrap secret, the reference logs to
 // stderr and leaves the admin routes fully open
 // (src/router/admin.router.ts:516-537). Operators of a deployed product do not
 // read stderr, so the same situation refuses to start.
+//
+// The second clause is the product's. The reference accepts adminSecret at any
+// length, and so did this loader, while it holds the JWT secrets to
+// minHS256SecretLength. The bootstrap secret deserves the same floor and for a
+// sharper reason: beside a policy it is a *password* POST <admin>/login accepts
+// for the empty email or the literal "admin" (core admin.go adminLogin, arm 2),
+// compared in constant time with no bcrypt cost per guess, and a hit mints an
+// isRoot token that skips the store and the policy alike. A short value there is
+// not a weak guard but a guessable one.
 func checkRS6AdminGuard(c *Config, d *diagnostics) {
 	if !c.Admin.Enabled {
 		return
 	}
-	if c.Admin.AccessPolicy != "" || c.SecretValue("admin.bootstrapSecret") != "" {
+	const path = "admin.bootstrapSecret"
+	secret := c.SecretValue(path)
+	if secret != "" && len(secret) < minHS256SecretLength && !c.secretFailed(path) {
+		d.errf(RuleAdminUnguarded, path,
+			fmt.Sprintf("the bootstrap secret is %d characters, below the %d-character minimum; beside a policy it is a password POST <admin>/login accepts for the empty email or \"admin\", "+
+				"compared with no bcrypt cost per guess, and a hit mints a root token that skips the store and the policy", len(secret), minHS256SecretLength),
+			fmt.Sprintf("generate one with: openssl rand -base64 %d, or remove it and get in with admin.rootUser", minHS256SecretLength+16))
+	}
+	if c.Admin.AccessPolicy != "" || secret != "" {
 		return
 	}
 	d.errf(RuleAdminUnguarded, "admin.accessPolicy",
 		"the admin surface is enabled with neither an access policy nor a bootstrap secret, which would leave every admin endpoint open to anyone",
-		"set admin.accessPolicy (first-user, is-admin-flag, rbac:<role>, permission:<perm>) or reference admin.bootstrapSecret from a store")
+		"set admin.accessPolicy (is-admin-flag, rbac:<role>, permission:<perm>) or reference admin.bootstrapSecret from a store")
 }
 
 // checkRS8ResourceServerJWKS: resource-server mode needs a well-formed https

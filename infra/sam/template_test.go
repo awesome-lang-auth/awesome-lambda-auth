@@ -412,6 +412,202 @@ func numericDefault(t *testing.T, tpl *template, name string) float64 {
 	return v
 }
 
+// ── the upload bucket ───────────────────────────────────────────────────────
+
+// TestTheUploadBucketIsPrivateEncryptedAndConditional is the enforcement half
+// of the comment above AdminUploadsBucket. Every bucket in this template must
+// be off unless asked for, block public access four ways, disable ACLs and
+// encrypt at rest — and the IAM statements that reach it must be conditioned
+// on the same switch and scoped to the bucket's prefix, never to a wildcard.
+// A later block that adds a bucket — access logs, an export — fails here
+// rather than in a public-bucket finding.
+func TestTheUploadBucketIsPrivateEncryptedAndConditional(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+
+	buckets := tpl.ofType("AWS::S3::Bucket")
+	if len(buckets) == 0 {
+		t.Fatal("the template declares no bucket, so this test proves nothing")
+	}
+	for _, b := range buckets {
+		if b.condition == "" {
+			t.Errorf("%s has no Condition: a bucket that always exists is a bill and a namespace collision on every deploy", b.name)
+		}
+		for _, want := range []string{
+			"BlockPublicAcls: true", "BlockPublicPolicy: true",
+			"IgnorePublicAcls: true", "RestrictPublicBuckets: true",
+			"ObjectOwnership: BucketOwnerEnforced",
+			"SSEAlgorithm:",
+		} {
+			if !strings.Contains(b.body, want) {
+				t.Errorf("%s lacks %q; the bucket must be private and encrypted in every configuration", b.name, want)
+			}
+		}
+		if strings.Contains(b.body, "BucketName:") {
+			t.Errorf("%s sets a BucketName; a fixed name collides with a bucket a previous stack left behind", b.name)
+		}
+		if strings.Contains(b.body, "WebsiteConfiguration") || strings.Contains(b.body, "PublicRead") {
+			t.Errorf("%s is configured for public serving; the function serves the objects, not S3", b.name)
+		}
+	}
+
+	fn, ok := tpl.resources["AuthFunction"]
+	if !ok {
+		t.Fatal("AuthFunction is gone")
+	}
+	for _, sid := range []string{"AdminUploadObjects", "AdminUploadListing"} {
+		i := strings.Index(fn.body, "Sid: "+sid)
+		if i < 0 {
+			t.Errorf("AuthFunction grants no statement with Sid %s", sid)
+			continue
+		}
+		// The statement must sit inside an !If on the upload switch: look back
+		// from the Sid to the nearest condition name.
+		before := fn.body[:i]
+		j := strings.LastIndex(before, "- !If")
+		if j < 0 || !strings.Contains(before[j:], "AdminUploadsEnabled") {
+			t.Errorf("Sid %s is not conditioned on AdminUploadsEnabled; a stack without the bucket would grant S3 access to nothing, or to everything", sid)
+		}
+	}
+	// The assertions are positive, because the template writes its ARNs
+	// through ${AdminUploadsBucket.Arn} and a literal wildcard could never
+	// appear in an honest or a dishonest edit: what has to be seen is the
+	// prefix on the object grant, the bucket ARN and no s3:prefix condition on
+	// the listing grant, and no '*' Resource anywhere in the S3 block.
+	start := strings.Index(fn.body, "Sid: AdminUploadObjects")
+	end := strings.Index(fn.body[start:], "AWS::NoValue")
+	if start < 0 || end < 0 {
+		t.Fatal("cannot isolate the S3 statements in AuthFunction")
+	}
+	s3Block := fn.body[start : start+end]
+	if !strings.Contains(s3Block, "Resource: !Sub '${AdminUploadsBucket.Arn}/uploads/*'") {
+		t.Error("AdminUploadObjects is not scoped to ${AdminUploadsBucket.Arn}/uploads/*, the one prefix the store writes under")
+	}
+	if !strings.Contains(s3Block, "Resource: !GetAtt AdminUploadsBucket.Arn") {
+		t.Error("AdminUploadListing is not scoped to the bucket's own ARN")
+	}
+	// No prefix condition on the listing, on purpose: S3 answers a missing
+	// key 404 only to a caller that holds s3:ListBucket for that request, and
+	// a GetObject carries no s3:prefix, so a conditioned grant would turn
+	// every miss into a 403 the store reads as a failure
+	// (internal/integration/aws/s3_uploads.go, TestS3AccessDeniedIsAFailureNotAMiss).
+	if strings.Contains(s3Block, "s3:prefix") {
+		t.Error("AdminUploadListing carries an s3:prefix condition, which does not apply to GetObject/HeadObject and turns every missing upload into a 403 instead of a 404")
+	}
+	for _, line := range strings.Split(s3Block, "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "Resource:") && strings.Contains(trimmed, "'*'") {
+			t.Errorf("an S3 statement names Resource '*': %s", trimmed)
+		}
+	}
+	if strings.Contains(fn.body, "s3:*") || strings.Contains(fn.body, "arn:aws:s3:::*") {
+		t.Error("AuthFunction carries an S3 wildcard; every S3 grant is scoped to the upload bucket")
+	}
+
+	// The bucket policy exists, is conditioned with the bucket, and only
+	// denies: the one thing a policy on a private bucket should add is the
+	// TLS requirement.
+	policy, ok := tpl.resources["AdminUploadsBucketPolicy"]
+	if !ok {
+		t.Fatal("AdminUploadsBucketPolicy is gone; the bucket must refuse requests that are not over TLS")
+	}
+	if policy.condition != "AdminUploadsEnabled" {
+		t.Errorf("AdminUploadsBucketPolicy Condition = %q, want AdminUploadsEnabled, the bucket's own switch", policy.condition)
+	}
+	for _, want := range []string{"Effect: Deny", "aws:SecureTransport: 'false'", "${AdminUploadsBucket.Arn}/*"} {
+		if !strings.Contains(policy.body, want) {
+			t.Errorf("AdminUploadsBucketPolicy lacks %q", want)
+		}
+	}
+	if strings.Contains(policy.body, "Effect: Allow") {
+		t.Error("AdminUploadsBucketPolicy grants something; the function's access comes from its role, and the bucket policy only denies")
+	}
+}
+
+// ── the admin console's variables and grants follow its switch ──────────────
+
+// TestTheRootUserFollowsTheConsoleSwitch is the enforcement half of the
+// comment above HasAdminRootPasswordHash: the two root-user variables and the
+// IAM read of the hash exist only with the console on. Before it, a stack with
+// EnableAdminConsole=false and a root user configured still fetched the hash
+// at every cold start and held a GetSecretValue grant for a console it did
+// not mount, against two comments that said otherwise.
+func TestTheRootUserFollowsTheConsoleSwitch(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+
+	i := strings.Index(body, "HasAdminRootPasswordHash: !And")
+	if i < 0 {
+		t.Fatal("HasAdminRootPasswordHash is gone or no longer an !And")
+	}
+	condition := body[i:]
+	if j := strings.Index(condition, "\n\n"); j > 0 {
+		condition = condition[:j]
+	}
+	for _, want := range []string{"!Condition AdminConsoleEnabled", "!Condition HasAdminRootEmail", "AdminRootPasswordHashArn"} {
+		if !strings.Contains(condition, want) {
+			t.Errorf("HasAdminRootPasswordHash lacks the term %q:\n%s", want, condition)
+		}
+	}
+
+	tpl := load(t)
+	fn := tpl.resources["AuthFunction"]
+	if fn == nil {
+		t.Fatal("AuthFunction is gone")
+	}
+	for _, name := range []string{"AWESOME_AUTH_ADMIN_ROOT_EMAIL", "AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH_SECRETSMANAGER", "Sid: ReadAdminRootPasswordHash"} {
+		k := strings.Index(fn.body, name)
+		if k < 0 {
+			t.Errorf("AuthFunction no longer carries %s", name)
+			continue
+		}
+		// The condition sits within a few lines of the name, before it for the
+		// IAM statement (`- !If` / `- HasAdminRootPasswordHash`) and after it
+		// for a variable (`!If` / `- HasAdminRootPasswordHash`).
+		lo, hi := k-200, k+200
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(fn.body) {
+			hi = len(fn.body)
+		}
+		if !strings.Contains(fn.body[lo:hi], "HasAdminRootPasswordHash") {
+			t.Errorf("%s is not conditioned on HasAdminRootPasswordHash, so it outlives the console switch:\n%s", name, fn.body[lo:hi])
+		}
+	}
+}
+
+// TestTheConsoleParameterOffersOnlyTheFlagPolicy pins the two values that
+// left AdminAccessPolicy's AllowedValues: `open` admits the world on a stack
+// whose every front door is internet-facing, and `first-user` is refused at
+// cold start on every driver (RS-17). Both stay in the schema so a family
+// document parses and meets the warning or the refusal; neither is something
+// this template should offer as a choice.
+func TestTheConsoleParameterOffersOnlyTheFlagPolicy(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	param, ok := tpl.parameters["AdminAccessPolicy"]
+	if !ok {
+		t.Fatal("AdminAccessPolicy is gone")
+	}
+	if got := param.fields["AllowedValues"]; got != "[is-admin-flag]" {
+		t.Errorf("AdminAccessPolicy AllowedValues = %s, want [is-admin-flag]: open and first-user are ConfigFile-only", got)
+	}
+	if got := param.fields["Default"]; got != "is-admin-flag" {
+		t.Errorf("AdminAccessPolicy Default = %s, want is-admin-flag", got)
+	}
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	if !strings.Contains(strings.ReplaceAll(string(raw), "\r\n", "\n"), "AdminConsoleNeedsSameSiteCookies:") {
+		t.Error("the Rule refusing the console beside CookieSameSite none is gone (RS-18 at changeset time)")
+	}
+}
+
 // ── what must never be committed ────────────────────────────────────────────
 
 var (

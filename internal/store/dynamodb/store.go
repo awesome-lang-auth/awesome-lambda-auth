@@ -174,7 +174,9 @@ type Options struct {
 // EmailVerificationStore, EmailChangeStore, TOTPStore, AuthCodeStore,
 // UserMetadataStore (metadata.go), RolesPermissionsStore (roles.go), TenantStore
 // (tenants.go) and the three v0.8.0 admin listers — AdminUserStore (users.go),
-// SessionLister (sessions.go) and RoleLister (roles.go). From account.go,
+// SessionLister (sessions.go) and RoleLister (roles.go), plus the two one-flag
+// profile writers UserAdminFlagStore and UserTwoFactorPolicyStore
+// (user_flags.go). From account.go,
 // UserPhoneStore. From template_store.go, TemplateStore (templates.go). From
 // settings_store.go, SettingsStore (settings.go). From api_keys.go, the
 // completed APIKeyStore and three of its four companions (api_keys.go). From

@@ -14,9 +14,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		domain string
 		mutate func(Document)
 	}{
-		{"admin", func(doc Document) {
-			set(doc, "admin.basePath", "/console")
-		}},
 		{"tools", func(doc Document) {
 			set(doc, "tools.basePath", "/ops")
 		}},
@@ -60,15 +57,18 @@ func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 // documented variable leaves no trace in the Config tree, so the check also looks
 // at what actually resolved.
 //
-// The admin bootstrap secret stands in for what used to be idProvider.privateKey
-// here: that domain is wired now, and this test needs a domain that still has a
-// secretPrefix.
+// The SSE distributor's password stands in for what used to be the admin
+// bootstrap secret here, which stood in for idProvider.privateKey before it:
+// both of those domains are wired now, and this test needs a domain that still
+// has a secretPrefix. `tools` is the last one, and its only secret is this one.
+// TestAdminIsWired holds the other side — the bootstrap secret through the same
+// kind of variable loads, because it is read.
 func TestUnwiredDomainViaSecretIsAlsoRefused(t *testing.T) {
 	env := baseEnv()
-	env["AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET"] = "admin-bootstrap-secret-value"
+	env["AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_PASSWORD"] = "sse-distributor-password-value"
 
 	_, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
-	requireRule(t, err, RuleUnimplemented, "admin")
+	requireRule(t, err, RuleUnimplemented, "tools")
 }
 
 // TestRuntimeSettingsIsWired is the other side of the refusal table for the
@@ -226,8 +226,14 @@ func TestUIIsWired(t *testing.T) {
 			set(doc, "ui.enabled", true)
 			set(doc, "ui.assetsDir", "/var/task/ui")
 		}},
-		{"an upload directory, which is accepted and not honoured", func(doc Document) {
+		// The name said "accepted and not honoured" until the admin block: the
+		// knob names an S3 location now, and this filesystem spelling still loads
+		// — a family document has to — and is reported at cold start instead.
+		{"an upload directory in the filesystem spelling, which loads and is reported", func(doc Document) {
 			set(doc, "ui.uploadDir", "/var/task/uploads")
+		}},
+		{"an upload location in the S3 spelling", func(doc Document) {
+			set(doc, "ui.uploadDir", "s3://example-uploads/uploads")
 		}},
 	}
 
@@ -250,6 +256,177 @@ func TestUIIsWired(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAdminIsWired is the other side of the refusal table for the domain this
+// block opened: a document that configures the admin console loads instead of
+// tripping the phase gate.
+//
+// Every case is something that used to refuse a deployment on its own, and one
+// of them is not in the document at all. `admin` was the last wired domain to
+// carry a secretPrefix: a bootstrap secret supplied through its documented
+// variable leaves no trace in the Config tree, the prefix was what noticed it,
+// and the case that supplies nothing else is what shows the prefix went with the
+// entry rather than outliving it. `admin.basePath` is here because it was the
+// refusal table's own admin case until this commit, and `false` for the reason
+// it is in TestDocsIsWired and TestUIIsWired: the gate made a deliberately-off
+// console impossible to write down.
+//
+// Un-gating relaxed nothing, and the sub-tests after the table pin that. The
+// block has refusals of its own which the gate used to pre-empt, so they were
+// unreachable without AllowUnimplemented and are the block's real front door
+// now: RS-6 for an enabled console with no access decision — the reference
+// builds that router, warns on stderr and serves it unguarded
+// (admin.router.ts:516-537) — RS-17 for `first-user` on every driver and RS-10
+// for it on a driver that cannot list at all, RS-18 for a session console
+// beside cookies.sameSite: none, the store requirement behind the two RBAC
+// spellings of the policy, and the enum the policy is held to. What cmd/auth
+// then builds out of the block is its own tests' business (admin_test.go).
+func TestAdminIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    map[string]string
+	}{
+		{name: "the console switched off deliberately", mutate: func(doc Document) {
+			set(doc, "admin.enabled", false)
+		}},
+		{name: "mounted under is-admin-flag", mutate: func(doc Document) {
+			set(doc, "admin.enabled", true)
+			set(doc, "admin.accessPolicy", "is-admin-flag")
+		}},
+		{name: "mounted under a role, with the rbac store beside it", mutate: func(doc Document) {
+			set(doc, "stores.enable.rbac", true)
+			set(doc, "admin.enabled", true)
+			set(doc, "admin.accessPolicy", "rbac:admin")
+		}},
+		{name: "mounted under a permission, with the rbac store beside it", mutate: func(doc Document) {
+			set(doc, "stores.enable.rbac", true)
+			set(doc, "admin.enabled", true)
+			set(doc, "admin.accessPolicy", "permission:console.access")
+		}},
+		{name: "a base path of its own", mutate: func(doc Document) {
+			set(doc, "admin.basePath", "/console")
+		}},
+		{name: "a root user's address", mutate: func(doc Document) {
+			set(doc, "admin.rootUser.email", "root@example.test")
+		}},
+		{name: "the two knobs that reach constants in the core", mutate: func(doc Document) {
+			set(doc, "admin.sessionTtl", "8h")
+			set(doc, "admin.upload.maxFileSizeMb", 10)
+		}},
+		{
+			name:   "a bootstrap secret through its variable and nothing in the document",
+			mutate: func(Document) {},
+			env:    map[string]string{"AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET": "admin-bootstrap-secret-value-0123456789"},
+		},
+		{
+			name: "mounted on the bootstrap secret alone, which RS-6 accepts as the guard",
+			mutate: func(doc Document) {
+				set(doc, "admin.enabled", true)
+			},
+			env: map[string]string{"AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET": "admin-bootstrap-secret-value-0123456789"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			for k, v := range tc.env {
+				env[k] = v
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("admin is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "admin" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("admin is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["admin"]; gated {
+				t.Error("admin is still listed by UnwiredDomains")
+			}
+		})
+	}
+
+	t.Run("enabled with no access decision", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, RuleAdminUnguarded, "admin.accessPolicy")
+	})
+
+	t.Run("a role policy without the rbac store", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "rbac:admin")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, RuleStoreRequired, "stores.enable.rbac")
+	})
+
+	t.Run("a policy outside the five spellings", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "everyone")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		if err == nil {
+			t.Fatal("an access policy the schema does not know loaded")
+		}
+		if !strings.Contains(err.Error(), "admin.accessPolicy") {
+			t.Errorf("the refusal does not name admin.accessPolicy:\n%v", err)
+		}
+	})
+
+	// first-user, on the un-gated front door and without AllowUnimplemented:
+	// RS-17 on every driver, because ids are random here and "first" is
+	// whoever drew the lowest one, and RS-10 beside it on a driver that cannot
+	// list at all. The table used to load this policy as a wired one; it is
+	// wired, and refused.
+	t.Run("first-user on a driver that can list users", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "first-user")
+
+		_, err := Load(t.Context(), Options{
+			Document:     doc,
+			Getenv:       getenvFrom(baseEnv()),
+			Capabilities: func(string) StoreCapabilities { return StoreCapabilities{ListUsers: true} },
+		})
+		requireRule(t, err, RuleFirstUserRandomIDs, "admin.accessPolicy")
+		requireNoRule(t, err, RuleFirstUserListUsers)
+	})
+
+	t.Run("first-user on a driver that cannot list users", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "first-user")
+
+		_, err := Load(t.Context(), Options{
+			Document:     doc,
+			Getenv:       getenvFrom(baseEnv()),
+			Capabilities: func(string) StoreCapabilities { return StoreCapabilities{ListUsers: false} },
+		})
+		requireRule(t, err, RuleFirstUserListUsers, "admin.accessPolicy")
+		requireRule(t, err, RuleFirstUserRandomIDs, "admin.accessPolicy")
+	})
+
+	t.Run("a session console beside sameSite none", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "is-admin-flag")
+		set(doc, "cookies.sameSite", "none")
+		set(doc, "cookies.secure", true)
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, RuleAdminCrossSiteCookie, "cookies.sameSite")
+	})
 }
 
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the

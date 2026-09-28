@@ -94,12 +94,14 @@ func TestUIOptionsCarryTheWholeBlock(t *testing.T) {
 		t.Errorf("DefaultLang = %q, want the mailer's %q", got.DefaultLang, "it")
 	}
 
-	// The uploads seam stays empty in this build. See uiUploadsAreNotServed and
-	// the ui-uploaded-assets-are-not-served deviation; a read path over an empty
-	// S3 location, on the request path of every page, is D8's to design beside
-	// the writer.
+	// The uploads seam stays nil, and nil is now load-bearing the other way
+	// round: the core serves the upload store admin.go configured through
+	// auth.UploadFS whenever this field is nil (uiUploadsFollowTheUploadStore),
+	// so a non-nil value here would *override* the store with a second
+	// configuration of the same objects. TestUploadedAssetsAreServedFromTheUploadStore
+	// in admin_test.go drives the read side end to end.
 	if got.Uploads != nil {
-		t.Error("UIOptions.Uploads is set; nothing writes to it until the upload store lands, and an fs.FS over S3 costs a GetObject per page view")
+		t.Error("UIOptions.Uploads is set; it must stay nil so the core serves the configured upload store rather than an override")
 	}
 }
 
@@ -315,7 +317,7 @@ func TestHTTPConfigMountsTheUIHandler(t *testing.T) {
 				t.Fatalf("auth.New: %v", err)
 			}
 			mux := http.NewServeMux()
-			if err := mountAuthSurface(mux, core, tc.cfg, nil); err != nil {
+			if err := mountAuthSurface(mux, core, tc.cfg, nil, nil); err != nil {
 				t.Fatalf("mountAuthSurface: %v", err)
 			}
 
@@ -362,13 +364,36 @@ func TestLogUISurfaceNamesWhatADeploymentCannotSee(t *testing.T) {
 		}
 	})
 
-	t.Run("an upload directory nothing honours", func(t *testing.T) {
+	// The upload location, as the UI sees it: the two asset paths now serve
+	// the upload store admin.go builds from an S3 location, one GetObject per
+	// request, and the log says so where a visitor would meet it. A plain
+	// path builds no store and is reported by unwiredKnobs instead
+	// (TestAPlainUploadPathBuildsNoStoreAndIsReported, admin_test.go); this
+	// used to be the retired ui-uploaded-assets-are-not-served warning.
+	t.Run("an upload location the UI serves from", func(t *testing.T) {
 		t.Parallel()
-		out := captureUILog(t, uiEnv(t, "AWESOME_AUTH_UI_UPLOAD_DIR", "/var/task/uploads"))
-		for _, want := range []string{"ui.uploadDir", "ui-uploaded-assets-are-not-served", "ui.branding.logoUrl"} {
+		out := captureUILog(t, uiEnv(t, "AWESOME_AUTH_UI_UPLOAD_DIR", "s3://logos/uploads"))
+		for _, want := range []string{"ui.uploadDir", "uploaded assets on the hosted UI", "/auth/ui/assets/uploads/*", "GetObject", uploadAssetCSP} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the cold-start log does not say %q:\n%s", want, out)
 			}
+		}
+	})
+
+	// The plain-path spelling builds no store, and the line says so instead
+	// of claiming the two paths are served from one: the two cold-start lines
+	// about ui.uploadDir — this one and the knob gap — used to contradict each
+	// other, and this one was the wrong one on the wire.
+	t.Run("an upload path the UI cannot serve from", func(t *testing.T) {
+		t.Parallel()
+		out := captureUILog(t, uiEnv(t, "AWESOME_AUTH_UI_UPLOAD_DIR", "/var/uploads"))
+		for _, want := range []string{"uploaded assets on the hosted UI are not served", "/var/uploads", "/auth/ui/assets/uploads/* answer 404"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the cold-start log does not say %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "from the upload store") {
+			t.Errorf("the cold-start log claims a filesystem path is served from the upload store:\n%s", out)
 		}
 	})
 }

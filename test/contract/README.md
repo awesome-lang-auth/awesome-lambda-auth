@@ -32,10 +32,12 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 | `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
+| `AWESOME_AUTH_CONTRACT_ADMIN_PATH` | Where the admin console is mounted, as an absolute path. Default `/admin`, the same default the reference's swagger base and this product's `admin.basePath` use. |
+| `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` + `AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` | An account the console admits — the configured root user, or a user the operator promoted. **Opt-in and unset by default**, because the suite cannot mint an administrator. Both or neither: one without the other is a fault. See below. |
 
-All four are passed through `scripts/toolchain.sh` into the container.
+All of them are passed through `scripts/toolchain.sh` into the container.
 
 **Set `AWESOME_AUTH_CONTRACT_REQUIRE` for anything that is supposed to be
 complete.** Absence is unfalsifiable from outside: a session store the operator
@@ -342,6 +344,77 @@ run there: the reference has no limiter to declare. It pins the product
 deviation `rate-limited-routes-answer-429`
 ([deviations.md](../../docs/deviations.md)) rather than a clause of the wire
 contract, which is why its `Doc` cites the register.
+
+**The admin console is `admin`, and the credential to enter it is the
+operator's to declare.** The reference's admin router
+(`src/router/admin.router.ts`) is mounted by the host *beside* the auth router
+— `/admin` by default, `AWESOME_AUTH_CONTRACT_ADMIN_PATH` to move it — and
+guarded by an access policy the operator chose (`admin.accessPolicy` here). It
+has no family client of its own: the client it must stay compatible with is
+the reference's `admin.js`, which the console serves itself, and the cases
+drive the routes that script calls with the bodies it sends.
+
+The probe is `GET <admin>/api/ping`, fetched **anonymously**, and it reads
+three answers rather than two. `401` is a mounted, guarded console and is
+`on`. `404` is no console — `admin.enabled` off — and is `absent`. And `200`
+to a caller holding nothing is the `open` policy, the reference's own default
+and the one configuration an authentication product must not report as
+healthy: the probe records it as **`BROKEN`**, says the console is open in as
+many words, and fails the run. A suite that treated an unguarded console as a
+capability would pass every case below against a deployment that admits the
+world.
+
+The credential is declared, not provisioned. The suite provisions ordinary
+accounts through `POST /register` and nothing a client can do turns one of
+them into an administrator: under `is-admin-flag` the flag is set by the
+console itself, under `first-user` the first account on a shared stack belongs
+to somebody else, and under `rbac:<role>` the role is assigned by an
+administrator. So `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` and
+`AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` name an account the console admits —
+the stack's configured root user (`AdminRootEmail`, whose hash lives in Secrets
+Manager) is the honest choice, because it exists precisely to bootstrap the
+first administrator — and they settle `admin-credential`, which the four
+credentialed cases need. Unset, those four skip with that reason; half-set is
+a fault. The login itself is `POST <admin>/login` as JSON with no CSRF header,
+because the admin router sits outside the auth router's CSRF chain, and the
+policy is not consulted at login: a user it will refuse logs in and is answered
+403 by the next request, exactly as in the reference.
+
+The same probe also settles **`admin-session`**, off the anonymous shell.
+Two conforming consoles answer the ping 401: one guarded by a policy, whose
+shell injects `sessionBased: true` and whose `/login` and `/logout` routes
+exist, and one guarded by the legacy bootstrap secret alone, whose shell
+injects `sessionBased: false`, registers no `/login`, and whose SPA holds the
+secret in `sessionStorage` (`admin.router.ts:516-541`). The ping cannot tell
+them apart; the shell can, so the probe reads it — a `302` carrying
+`?redirect=` settles it `on` too, because only the session guard redirects to
+a host-configured `loginPath`. Every case that logs in, or asserts the login
+form, needs `admin-session`; against a secret-only console they skip with
+that reason instead of failing on a form the deployment never serves.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `admin/ping-refuses-an-anonymous-caller` | `401 {"error":"Unauthorized"}` — the admin envelope, no `code` — with no credential and with a bogus bearer token alike | `admin` |
+| `admin/shell-serves-the-login-form-anonymously` | an HTML `GET <admin>/` is `200 text/html` carrying `window.__ADMIN_CONFIG__` with `base` equal to the mount, `sessionBased: true` and an absolute `authApiPrefix` (the reference emits the host's option, not the mount it observes, so equality with the prefix the suite drives is logged, not asserted); or `302` to `<loginPath>?redirect=<mount>` when the host configured a login path; `admin.js` and `admin.css` are public either way | `admin`, `admin-session` |
+| `admin/login-sets-the-session-and-ping-reads-it` | `POST <admin>/login {email,password}` is `200 {"success":true}` with a `Set-Cookie`; `GET <admin>/api/ping` with it is `200 {ok:true, features:{…}}` carrying all eleven flags `admin.js` reads; the wrong password is `401 {"error":"Invalid credentials"}`; `POST <admin>/logout` makes the next ping anonymous again | `admin`, `admin-session`, `admin-credential` |
+| `admin/users-listing-has-the-reference-shape` | `GET <admin>/api/users` is `200 {users:[{id,email,…}], total:n}` with a lister, or `501 {error:'IUserStore.listUsers is not implemented', users:[], total:0}` without one; never a bare array, never a `passwordHash`; `total ≥ 1` after this run registered an account — an unswept DynamoDB table under-reports here, which is what `migrate backfill-users` fixes | `admin`, `admin-session`, `admin-credential` |
+| `admin/settings-round-trip` | `GET <admin>/api/settings` is the settings object unwrapped; a write is observed — `PUT` flips `require2FA` when the store holds that key, else `PATCH /api/settings/ui` changes `siteName` when it holds a `ui` block — answering `200 {"success":true}` with the next `GET` reflecting it, and a cleanup restores exactly what was there, keys included: on this product a key's presence carries meaning (`runtime-settings-seed-only-fills-absent-keys`), so the case never materialises one and skips the write half when nothing restorable is stored; `404 {error:'Settings store not configured'}` on a deployment with no settings store, which skips | `admin`, `admin-session`, `admin-credential` |
+
+Three things are deliberately not asserted here, for the reason the docs and
+UI sections give: they are upstream deviations the reference does not share,
+pinned in the core's own tests. The admin token being typed and the 2FA
+step-up token being refused (`admin-guard-accepts-only-typed-session-tokens`);
+an unauthenticated HTML `GET` reaching only the shell and never a guarded route
+(`admin-unauthenticated-get-serves-only-the-login-form`, pinned in
+`cmd/auth/admin_test.go` `TestAdminConsoleIsMountedGuardedAndServed` — every
+anonymous guarded request this suite makes carries `Accept: application/json`,
+the branch the reference answers 401 on too); and the cookie's `Secure` flag
+coming from configuration rather than `X-Forwarded-Proto`. The console's
+documentation pair, `GET <admin>/api/openapi.json` and `/api/docs`, is not
+covered by this suite at all: no case requests it, and its status and its
+`Content-Security-Policy` are pinned in `cmd/auth/admin_test.go`
+`TestAdminDocsPairFollowsDocsSwaggerAndCarriesThePolicy`.
+
 ## Adding a case
 
 Adding a route to the covered surface is adding a `Case`, never editing the
@@ -443,13 +516,24 @@ would leave the deployment throttled for the next caller — and neither is the
 counter's atomicity, which is pinned against a real DynamoDB in
 `internal/store/dynamodb/rate_limit_test.go` instead.
 
+The admin console joins it as far as the operator lets it: the guard's refusal
+and the login shell without a credential, and — with one declared — the login,
+the ping and its feature flags, the users listing in both of its documented
+shapes, and a settings round trip that observes a write and restores exactly
+what was there. The promote, role, tenant, API-key, webhook and upload routes
+are not covered, because each one changes the deployment for whoever calls
+next. `cmd/auth/admin_test.go` drives the promote and upload routes end to end
+against a synthetic deployment, reads the role, tenant, API-key, webhook and
+per-user metadata routes once each behind their handed-over stores, and
+creates an API key and a webhook through the console to assert that neither
+credential reaches the log; it does not exercise every route of those tabs.
+
 Not covered: the OAuth round trip itself — the suite cannot consent at a real
 provider — so the exchange, the provisioning policy and the account-conflict
 redirect are pinned against an httptest provider in `cmd/auth/oauth_test.go`
 instead; the OIDC authorization round trip, which needs a client id and secret
 the suite cannot register for itself (`cmd/auth/idp_test.go` drives that one end
-to end against a synthetic deployment instead); and the admin router, the
-tools/SSE router and the email/SMS token round trips — a token minted by one
-route and spent by another — because the suite has no mailbox to read it from.
-Nothing stops a case being added for them the day the deployment has what they
-need.
+to end against a synthetic deployment instead); and the tools/SSE router and
+the email/SMS token round trips — a token minted by one route and spent by
+another — because the suite has no mailbox to read it from. Nothing stops a
+case being added for them the day the deployment has what they need.

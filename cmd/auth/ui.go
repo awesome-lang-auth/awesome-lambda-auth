@@ -10,6 +10,7 @@ import (
 	auth "github.com/nik2208/awesome-go-auth"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
+	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
 )
 
 // The hosted UI: everything under GET <prefix>/ui — the config document, the
@@ -117,14 +118,16 @@ import (
 //
 // **Uploads** is the reference's uploadDir (ui.router.ts:16-20), served under
 // <prefix>/ui/assets/logo/ and <prefix>/ui/assets/uploads/ (:185-191). **It
-// stays nil in this build, on purpose**, and `ui.uploadDir` is accepted and not
-// honoured. See uiUploadsAreNotServed for the argument and the registered
-// deviation; the short version is that there is nothing writing to it until D8,
-// and building a read path over S3 now would mean a GetObject on the request
-// path of every page that shows a logo, for a bucket that is always empty.
-// Leaving the seam nil is also the core's documented unconfigured behaviour:
-// neither path is mounted and both answer 404, rather than 500 on a store that
-// is not there.
+// stays nil in this build, and nil now means "the upload store".** See
+// uiUploadsFollowTheUploadStore: the core composes the read side from the
+// auth.UploadStore the admin surface hands it (auth.WithUploadStore, U15), and
+// this field is the override for a host that wants the read side served from
+// somewhere else, which this product does not. So `ui.uploadDir` is honoured —
+// as an S3 location, admin.go says how — and the two paths serve what the
+// console uploaded, through one store rather than two configurations. With no
+// store the core's behaviour is the reference's with uploadDir unset: neither
+// path is mounted and both answer 404, rather than 500 on a store that is not
+// there.
 //
 // ── the language default the core left to the host ───────────────────────────
 //
@@ -178,7 +181,8 @@ func uiOptions(cfg *config.Config) auth.UIOptions {
 		// mailer's, and this product has a mailer block where the core does not.
 		DefaultLang: cfg.Email.Mailer.DefaultLang,
 		Assets:      uiAssets(cfg),
-		// Deliberately absent. See uiUploadsAreNotServed.
+		// Deliberately absent, and absent now means the upload store: see
+		// uiUploadsFollowTheUploadStore.
 		Uploads: nil,
 	}
 }
@@ -279,57 +283,50 @@ func checkUIAssets(cfg *config.Config) error {
 		dir, strings.Join(uiFallbackPages, ", "))
 }
 
-// uiUploadsAreNotServed is the argument behind UIOptions.Uploads being nil, and
-// the text the deviation register points at.
+// uiUploadsFollowTheUploadStore is the argument behind UIOptions.Uploads staying
+// nil now that there is something to serve, and the record of the deviation it
+// retires.
 //
 // **What the reference does.** `ui.uploadDir` is a directory an administrator's
 // uploads are written into by the admin router (admin.router.ts:656) and read
 // out of by two express.static mounts, <prefix>/ui/assets/logo/ and
 // <prefix>/ui/assets/uploads/ (ui.router.ts:185-191). With the option unset the
-// reference mounts neither and both paths 404, which is what makes an
-// unconfigured deployment and a configured one that is asked for a file it does
-// not hold behave alike.
+// reference mounts neither and both paths 404.
 //
-// **What this product does.** It serves neither path, in every configuration,
-// and `ui.uploadDir` is accepted by the schema and honoured by nothing.
+// **What this product does.** The same two paths serve the same objects the
+// console uploaded, and the knob that names where they live is the same knob —
+// spelled as an S3 location, `s3://<bucket>[/<prefix>]`, because a Lambda has
+// no directory that survives a request and config-schema.md §1.12 recorded that
+// the serverless target would be S3. admin.go builds one auth.UploadStore from
+// it and hands it to the core (auth.WithUploadStore); the admin routes write
+// through that store, and (*Auth).UIHandler serves the two paths from it
+// through auth.UploadFS whenever UIOptions.Uploads is nil (core ui_config.go,
+// the precedence on UIOptions.Uploads). So this field is left nil *because*
+// the store exists, not in spite of it: filling it would be a second
+// configuration of the same objects, and the one host that should fill it is a
+// host serving the read side from somewhere the store is not — a snapshot, a
+// read-through cache — which this product is not.
 //
-// **Why, and why now rather than later.** Three things, in order of weight.
+// **What retired the deviation.** D7 registered
+// ui-uploaded-assets-are-not-served with three reasons, and each is answered
+// rather than outgrown. *There was no writer*: the four upload routes are the
+// writer, mounted by the adapter under <admin>/api/upload. *A directory was the
+// wrong noun*: the noun is decided, and a plain path is reported at cold start
+// by adminKnobGaps as a spelling this runtime cannot honour, with the s3://
+// form as the remedy — accepted rather than refused so a document written for
+// another port in the family still loads. *An fs.FS over S3 costs a GetObject
+// per Open*: it does, misses included, and the cost is now paid knowingly and
+// written down (docs/cost-model.md) rather than avoided by not having the
+// feature. The retired entry stays indexed under "Retired" in docs/deviations.md
+// so its id keeps resolving.
 //
-// *There is no writer.* The upload half is an admin route, and this build mounts
-// no admin router — the `admin` domain is still refused by phases.go. So a read
-// path built today would be a read path over an empty location, on every
-// deployment, for as long as it takes D8 to land. The core made the same call
-// for the same reason and says so in as many words: Uploads is read-only "on
-// purpose", because "this port has no UploadStore to write through until U15".
-//
-// *A directory is the wrong noun here.* The knob names a filesystem path and a
-// Lambda has no filesystem to name — /var/task is read-only and /tmp is per
-// execution environment, so a logo uploaded through one cold start would be
-// invisible to the next request and gone by the one after. The serverless shape
-// is S3, which §1.12 already records ("serverless target is an S3 location").
-// That is a different thing behind the same knob, and which thing it is decides
-// what the value means, so it is D8's to define together with the writer rather
-// than this block's to guess at.
-//
-// *An fs.FS over S3 costs per request, on the page path.* fs.FS has one
-// operation and it is Open, so every miss and every hit is a GetObject — and the
-// misses are the common case, because the logo is requested by every page of the
-// hosted UI whether or not a deployment has ever uploaded one. Caching it in the
-// execution environment trades that for an upload that does not appear until the
-// next cold start, which is worse than not having the feature. The honest answer
-// is that the read path belongs beside the write path, where one design can pay
-// for both, and that is D8.
-//
-// **What a deployment sees in the meantime.** Exactly the reference's
-// unconfigured behaviour: GET <prefix>/ui/assets/logo/<anything> and
-// <prefix>/ui/assets/uploads/<anything> answer 404 — not 500, and not a
-// half-served 200 — because the core leaves an unset Uploads unmounted rather
-// than erroring. A deployment that wants a logo today sets
-// `ui.branding.logoUrl` to a URL it hosts somewhere else, which is a knob this
-// build does honour and which the SSR injection writes straight into the page.
-// logUISurface names the knob at cold start when it is set, so nobody has to
-// learn this from a 404.
-const uiUploadsAreNotServed = "ui.uploadDir is accepted and not honoured; the two uploaded-asset paths answer 404 until the upload store lands"
+// **What a deployment without a bucket sees.** Exactly the reference's
+// unconfigured behaviour, which is why no entry replaces the retired one: with
+// `ui.uploadDir` unset, or set to a path, there is no store, the console draws
+// no file picker, and both asset paths answer 404 — not 500 — because the core
+// leaves an unset Uploads unmounted. A deployment that wants a logo without a
+// bucket sets `ui.branding.logoUrl` to a URL it hosts elsewhere, as before.
+const uiUploadsFollowTheUploadStore = "UIOptions.Uploads is nil so the core serves the upload store admin.go configured; ui.uploadDir names that store as an S3 location"
 
 // logUISurface announces what the `ui` block resolved to.
 //
@@ -387,12 +384,28 @@ func logUISurface(cfg *config.Config, log *slog.Logger) {
 				"-- default branding, English, no translations and three of the eight feature flags -- and a client cannot tell that from success"))
 	}
 
+	// ui.uploadDir is the admin surface's to report: an S3 location builds the
+	// upload store, and the two asset paths serve it (uiUploadsFollowTheUploadStore);
+	// a plain path is a knob gap reported by unwiredKnobs (admin.go,
+	// adminKnobGaps). What is said here is only which of the two this
+	// deployment is in, because the UI is the surface a visitor sees it on --
+	// and it is decided the way newUploadStore decides it, on the spelling, so
+	// the two lines cannot disagree: this one used to claim "served from the
+	// upload store" for a plain path that built none.
 	if dir := strings.TrimSpace(cfg.UI.UploadDir); dir != "" {
-		log.Warn("configured knob is not wired to the auth core",
-			slog.String("path", "ui.uploadDir"),
-			slog.String("problem", uiUploadsAreNotServed+" (deviation ui-uploaded-assets-are-not-served): "+
-				"the writer is an admin route this build does not mount, and a Lambda has no durable directory for one to write to"),
-			slog.String("remedy", "set ui.branding.logoUrl to a URL you host elsewhere, which this build does honour and injects into every page; "+
-				"leave ui.uploadDir set only if the same document is deployed to another port in the family"))
+		if _, _, isS3, _ := awsintegration.ParseS3Location(dir); isS3 {
+			log.Info("uploaded assets on the hosted UI",
+				slog.String("path", "ui.uploadDir"),
+				slog.String("value", dir),
+				slog.String("served", mount+"/assets/logo/* and "+mount+"/assets/uploads/* from the upload store, one GetObject per request, misses included"),
+				slog.String("headers", "every response under the two paths carries Content-Security-Policy "+uploadAssetCSP+" and X-Content-Type-Options: nosniff (uploaded-assets-carry-a-content-security-policy)"),
+				slog.String("note", uiUploadsFollowTheUploadStore))
+		} else {
+			log.Info("uploaded assets on the hosted UI are not served",
+				slog.String("path", "ui.uploadDir"),
+				slog.String("value", dir),
+				slog.String("effect", "a filesystem path builds no upload store on this runtime, so GET "+mount+"/assets/logo/* and GET "+mount+"/assets/uploads/* answer 404 and the console draws no file picker"),
+				slog.String("note", "the knob gap for ui.uploadDir names the s3:// spelling that would; the reference's meaning of the knob cannot be honoured here"))
+		}
 	}
 }

@@ -303,7 +303,7 @@ func TestInvalidConfigAbortsInit(t *testing.T) {
 		},
 		{
 			name: "a configured but unwired domain",
-			env:  with(baseEnv(), "AWESOME_AUTH_ADMIN_ENABLED", "true"),
+			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_ENABLED", "true"),
 			rule: config.RuleUnimplemented,
 		},
 	}
@@ -540,9 +540,13 @@ func TestUnsupportedStoreIsRefused(t *testing.T) {
 		want string
 	}{
 		{
-			name: "a store the driver does not implement",
-			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_RBAC", "true"),
-			want: "stores.enable.rbac",
+			// telemetry: implemented by the DynamoDB store, handed to the core
+			// by nothing until the tools block, so the flag is refused rather
+			// than accepted and inert. It replaced rbac here when the admin
+			// surface made that flag a real switch.
+			name: "a store nothing hands to the core",
+			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
+			want: "stores.enable.telemetry",
 		},
 		{
 			name: "users switched off",
@@ -701,7 +705,7 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// The slots that contribute no option. Filling one means deleting its name
 	// from here in the same commit.
 	//
-	// **Two of these four are empty on purpose and two are still waiting**, and
+	// **Two of these three are empty on purpose and one is still waiting**, and
 	// the list cannot tell them apart, so this comment has to.
 	//
 	// `docs` and `ui` are the deliberate ones. Both blocks are wired, and both
@@ -714,10 +718,16 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// this one. If either ever leaves this list it must be because upstream grew
 	// an option, not because somebody read an empty slot as unfinished work.
 	//
-	// `admin` and `tools` are the pending ones: their domains are still refused
-	// by internal/config/phases.go, and whether they contribute options is not
-	// yet known.
-	wantEmpty := []string{"docs", "ui", "admin", "tools"}
+	// `admin` left the list with the admin surface, and it is the first reserved
+	// slot to turn out genuinely non-empty: the console's router reaches the
+	// core through HTTPConfig.Admin like the two above, but its tabs are drawn
+	// from five stores the core takes by name and cannot discover, plus the
+	// upload store, and adminOptions hands those over (admin.go).
+	//
+	// `tools` is the pending one: its domain is still refused by
+	// internal/config/phases.go, and whether it contributes options is not yet
+	// known.
+	wantEmpty := []string{"docs", "ui", "tools"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
 	}

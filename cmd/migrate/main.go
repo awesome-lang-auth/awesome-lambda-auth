@@ -1,8 +1,14 @@
 // Command migrate imports users from another identity provider into this
-// deployment's table.
+// deployment's table, and runs the one-off sweeps that table needs.
 //
 //	migrate cognito --user-pool-id <id> --table <name> --region <region> \
 //	                [--profile <name>] [--dry-run] [--attribute-map <file>]
+//	migrate backfill-users --table <name> --region <region> \
+//	                [--profile <name>] [--dry-run] [--start-key <token>]
+//
+// The second is the user-directory backfill D6 declared and nothing ran: see
+// backfill.go here and internal/store/dynamodb/backfill.go for what it does and
+// why it is a job rather than a store method.
 //
 // It is an operator tool, run from a workstation or a pipeline, and it is
 // deliberately not part of the deployed artifact: nothing about it belongs on a
@@ -78,11 +84,13 @@ const usage = `migrate imports users from another identity provider into this de
 
 usage:
   migrate cognito --user-pool-id <id> --table <name> --region <region> [flags]
+  migrate backfill-users --table <name> --region <region> [flags]
 
 commands:
-  cognito   import users from an Amazon Cognito user pool
+  cognito          import users from an Amazon Cognito user pool
+  backfill-users   index pre-existing profiles for the admin user directory (run once, before admin.enabled)
 
-run "migrate cognito -h" for the flags.
+run "migrate <command> -h" for the flags.
 `
 
 func run(ctx context.Context, args []string, stdout, stderr *os.File) error {
@@ -93,6 +101,8 @@ func run(ctx context.Context, args []string, stdout, stderr *os.File) error {
 	switch args[0] {
 	case "cognito":
 		return runCognito(ctx, args[1:], stdout, stderr)
+	case "backfill-users":
+		return runBackfillUsers(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return nil

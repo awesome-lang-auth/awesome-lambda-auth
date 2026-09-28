@@ -48,6 +48,33 @@ const (
 	// on RS-5.
 	RuleMigrationIncomplete = "RS-13"
 
+	// RS-14 to RS-16 belong to the tools block (D9a), which numbered them first
+	// and lands beside this one; the admin surface takes the two after them.
+	//
+	// RuleFirstUserRandomIDs refuses admin.accessPolicy: first-user on every
+	// driver, because the policy's premise does not hold here. The reference
+	// grants "the first registered user", meaning whoever listUsers(1, 0)
+	// returns first, and that is the first registered user only under
+	// monotonic ids. The core's ids are 128 random bits (newID, security.go),
+	// the listers order by id, and so the console goes to whoever holds the
+	// LOWEST RANDOM id -- which changes hands every time a later registrant
+	// draws a lower one, through a route anybody can call. RS-10 already refuses
+	// the policy on a driver that cannot list at all; this one refuses it on the
+	// drivers that can, for the reason that what they list is not what the
+	// policy assumes. cmd/auth/deviations.go admin-first-user-policy-is-refused
+	// carries the argument and names the day it retires.
+	RuleFirstUserRandomIDs = "RS-17"
+
+	// RuleAdminCrossSiteCookie refuses the admin console under a session policy
+	// beside cookies.sameSite: none. The console sits outside the CSRF chain by
+	// design -- the vendored SPA posts to <admin>/login as JSON with no CSRF
+	// header, so a double-submit check would refuse every login it makes -- and
+	// the guard accepts the ordinary access-token cookie, so the cookie's
+	// SameSite attribute is the only thing between a cross-site form post and
+	// every admin write, POST <admin>/users/{id}/promote included. RS-5 makes
+	// `none` need Secure; this one makes it and the console exclusive.
+	RuleAdminCrossSiteCookie = "RS-18"
+
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start
 	// with the same posture as any §2 rule.
