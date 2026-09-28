@@ -317,7 +317,7 @@ func TestHTTPConfigMountsTheUIHandler(t *testing.T) {
 				t.Fatalf("auth.New: %v", err)
 			}
 			mux := http.NewServeMux()
-			if err := mountAuthSurface(mux, core, tc.cfg, nil, nil); err != nil {
+			if err := mountAuthSurface(mux, core, tc.cfg, nil, nil, auth.ToolsOptions{}); err != nil {
 				t.Fatalf("mountAuthSurface: %v", err)
 			}
 

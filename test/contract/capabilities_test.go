@@ -542,3 +542,147 @@ func classifyUI(r *Resp) capability {
 	}
 	return classify(r)
 }
+
+// ── the tools router, probed with the account's own session ─────────────────
+
+// CapTools is the tools router — POST <tools>/track/{event}, POST
+// <tools>/notify/{target} and, with a telemetry store, GET <tools>/telemetry —
+// mounted beside the api prefix at Env.ToolsPath and answering the suite's
+// session. It is one capability for the three routes because one option
+// mounts the router (createToolsRouter here, tools.enabled there) and one
+// guard fronts all three (tools.router.ts:135, spread onto :141, :166, :227).
+const CapTools Capability = "tools"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapTools,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			// The logged-in client, on the track route, with an empty body.
+			//
+			// Logged in because the ordinary posture guards every feature
+			// route with the host's auth middleware, and an anonymous probe
+			// would report a guarded router as absent. On track rather than
+			// notify or telemetry because it is the one route that exists
+			// under every store configuration: telemetry needs a store to be
+			// mounted at all (:226), and notify is a broadcast to nobody.
+			//
+			// The event name is the suite's own, so a deployment that keeps
+			// telemetry can tell a probe from traffic. A body-less POST is the
+			// reference's own accepted shape: express.json leaves req.body {}
+			// and the route tracks an event with no payload (:143-158).
+			//
+			// With the double-submit, because this is a cookie caller on a
+			// mutating method: the reference performs the CSRF check inside
+			// auth.middleware() (auth.middleware.ts:33-41) and this product's
+			// session posture reproduces it on the tools mount, so a
+			// csrf-enabled deployment answers a header-less cookie POST 403
+			// CSRF_INVALID — which classifyTools would misread as a guard this
+			// credential cannot pass. CSRF() sends nothing when the client
+			// holds no csrf-token cookie, which is what a csrf-disabled
+			// deployment should see.
+			p.Set(CapTools, classifyTools(p.LoggedIn(t).POST(t, p.Env.tools("/track/contract-probe"), body{}, CSRF())))
+		},
+	})
+}
+
+// CapToolsGuarded is the tools router's guard itself: an anonymous POST
+// <tools>/track is refused. It is probed separately from CapTools because the
+// reference's own default is no guard at all — `const protect = authMiddleware ?
+// [authMiddleware] : []` (tools.router.ts:135) — and this product offers the
+// same door as tools.auth: none, so a deployment on which anonymous track
+// answers 202 is conformant, and the case that asserts the guard has to skip
+// there rather than fail. Probed with a fresh client holding nothing: the
+// question is what a caller presenting no credential gets, and p.Anon carries
+// the provisioned account's cookies by this stage.
+const CapToolsGuarded Capability = "tools-guarded"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapToolsGuarded,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			r := p.Env.NewClient().POST(t, p.Env.tools("/track/contract-probe"), body{})
+			switch r.Status {
+			case 401, 403:
+				p.Set(CapToolsGuarded, capability{state: capOn, why: fmt.Sprintf("%s answered %d to a caller presenting nothing", r.Target, r.Status)})
+			case 202:
+				p.Set(CapToolsGuarded, capability{state: capAbsent, why: fmt.Sprintf(
+					"%s answered 202 to a caller presenting nothing — the router has no guard (tools.auth is none here; authMiddleware unset in the reference)", r.Target)})
+			case 404:
+				p.Set(CapToolsGuarded, capability{state: capAbsent, why: fmt.Sprintf("%s answered 404 — the tools router is not mounted", r.Target)})
+			default:
+				p.Set(CapToolsGuarded, capability{state: capBroken, why: fmt.Sprintf(
+					"%s answered %d %s to a caller presenting nothing, which is neither a guard, the open door nor an unmounted router", r.Target, r.Status, r.snippet())})
+			}
+		},
+	})
+}
+
+// classifyTools reads the probe answer for POST <tools>/track/contract-probe,
+// whose "on" is a 202 and not a 200 (tools.router.ts:158), and whose absences
+// are three rather than two.
+//
+// A 404 is the router not mounted, as everywhere. A 401 or a 403 is a router
+// that is mounted and guarded against *this* credential: the apiKey posture
+// answers the core's bare 401 to a session, the admin posture answers its own
+// refusal, and neither is a fault — it is a deployment the suite holds no key
+// for, so the cases that need the router skip with that reason rather than
+// failing a working stack. Anything else is a fault.
+func classifyTools(r *Resp) capability {
+	switch r.Status {
+	case 202:
+		return capability{state: capOn, why: fmt.Sprintf("%s answered 202", r.Target)}
+	case 404:
+		return capability{state: capAbsent, why: fmt.Sprintf("%s answered 404 — the tools router is not mounted", r.Target)}
+	case 401, 403:
+		return capability{state: capAbsent, why: fmt.Sprintf(
+			"%s answered %d — the tools router is mounted behind a guard this suite's session cannot pass (tools.auth is apiKey or admin)",
+			r.Target, r.Status)}
+	}
+	return capability{state: capBroken, why: fmt.Sprintf("%s answered %d %s, which is neither the feature, an unmounted router nor a guard", r.Target, r.Status, r.snippet())}
+}
+
+// CapToolsTelemetry is GET <tools>/telemetry: the query route, mounted only
+// when the tools router is and a telemetry store with a query is configured
+// (tools.router.ts:226). Probed separately from CapTools because the reference
+// mounts track without it, so a deployment can offer one and not the other.
+const CapToolsTelemetry Capability = "tools-telemetry"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapToolsTelemetry,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			// Logged in, for the reason CapTools is: the route sits behind the
+			// same guard. Filtered on the probe's own event name so the answer
+			// is small whatever the store holds; the classification does not
+			// depend on the rows, only on the status.
+			r := p.LoggedIn(t).GET(t, p.Env.tools("/telemetry?event=contract-probe"))
+			switch r.Status {
+			case 401, 403:
+				p.Set(CapToolsTelemetry, capability{state: capAbsent, why: fmt.Sprintf(
+					"%s answered %d — behind a guard this suite's session cannot pass", r.Target, r.Status)})
+			default:
+				p.Set(CapToolsTelemetry, classify(r))
+			}
+		},
+	})
+}
+
+// CapToolsDocs is the tools router's own documentation pair, GET
+// <tools>/openapi.json and GET <tools>/docs, registered under one option and
+// with no guard on either (tools.router.ts:332-352). Probed anonymously for
+// the reason CapDocs is: a session would hide a deployment that had put the
+// pair behind one.
+const CapToolsDocs Capability = "tools-docs"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapToolsDocs,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			p.Set(CapToolsDocs, classify(p.Anon.GET(t, p.Env.tools("/openapi.json"))))
+		},
+	})
+}

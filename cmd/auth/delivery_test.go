@@ -952,6 +952,62 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 		assertReceiverPathNotLogged(t, out, rec.srv.URL)
 	})
 
+	// The tools fan-out is the fourth path into the same log, and the one that
+	// runs at login rate: with the bridge on, every login is a delivery to
+	// every outgoing webhook subscribed to it, and a receiver that is down
+	// fails every one of them. The facade reports each failure to OnError as
+	// the *url.Error whose text is the whole receiver URL — path and query
+	// included, which is where a Slack- or Zapier-style receiver keeps its
+	// capability token — so the one thing this pins is that the token never
+	// reaches the log while the failure itself does.
+	t.Run("tools fan-out", func(t *testing.T) {
+		t.Parallel()
+		rec := newWebhookReceiver(t)
+		bundle := newToolsBundle()
+		if _, err := bundle.bundle.webhooks.(*auth.MemoryWebhookStore).AddWebhook(context.Background(), auth.WebhookConfig{
+			URL:    rec.srv.URL + capabilityPath,
+			Events: []string{auth.EventAuthLoginSuccess},
+			Secret: "tools-webhook-signing-secret",
+		}); err != nil {
+			t.Fatalf("add webhook: %v", err)
+		}
+		// Locked, because the line this test waits for is written by the
+		// delivery goroutine while the test is reading.
+		buf := &lockedBuffer{}
+		app, err := New(context.Background(), Options{
+			// No retries, so the failure is reported on the first attempt
+			// rather than after the schedule; the assertion is about what
+			// is written, not when.
+			Getenv:     envFunc(toolsEnv("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES", "0")),
+			Logger:     newLogger(buf, slog.LevelDebug),
+			Stores:     bundle.factory,
+			HTTPClient: rec.srv.Client(),
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(app.Close)
+		const owner = "quiet-tools@example.test"
+		invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(owner))
+		// The receiver is gone before the login, so the bridged delivery fails
+		// with the error whose text is the URL.
+		rec.srv.Close()
+		if resp := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(), nil, registerBody(owner)); resp.StatusCode != http.StatusOK {
+			t.Fatalf("login = %d %s", resp.StatusCode, resp.Body)
+		}
+		// The delivery is on a detached goroutine; the failure line is
+		// awaited with a bound.
+		deadline := time.Now().Add(5 * time.Second)
+		for !strings.Contains(buf.String(), "tools fan-out") && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "tools fan-out") {
+			t.Fatalf("the failed delivery was never reported, so this test proves nothing:\n%s", out)
+		}
+		assertReceiverPathNotLogged(t, out, rec.srv.URL)
+	})
+
 	// The claims webhook is the same claim over the third transport, and what
 	// it adds is a request body nobody would think of as a credential: the user
 	// profile as GET /me renders it. A deployment's logs are readable for the

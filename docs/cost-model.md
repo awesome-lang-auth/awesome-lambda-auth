@@ -222,6 +222,81 @@ The one-off `migrate backfill-users` sweep is a `Scan` of the whole table —
 of a million items of ~1 KB is about USD 0.03 of reads; a hundred thousand
 pre-D6 users about USD 0.25 of writes. It runs once.
 
+### 2.8 The tools block — one telemetry write per identity event, and a webhook that races the freeze
+
+D9a hands the auth core an event bus and bridges every `identity.*` event it
+raises into the tools fan-out (`cmd/auth/tools.go`;
+`library-events-are-bridged-into-the-tools-fan-out`). Two things now cost
+money that cost nothing before, both gated on `tools.enabled`, which defaults
+to off.
+
+**Every identity event is a telemetry `PutItem`, awaited on the request
+goroutine.** A login raises `identity.auth.login.success` and, because the
+core issues a session with it, `identity.session.created`; a failed login
+raises one event; a refresh, a logout, a registration, a password change, an
+account deletion each raise one or two. Each is one item on the day-bucketed
+`TEL#<tenant>#<day>` partition (`internal/store/dynamodb/telemetry.go`),
+written with a TTL of `TelemetryRetention` — 90 days by default — and well
+under 1 KB unless the payload is large:
+
+| operation | source | units |
+|---|---|---|
+| telemetry row per `identity.*` event | `telemetry.go` `Record` | **1 WCU per event** |
+| outgoing-webhook lookup per event | `webhooks.go` `FindByEvent` | 1 RRU per event, when `stores.enable.webhooks` is on |
+
+So the login of §2.2 becomes **≈ 3 RRU and ≥ 11 WCU** with the tools block on
+— two events, each a write and a subscription lookup — which is
+**USD 2.50 more per million logins in DynamoDB writes** and USD 0.25 in reads,
+on top of the USD 15.26 there. It is awaited, so it is also on the latency
+path: about a millisecond against DynamoDB Local, single-digit milliseconds in
+a region, per event. The write is a plain `PutItem` and not a transaction, so
+it is billed once, not twice.
+
+`POST <tools>/track/{eventName}` is the same row again, on demand, from
+whoever the posture lets in — which is why `tools.auth: none` is priced in
+`docs/config-reference.md` §17.6 as a door rather than a knob: an anonymous
+caller can write a 300 KB row (`MaxTelemetryBytes`) per request, at 300 WCU a
+time, under any `userId` they like.
+
+**Retention is storage, and storage is the one DynamoDB line that is not per
+operation.** At 90 days and 500 bytes a row, a million identity events a month
+is about 1.5 GB resident, or ~USD 0.40 a month; a stack doing a million logins
+a month should expect that on top of the write bill. The TTL delete itself is
+free.
+
+**Outgoing webhooks are an HTTP call the deployment makes on a detached
+goroutine, and on Lambda that goroutine races the freeze.** The core's emitter
+delivers fire-and-forget and returns, the response is written, and the
+execution environment is frozen the moment it is — so a delivery that has not
+completed by then completes, if ever, on that environment's next invocation
+(`outgoing-webhook-delivery-races-the-response`). The cost shape until D9b:
+
+- A receiver that answers inside the request's own lifetime costs the
+  deployment **one outbound request per matching subscription per event**, and
+  the duration of that request is added to the invocation's — a 200 ms
+  receiver is 200 ms of GB-seconds, ~USD 1.33 per million events at 512 MB.
+- A receiver that does not answer in time costs nothing further **because the
+  retry never runs**: the 1 s / 2 s / 4 s schedule sleeps on a goroutine the
+  freeze suspends. What is lost is the delivery, not money.
+- The bound on the first attempt is `DefaultWebhookTimeout`, 10 seconds, which
+  is also the bound on how long a slow receiver can hold the invocation open —
+  but only while the response is not yet written, and the route writes it
+  without waiting. In practice the receiver gets whatever fraction of a second
+  the response took to serialise.
+
+D9b moves the attempt onto SQS, at USD 0.40 per million requests after the
+free million, plus one worker invocation per attempt (§3.3): a delivery then
+costs about **USD 0.60 per million attempts** and is actually delivered, with
+the schedule honoured and a dead-letter queue for the ones that never were.
+
+**What the block does not cost.** No new resource, no new parameter with a
+standing charge, no IAM statement: the three stores are partitions of the one
+table and the actions are the ones the function already holds. The SSE manager,
+when `tools.sse.enabled` is set, holds no connection on this runtime and costs
+nothing; the stream that would cost USD 0.024 per connection-hour (§3.1) is
+not mounted (`tools-stream-is-not-mounted-on-api-gateway`) precisely so that
+it cannot.
+
 ---
 
 ## 3. What is coming, and what shape it costs

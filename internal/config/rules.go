@@ -38,9 +38,83 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS11OAuthProviders(c, d)
 	checkRS12MemoryStore(c, d)
 	checkRS13Migration(c, capabilities, d)
+	checkRS14ToolsSSEDistributor(c, d)
+	checkRS15ToolsInboundWebhooks(c, d)
 	checkRS17FirstUserRandomIDs(c, d)
 	checkRS18AdminCrossSiteCookie(c, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS14ToolsSSEDistributor: an SSE configuration that names a distributor
+// this build cannot provide is refused rather than run without one.
+//
+// The distributor is what carries a broadcast from the execution environment
+// that produced an event to the ones holding the connections
+// (sse-manager.ts:110-112, the core's SseDistributor). On Lambda that is not an
+// optimisation but the whole feature: every concurrent invocation is its own
+// process, so a manager with no distributor delivers to the connections of the
+// one environment that happened to serve the tracking request, which is almost
+// never the environment serving the stream. The core's NewSseManager takes a
+// distributor as an option and this build passes none — the transport is D9c's,
+// on a Function URL, where the stream itself can live — so a document that
+// writes `redis` or `sns` here has asked for cross-instance delivery and would
+// silently get single-instance delivery instead. That is exactly the shape of
+// failure the refuse-to-start table exists for: nothing errors, every request
+// answers, and an operator watching one stream miss events has no way to tell
+// from outside that the fan-out was never configured.
+//
+// The rule fires only under tools.enabled, because with the block off the
+// distributor is dead configuration nothing reads, and an operator keeping a
+// portable document is not asking for anything. It fires whether or not
+// tools.sse.enabled is set, because the type is the statement of intent and a
+// distributor configured for a manager that is off is still a distributor this
+// build cannot honour the day the manager is switched on.
+func checkRS14ToolsSSEDistributor(c *Config, d *diagnostics) {
+	if !c.Tools.Enabled {
+		return
+	}
+	kind := c.Tools.SSE.Distributor.Type
+	if kind == "" || kind == DistributorNone {
+		return
+	}
+	d.errf(RuleToolsSSEDistributor, "tools.sse.distributor.type",
+		fmt.Sprintf("tools.sse.distributor.type is %q, but this build ships no SSE distributor: the stream manager would reach only the connections of its own execution environment, which on Lambda is almost nobody, and nothing would say so", kind),
+		"set tools.sse.distributor.type to none until the SSE transport block (D9c) lands, or leave the whole distributor block out; on this runtime GET <tools>/stream is not mounted either, for the reason cmd/auth/tools.go gives")
+}
+
+// checkRS15ToolsInboundWebhooks: inbound webhooks are refused until something
+// exists that can run their mapping scripts.
+//
+// The core's inbound route resolves the provider's WebhookConfig and, when it
+// carries a jsScript, hands script, body and action allowlist across an
+// InboundScriptRunner seam it deliberately does not implement in process
+// (tools_webhook.go; the deviation inbound-webhook-script-runs-out-of-process).
+// With no runner configured the route fails closed: 400, nothing tracked. That
+// is the right posture for the core and the wrong outcome for a deployment,
+// because every webhook provider treats a non-2xx as "not delivered" and
+// redelivers — for hours, some of them for days — so a deployment that came up
+// with the route mounted and no runner would be answering 400 to a provider's
+// retry storm from the first event onwards. And a configuration whose rows
+// carry no script is no better served: the alternative handler, OnWebhook, is a
+// host callback this product has no configuration path into, so a scriptless
+// row would be acknowledged and dropped.
+//
+// The runner is D9d's — a Lambda of its own whose IAM role is the sandbox —
+// and until it lands the honest answer to `tools.inboundWebhooks.enabled: true`
+// is to refuse. The knob defaults to true because the reference mounts the
+// route by default (tools.router.ts:120-128), which means a document that
+// enables the tools block and says nothing about inbound webhooks is refused
+// here, and has to write `tools.inboundWebhooks.enabled: false` to load. That
+// is deliberate and the remedy says so: a default that is silently overridden
+// to false would be a document that lies about what it configures, which is
+// the failure the phase mechanism this rule descends from exists to prevent.
+func checkRS15ToolsInboundWebhooks(c *Config, d *diagnostics) {
+	if !c.Tools.Enabled || !c.Tools.InboundWebhooks.Enabled {
+		return
+	}
+	d.errf(RuleToolsInboundWebhooks, "tools.inboundWebhooks.enabled",
+		"inbound webhooks are enabled, but this build ships no script runner: a provider whose row carries a mapping script would be answered 400 on every delivery and would redeliver until it gave up, and a row without one would be acknowledged and dropped",
+		"set tools.inboundWebhooks.enabled: false until the script-runner block (D9d) lands; the default is true because the reference mounts the route by default, so the document has to say so explicitly")
 }
 
 // checkRS17FirstUserRandomIDs: the first-user policy does not elect the first
@@ -626,6 +700,16 @@ func checkStoreRequirements(c *Config, d *diagnostics) {
 	requireStore(c.Tools.Enabled && c.Tools.Telemetry.Enabled, "stores.enable.telemetry", c.Stores.Enable.Telemetry,
 		"the telemetry query endpoint is enabled and has no store to query",
 		"enable stores.enable.telemetry, or set tools.telemetry.enabled: false")
+
+	// The apiKey posture guards every tools route with the core's
+	// APIKeyMiddleware, which verifies the presented key against an APIKeyStore
+	// and nothing else (awesome-go-auth api_keys.go, APIKeyMiddleware). A
+	// posture with no store behind it is a guard nobody can pass — every call
+	// answers 401 — which is safe and is also a deployment that configured a
+	// surface it cannot use, so it is refused by name like the other three.
+	requireStore(c.Tools.Enabled && c.Tools.Auth == ToolsAuthAPIKey, "stores.enable.apiKeys", c.Stores.Enable.APIKeys,
+		fmt.Sprintf("tools.auth is %q, and the API-key guard verifies every presented key against that store", ToolsAuthAPIKey),
+		"enable stores.enable.apiKeys, or choose tools.auth: session")
 }
 
 // runtimeSettingsConfigured reports whether the operator declared any

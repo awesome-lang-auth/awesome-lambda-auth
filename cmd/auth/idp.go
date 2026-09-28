@@ -426,9 +426,9 @@ var idpMountedEndpoints = []string{
 // v0.7.0 is the whole HTTP surface of this deployment, OIDC included — see
 // idpMountedEndpoints.
 //
-// The recover is for one failure mode with one cause. http.ServeMux panics when
-// the same pattern is registered twice, and idProvider.jwksPath is the only knob
-// in the schema that can provoke it: point it at a path the adapter already
+// The recover is for one failure mode. http.ServeMux panics when the same
+// pattern is registered twice, and until the tools block idProvider.jwksPath was
+// the only knob in the schema that could provoke it: point it at a path the adapter already
 // serves under the same method — "/me", say — and the process dies inside the
 // Lambda's init phase with a stack trace and no mention of the knob that caused
 // it. The core refuses the four paths its own RegisterHandlers uses (NewIDP,
@@ -437,9 +437,11 @@ var idpMountedEndpoints = []string{
 // free to drift from the first.
 //
 // So the panic becomes the cold-start refusal every other configuration mistake
-// gets. The guard is installed only when an IdP exists, which is what keeps the
-// message honest: with no IdP the adapter mounts exactly what it always mounts,
-// and a panic there is a bug that should look like one.
+// gets. The guard is installed only when a knob that can move a mount is in
+// play — an IdP, or the tools block — which is what keeps the message honest:
+// with neither the adapter mounts exactly what it always mounts, and a panic
+// there is a bug that should look like one. The message names every such knob
+// rather than the first one this file happened to know about; see below.
 //
 // rl is the rate limiter, and it arrives as a parameter rather than through
 // httpConfig because it is the one field of auth.HTTPConfig that is not a
@@ -448,18 +450,46 @@ var idpMountedEndpoints = []string{
 // pass-through. This is also the only place the value is needed — the adapter
 // calls it once per route from here — so passing it down one call is cheaper
 // than making every other caller of httpConfig say it has none.
-//
 // adminRL is the same thing for the console's own slot, AdminOptions.RateLimiter,
 // which the core applies to exactly one route — POST <admin>/users/{id}/promote
 // — and which the auth router's limiter cannot serve because it matches paths
 // under the api prefix (ratelimit.go, newAdminPromoteLimiter). Two parameters
 // rather than one, because they are two budgets with two subjects, and nil
 // means the same thing for both.
-func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl, adminRL func(http.Handler) http.Handler) (err error) {
+//
+// tools is the tools router's options, and it arrives the same way for the
+// same reason: two of its access postures are middleware built over the core
+// and the store, which only the composition root has (tools.go,
+// toolsHTTPOptions). The zero value is "no tools block", which the adapter
+// reads as nothing to mount under the tools path.
+func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl, adminRL func(http.Handler) http.Handler, tools auth.ToolsOptions) (err error) {
 	hc := httpConfig(cfg)
 	hc.RateLimiter = rl
 	hc.Admin.RateLimiter = adminRL
-	if core.IDP() == nil {
+	hc.Tools = tools
+	// The knobs that can move a mount onto another one, as this deployment
+	// resolved them. With none — no IdP, no tools block — the adapter mounts
+	// exactly what it always mounts, the guard is not installed, and a panic is
+	// a bug that looks like one.
+	//
+	// The tools mount joined the list with the tools block. internal/config
+	// refuses the values of tools.basePath it can see are wrong (the root, the
+	// api prefix itself, the admin console's subtree — validateMounts), and
+	// ServeMux tolerates the supported overlap, a tools router *under* the
+	// prefix, because every auth route is more specific than a subtree. What is
+	// left is whatever neither of those foresaw, and when it happens the
+	// refusal must not send the operator to idProvider.jwksPath — which is what
+	// this message said, for any collision at all, while jwksPath was the only
+	// candidate. It names every candidate and quotes ServeMux, whose text names
+	// the two patterns.
+	var movable []string
+	if core.IDP() != nil {
+		movable = append(movable, fmt.Sprintf("idProvider.jwksPath %q", jwksPathOf(cfg)))
+	}
+	if tools.Enabled {
+		movable = append(movable, fmt.Sprintf("tools.basePath %q", hc.ToolsPath()))
+	}
+	if len(movable) == 0 {
 		nethttp.MountWithConfig(mux, core, hc)
 		return nil
 	}
@@ -476,8 +506,8 @@ func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, r
 			panic(r)
 		}
 		err = fmt.Errorf(
-			"config: refusing to start: idProvider.jwksPath %q collides with a route this deployment already mounts, so the JWKS document and that route would claim one pattern: %v",
-			jwksPathOf(cfg), r)
+			"config: refusing to start: a configured path collides with a route this deployment already mounts, so two handlers would claim one pattern (%s): %v",
+			strings.Join(movable, ", "), r)
 	}()
 	nethttp.MountWithConfig(mux, core, hc)
 	return nil

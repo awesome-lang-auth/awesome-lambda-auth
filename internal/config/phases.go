@@ -178,6 +178,34 @@ type domain struct {
 // its 5 MiB multer limit — so unwiredKnobs names either one that differs from
 // the value the core applies.
 //
+// The tools surface (D9a) closed `tools`, the last domain of P7 and the second
+// to add a surface rather than change one. With `tools.enabled` set, the
+// composition root builds the event bus the auth core publishes its
+// twenty-three identity.* events on, builds the AuthTools facade over the
+// telemetry, webhook and API-key stores the driver exposes, and the imported
+// adapter mounts track, notify, the telemetry query and the router's own
+// documentation pair at `tools.basePath` — a sibling of the api prefix —
+// behind the posture `tools.auth` names (cmd/auth tools.go). The bridge
+// between the core's events and the facade's sinks is the block's substantive
+// decision and is registered; so are the two things this runtime does not do:
+// the stream is never mounted behind API Gateway, and outgoing webhooks race
+// the freeze until D9b. Its `secretPrefix` — `tools.`, covering the SSE
+// distributor's password — goes with it, for the reason every earlier prefix
+// went: the secret belongs to a wired domain now, and RS-14 refuses the
+// distributor it would authenticate to.
+//
+// Three knobs of the block are handled by three different mechanisms, and the
+// division is the one this gate has always preserved. `tools.stream.enabled`
+// and `tools.sse.enabled` are honoured by nothing on this runtime and are
+// *reported* at cold start, because they sit inside a wired domain and the
+// core exposes both fields — it is the transport that cannot carry them.
+// `tools.sse.distributor.type` and `tools.inboundWebhooks.enabled` are
+// *refused* (RS-14, RS-15), because a document that names a distributor or
+// mounts the inbound route asks for something this build cannot be, and the
+// failure of pretending is silent in both cases. Neither is a phase gap: the
+// domain is wired, and a rule with a number is what a knob a later block
+// makes live gets in the meantime.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -187,16 +215,11 @@ type domain struct {
 // OIDC token endpoint issues no refresh token of its own in v1 (decisions.md
 // D-3).
 //
-// Everything below is defined, validated and refused.
+// Everything below is defined, validated and refused. Every domain the schema
+// accepts is wired now, and TestUnwiredDomainsIsPinned asserts the empty set
+// the roadmap's definition of done asks for.
 func unwiredDomains() []domain {
-	return []domain{
-		{
-			path:         "tools",
-			phase:        "P7 (tools, telemetry, SSE, webhooks)",
-			get:          func(c *Config) any { return c.Tools },
-			secretPrefix: "tools.",
-		},
-	}
+	return nil
 }
 
 // UnwiredDomains returns the dotted paths of the domains this build validates but

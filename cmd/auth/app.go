@@ -157,7 +157,33 @@ type App struct {
 	// immediate and total, and it is the whole of the knob's effect here.
 	ResourceServerGuard func(http.Handler) http.Handler
 
+	// Tools is the AuthTools facade the tools router calls, exported for a host
+	// that embeds this package and wants Notify's email and SMS channels, which
+	// no HTTP route reaches (tools.go). Nil unless tools.enabled.
+	Tools *auth.AuthTools
+
+	// Events is the bus the auth core publishes its identity.* events on,
+	// exported for a host that wants to subscribe to them directly. It is not
+	// the facade's bus: Tools.Events carries what was fanned out, tracked and
+	// bridged alike, and this one carries what the library raised (tools.go,
+	// the bridge). Nil unless tools.enabled, because without the block no bus
+	// is built and the core publishes nothing.
+	Events *auth.EventBus
+
 	adapter *lambdahttp.Adapter
+	tools   *toolsWiring
+}
+
+// Close releases what a cold start subscribed: today the bridge between the
+// event bus and the tools facade. The Lambda entrypoint never calls it — the
+// process and its subscriptions end together — but a test that builds several
+// Apps in one process should not leave every earlier App's bridge listening on
+// a bus nothing publishes to. Safe to call on an App with no tools block, and
+// more than once.
+func (a *App) Close() {
+	if a != nil && a.tools != nil && a.tools.stopBridge != nil {
+		a.tools.stopBridge()
+	}
 }
 
 // New performs the whole cold start and returns an App ready to serve, or an
@@ -186,9 +212,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 	// Every outbound request this binary makes on a route's behalf carries the
 	// caller's correlation id from here on. It is done once, on the way in,
-	// rather than at each of the three consumers (delivery webhook, claims
-	// webhook, resource-server JWKS fetch), because the fourth consumer has not
-	// been written yet and the property should hold for it too. See
+	// rather than at each of the four consumers (delivery webhook, claims
+	// webhook, resource-server JWKS fetch, outgoing tools webhooks), so that
+	// the property holds for a fifth without anyone remembering it. See
 	// correlatingClient: it copies, so Options.HTTPClient is not mutated.
 	opts.HTTPClient = correlatingClient(opts.HTTPClient)
 
@@ -247,6 +273,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := checkUISupport(cfg); err != nil {
 		return nil, err
 	}
+	// Before the stores too, and for the same reason: the one tools posture
+	// this build cannot build needs no store to be recognised. See
+	// checkToolsSupport.
+	if err := checkToolsSupport(cfg); err != nil {
+		return nil, err
+	}
 
 	users, sessions, err := newStores(ctx, cfg, log)
 	if err != nil {
@@ -274,7 +306,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	core, err := buildCore(ctx, cfg, opts, users, sessions, deliver, log)
+	// The tools block: the event bus and the AuthTools facade (tools.go). Built
+	// before the core for the reason delivery is — the core takes the bus as an
+	// option, and the facade wants the delivery transports — and it does no
+	// I/O: the stores it is handed are already open and the webhook sender's
+	// client is deferred to the first delivery. With tools.enabled off it
+	// returns nil, and every consumer below reads nil as "no tools block".
+	tools, err := newToolsWiring(ctx, cfg, users, deliver, opts.HTTPClient, log)
+	if err != nil {
+		return nil, err
+	}
+
+	core, err := buildCore(ctx, cfg, opts, users, sessions, deliver, tools, log)
 	if err != nil {
 		return nil, err
 	}
@@ -317,12 +360,23 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// routes rateLimit.scope names, and the console's, over the one route the
 	// core's AdminOptions.RateLimiter covers (ratelimit.go,
 	// newAdminPromoteLimiter). Both are built here for the reason above.
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log)); err != nil {
+	//
+	// The tools router's options, resolved here and not in httpConfig for the
+	// reason the rate limiter is: the `session` posture is the adapter's own
+	// middleware over the core that now exists, so it is not a function of the
+	// document alone (tools.go, toolsHTTPOptions). With the block off this is
+	// the zero value and the adapter registers nothing under the tools path.
+	toolsOpts, err := toolsHTTPOptions(cfg, tools, core, httpConfig(cfg), users)
+	if err != nil {
+		return nil, err
+	}
+	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
+	logToolsSurface(cfg, tools, log)
 
 	// The middleware chain is one function, assembleHandler, so that the test
 	// harness (admin_test.go newAdminSurface) builds the very chain New builds
@@ -331,7 +385,11 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// other two are: it counts with the shared counter.
 	handler := assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log))
 
-	app := &App{Config: cfg, Logger: log, Handler: handler}
+	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools}
+	if tools != nil {
+		app.Tools = tools.tools
+		app.Events = tools.bus
+	}
 
 	// Resource-server mode. Built after the core because the verifier's cookie
 	// path needs it, and built at cold start so a JWKS endpoint the client
@@ -464,9 +522,9 @@ func corsExemptMounts(cfg *config.Config) []string {
 // the gate comes down (config.Options.AllowUnimplemented; the gate removal is
 // its own last commit by convention). Nothing about the composition is
 // different from New's: it is New's middle, named.
-func buildCore(ctx context.Context, cfg *config.Config, opts Options, users auth.UserStore, sessions auth.SessionStore, deliver *delivery, log *slog.Logger) (*auth.Auth, error) {
+func buildCore(ctx context.Context, cfg *config.Config, opts Options, users auth.UserStore, sessions auth.SessionStore, deliver *delivery, tools *toolsWiring, log *slog.Logger) (*auth.Auth, error) {
 	coreOpts := coreOptions(cfg, users, sessions, log)
-	for _, set := range coreOptionSets(ctx, cfg, opts, users, deliver, log) {
+	for _, set := range coreOptionSets(ctx, cfg, opts, users, deliver, tools, log) {
 		if set.build == nil {
 			// A reserved slot. See coreOptionSets.
 			continue
@@ -625,6 +683,7 @@ func coreOptionSets(
 	opts Options,
 	users auth.UserStore,
 	deliver *delivery,
+	tools *toolsWiring,
 	log *slog.Logger,
 ) []coreOptionSet {
 	return []coreOptionSet{
@@ -740,8 +799,18 @@ func coreOptionSets(
 			name:  "admin",
 			build: func() ([]auth.Option, error) { return adminOptions(cfg, opts, users, log) },
 		},
-		// tools.* — telemetry, SSE and the inbound-webhook sandbox.
-		{name: "tools"},
+		{
+			// tools.* — the event bus, and only the bus. The facade and the
+			// router reach the core through HTTPConfig.Tools, as docs and ui
+			// do through theirs, so this slot holds the one thing the block has
+			// that IS an auth.Option: auth.WithEventBus, which is what makes the
+			// service layer publish its identity.* events at all. No I/O, and
+			// nothing to refuse — newToolsWiring has already done the refusing,
+			// before the core is built, for the same reason newDelivery has.
+			// With tools.enabled off it contributes nothing and says so.
+			name:  "tools",
+			build: func() ([]auth.Option, error) { return toolsOptions(tools, cfg, log), nil },
+		},
 	}
 }
 
@@ -896,19 +965,13 @@ type memoryStoreBundle struct {
 	templates auth.TemplateStore
 	settings  auth.SettingsStore
 	codes     auth.AuthCodeStore
-
-	// The five stores behind the console's tabs, each the core's own in-memory
-	// implementation and each per execution environment like everything else
-	// on this driver: a role assigned through one environment is unknown to
-	// the next, so an rbac:<role> policy on the memory driver admits a user on
-	// one cold start and refuses them on another. RS-12 already refuses this
-	// driver in production; internal/store/dynamodb is what makes the console
-	// consistent across instances.
-	metadata auth.UserMetadataStore
-	rbac     auth.RolesPermissionsStore
-	tenants  auth.TenantStore
-	apiKeys  auth.APIKeyStore
-	webhooks auth.WebhookStore
+	// The five stores behind the console's tabs and the three the tools block consumes.
+	metadata  auth.UserMetadataStore
+	rbac      auth.RolesPermissionsStore
+	tenants   auth.TenantStore
+	telemetry auth.TelemetryStore
+	apiKeys   auth.APIKeyStore
+	webhooks  auth.WebhookStore
 }
 
 // newMemoryStoreBundle is the one place the development driver's bundle is
@@ -935,14 +998,13 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		// dynamodb store (internal/store/dynamodb/auth_codes.go) is what makes
 		// the flow work across instances.
 		codes: auth.NewMemoryAuthCodeStore(),
-		// The console's five, so that the same document that draws a tab on
-		// the DynamoDB driver draws it here (driverStores lists the flags for
-		// both drivers, and adminOptions hands each store over by accessor).
-		metadata: auth.NewMemoryMetadataStore(),
-		rbac:     auth.NewMemoryRolesPermissionsStore(),
-		tenants:  auth.NewMemoryTenantStore(),
-		apiKeys:  auth.NewMemoryAPIKeyStore(),
-		webhooks: auth.NewMemoryWebhookStore(),
+		// The console's five and the tools block's three, per execution environment.
+		metadata:  auth.NewMemoryMetadataStore(),
+		rbac:      auth.NewMemoryRolesPermissionsStore(),
+		tenants:   auth.NewMemoryTenantStore(),
+		telemetry: auth.NewMemoryTelemetryStore(),
+		webhooks:  auth.NewMemoryWebhookStore(),
+		apiKeys:   auth.NewMemoryAPIKeyStore(),
 	}
 }
 
@@ -954,8 +1016,9 @@ func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.c
 func (m memoryStoreBundle) Metadata() auth.UserMetadataStore        { return m.metadata }
 func (m memoryStoreBundle) Roles() auth.RolesPermissionsStore       { return m.rbac }
 func (m memoryStoreBundle) Tenants() auth.TenantStore               { return m.tenants }
-func (m memoryStoreBundle) APIKeys() auth.APIKeyStore               { return m.apiKeys }
+func (m memoryStoreBundle) Telemetry() auth.TelemetryStore          { return m.telemetry }
 func (m memoryStoreBundle) Webhooks() auth.WebhookStore             { return m.webhooks }
+func (m memoryStoreBundle) APIKeys() auth.APIKeyStore               { return m.apiKeys }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
 // back. A key that is enabled and absent from its driver's set is a knob that
@@ -979,16 +1042,25 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// RolesPermissionsStore, TenantStore, APIKeyStore, the three webhook
 		// stores and TelemetryStore, and deliberately listed none of them,
 		// because the core takes each by name and nothing handed them over.
-		// The admin surface is what hands five of them over (admin.go,
-		// adminOptions), so those five are listed now: metadata reaches
-		// GET <prefix>/me and the console's metadata tab, rbac reaches the
-		// roles tab and the rbac:/permission: access policies, tenants the
-		// tenants tab, apiKeys and webhooks the two credential tabs.
 		//
-		// "telemetry" is still absent, on the same rule. The telemetry store
-		// reaches a route only through ToolsOptions.TelemetryStore, which the
-		// tools block hands over; until it does, the flag would validate and
-		// do nothing. That block adds the key here.
+		// The admin surface handed five of them over (admin.go, adminOptions):
+		// metadata reaches GET <prefix>/me and the console's metadata tab,
+		// rbac reaches the roles tab and the rbac:/permission: access policies,
+		// tenants the tenants tab, apiKeys and webhooks the two credential tabs.
+		//
+		// The tools block (D9a) handed over telemetry, webhooks and apiKeys:
+		// the telemetry store is what Track and the bridge write and GET
+		// <tools>/telemetry reads, the webhook store is what every event is
+		// matched against for outgoing delivery, and the API-key store is what
+		// tools.auth: apiKey verifies against (tools.go).
+		//
+		// The listing is about the driver and cannot see the document, so it
+		// reopens the hole above for one combination: a flag switched on while
+		// its one consumer is off — any of the three with tools.enabled off,
+		// or apiKeys under a posture other than apiKey. That combination is
+		// reported by toolsKnobGaps at every cold start rather than refused
+		// here, for the reason given there, and
+		// TestUnwiredKnobsIsExactlyTheDocumentedList pins the rows.
 		//
 		// The three v0.8.0 admin listers and the two profile flag writers need
 		// no flag: AdminUserStore, SessionLister, RoleLister,
@@ -1001,23 +1073,24 @@ func driverStores(driver string) (map[string]bool, bool) {
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 			"settings": true,
 			"metadata": true, "rbac": true, "tenants": true,
-			"apiKeys": true, "webhooks": true,
+			"apiKeys": true, "webhooks": true, "telemetry": true,
 		}, true
 	case config.StoreDriverMemory:
 		// awesome-go-auth ships an in-memory implementation of every one of
 		// these — MemoryLinkedAccounts, MemoryPendingLinks, MemoryTemplateStore,
 		// MemorySettingsStore, MemoryMetadataStore, MemoryRolesPermissionsStore,
-		// MemoryTenantStore, MemoryAPIKeyStore and MemoryWebhookStore — and
-		// newMemoryStoreBundle hangs all of them off the user store, so the
-		// development driver backs the same set as the production one. A driver
-		// that backs fewer is still refused by name in emailOptions,
-		// settingsOptions and adminOptions, which is why those refusals exist.
+		// MemoryTenantStore, MemoryTelemetryStore, MemoryWebhookStore and
+		// MemoryAPIKeyStore — and newMemoryStoreBundle hangs all of them off
+		// the user store, so the development driver backs the same set as the
+		// production one. A driver that backs fewer is still refused by name in
+		// emailOptions, settingsOptions, adminOptions and newToolsWiring, which
+		// is why those refusals exist.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 			"settings": true,
 			"metadata": true, "rbac": true, "tenants": true,
-			"apiKeys": true, "webhooks": true,
+			"apiKeys": true, "webhooks": true, "telemetry": true,
 		}, true
 	default:
 		return nil, false
@@ -1165,6 +1238,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, idpKnobGaps(cfg)...)
 	gaps = append(gaps, runtimeSettingsKnobGaps(cfg)...)
 	gaps = append(gaps, adminKnobGaps(cfg)...)
+	gaps = append(gaps, toolsKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

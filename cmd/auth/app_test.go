@@ -301,11 +301,6 @@ func TestInvalidConfigAbortsInit(t *testing.T) {
 				"https://abc123.execute-api.eu-west-1.amazonaws.com/prod"),
 			rule: config.RuleInsecureCookieMode,
 		},
-		{
-			name: "a configured but unwired domain",
-			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_ENABLED", "true"),
-			rule: config.RuleUnimplemented,
-		},
 	}
 
 	for _, tc := range cases {
@@ -540,15 +535,6 @@ func TestUnsupportedStoreIsRefused(t *testing.T) {
 		want string
 	}{
 		{
-			// telemetry: implemented by the DynamoDB store, handed to the core
-			// by nothing until the tools block, so the flag is refused rather
-			// than accepted and inert. It replaced rbac here when the admin
-			// surface made that flag a real switch.
-			name: "a store nothing hands to the core",
-			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
-			want: "stores.enable.telemetry",
-		},
-		{
 			name: "users switched off",
 			env:  with(baseEnv(), "AWESOME_AUTH_STORES_ENABLE_USERS", "false"),
 			want: "stores.enable.users",
@@ -680,7 +666,7 @@ func TestEnabledStoresTracksTheSchema(t *testing.T) {
 func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	t.Parallel()
 
-	sets := coreOptionSets(context.Background(), config.Defaults(), Options{}, nil, nil, discardLogger())
+	sets := coreOptionSets(context.Background(), config.Defaults(), Options{}, nil, nil, nil, discardLogger())
 
 	var names []string
 	var empty []string
@@ -724,10 +710,12 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// from five stores the core takes by name and cannot discover, plus the
 	// upload store, and adminOptions hands those over (admin.go).
 	//
-	// `tools` is the pending one: its domain is still refused by
-	// internal/config/phases.go, and whether it contributes options is not yet
-	// known.
-	wantEmpty := []string{"docs", "ui", "tools"}
+	// `tools` left the list with D9a, and it is the counter-example to `docs`
+	// and `ui`: the block's router and facade reach the core through
+	// HTTPConfig.Tools exactly as those two do, but the block also owns the one
+	// thing that IS an auth.Option — the event bus, auth.WithEventBus — so the
+	// slot holds that and nothing else (tools.go, toolsOptions).
+	wantEmpty := []string{"docs", "ui"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
 	}
