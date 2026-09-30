@@ -1,0 +1,1 @@
+{"outcome":"result","result":{"event":"identity.tenant.user.removed","data":{"amount":12,"id":"evt_1","nested":{"ok":true}},"userId":"u_1","tenantId":"t_1"}}

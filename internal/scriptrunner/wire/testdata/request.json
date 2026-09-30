@@ -1,0 +1,1 @@
+{"provider":"contract","webhookId":"wh_1","script":"result = {event: 'identity.tenant.user.removed', data: body}","body":{"id":"evt_1","amount":12,"nested":{"ok":true}},"actions":["user.suspend"],"deadlineUnixMs":1790000000000}
