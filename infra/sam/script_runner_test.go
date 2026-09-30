@@ -206,7 +206,7 @@ func numericField(t *testing.T, tpl *template, name, field string) float64 {
 // so the caller chooses the rate, and the one hard cap on what that costs is a
 // reservation on the runner. It is on by default and small, because a
 // reservation is free, and it is a parameter because an account still on the
-// new-account concurrency quota cannot reserve any.
+// low concurrency quota (a new one often starts at 10) cannot reserve any.
 func TestTheScriptRunnerHasAConcurrencyCap(t *testing.T) {
 	t.Parallel()
 	tpl := load(t)

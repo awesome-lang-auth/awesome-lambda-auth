@@ -883,9 +883,11 @@ Parameters:
       unauthenticated inbound route can spend: each in-flight run holds this
       function and an auth environment waiting on it. A run over the cap is
       throttled, refused 400, and redelivered by the provider. Empty reserves
-      nothing and leaves the runner drawing on the account pool uncapped. An
-      account still on the new-account concurrency quota of 10 cannot reserve
-      any; set it empty there.
+      nothing and leaves the runner drawing on the account pool uncapped.
+      Lambda refuses a reservation that would leave the account's unreserved
+      pool below its minimum (100 on a standard quota), so an account on a
+      low quota — a new one often starts at 10 — fails the deploy with this
+      set; set it empty there, or raise the quota.
   ScriptRunnerDurationAlarmThresholdMs:
     Type: Number
     Default: 4000
