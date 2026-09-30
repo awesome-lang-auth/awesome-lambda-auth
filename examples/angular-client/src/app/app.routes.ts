@@ -1,5 +1,5 @@
 import { Routes } from '@angular/router';
-import { authGuard, guestGuard } from 'ng-awesome-node-auth';
+import { authGuard, guestGuard } from '@awesome-lang-auth/angular';
 
 export const routes: Routes = [
   { path: '', pathMatch: 'full', redirectTo: 'profile' },

@@ -1,6 +1,6 @@
 import { Component, inject } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
-import { AuthService } from 'ng-awesome-node-auth';
+import { AuthService } from '@awesome-lang-auth/angular';
 
 @Component({
   selector: 'app-root',
@@ -9,7 +9,7 @@ import { AuthService } from 'ng-awesome-node-auth';
     <header>
       <h1>awesome-lambda-auth</h1>
       <p class="sub">
-        demo Angular — libreria ufficiale <code>ng-awesome-node-auth</code>, non modificata
+        demo Angular — libreria ufficiale <code>@awesome-lang-auth/angular</code>, non modificata
       </p>
 
       @if (auth.isAuthenticated()) {
