@@ -9,7 +9,7 @@
 //
 // La forma dei payload non e' inventata: e' quella di `docs/spec/wire-contract.md`
 // e quella osservata su uno stack vivo.
-import 'package:awesome_node_auth_flutter/awesome_node_auth_flutter.dart';
+import 'package:awesome_flutter_auth/awesome_flutter_auth.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
