@@ -2078,8 +2078,11 @@ precisely so nobody has to discover them from behaviour — that the stream is
 until D9b**. `tools surface not mounted`, the default, says that no bus is
 built either, so the core's `identity.*` events go nowhere.
 
-`the tools routes are unguarded` is the warning for `tools.auth: none`, and
-repeats the price §17.6 puts on it. `the tools routes answer any signed-in
+`the tools routes are unguarded` is the warning for `tools.auth: none` — and
+for `tools.auth: admin` behind `admin.accessPolicy: open`, the same door — and
+repeats the price §17.6 puts on it. `the tools routes answer whoever the admin
+console admits` is the `admin` line — not a warning — naming the policy and the
+console's refusals, the redirect included. `the tools routes answer any signed-in
 user, and anyone can sign up` is the warning for `tools.auth: session`, for the
 same reason in a different key: it names the store-wide telemetry read, the
 body-supplied `userId` and the remedy (`apiKey`), and says whether a cookie
@@ -2367,23 +2370,44 @@ the adapter guards `<admin>/api/*` with, built from `admin.accessPolicy` (§16.1
 or, in the legacy form, from `admin.bootstrapSecret` (`cmd/auth/tools.go`,
 `toolsAccess`). A caller is whoever the console would admit — the root user or a
 flagged user under `is-admin-flag`, a role or permission holder under the two
-RBAC spellings, the bearer of the secret under the legacy guard — and nobody
-else: a self-registered session that `session` would admit is refused here. The
-refusal is the console's, `401 {"error":"Unauthorized"}` (`403` for a signed-in
-user the policy does not admit), not the auth router's envelope.
+RBAC spellings, the bearer of the secret under the legacy guard — and, under
+`admin.accessPolicy: open`, everyone: that guard reads no credential at all, so
+the pair is `none` by another name, and the loader and the cold start warn
+about it as they do about `none`. Under every other decision a self-registered
+session that `session` would admit is refused here. The refusals are the
+console's, not the auth router's envelope: `401 {"error":"Unauthorized"}` for
+no credential, and `403 {"error":"Forbidden"}` for a bearer that is not the
+secret under the legacy guard or for a signed-in user a session policy does not
+admit. One more branch is the core's: under a session policy with
+`admin.loginPath` set, an unauthenticated request whose `Accept` names
+`text/html` — a browser opening the URL — gets `302` to
+`<loginPath>?redirect=<admin mount><tools path>`, a path nothing serves, where
+the reference answers `401` on every route but the console's panel
+(registered: `tools-admin-login-redirect-points-into-the-admin-mount`).
 `internal/config` refuses the posture without `admin.enabled`, and the
 console's own rules come with it: RS-6 demands an access decision, and RS-18
-refuses a session policy beside `cookies.sameSite: none` — which matters here,
-because the guard performs no double-submit (the reference's admin guard
-performs none), so the cookie's `SameSite` attribute is what stands between a
-cross-site form post and `POST <tools>/track` under this posture. The SAM
+refuses a session policy beside `cookies.sameSite: none`. Under a session
+policy the guard reads the `accessToken` cookie as `session` does, so the
+product puts the same double-submit in front of it: a cookie-authenticated
+`POST` needs the matching `X-CSRF-Token` (the `csrf-token` cookie the auth
+router sets), a bearer caller does not, and the cookie looked for is
+`<admin.cookiePrefix>accessToken` when that knob is set. The reference's
+console guard performs none, but the guard it documents for the tools router
+is `auth.middleware()` (`tools.router.ts:114`), which does
+(`auth.middleware.ts:33-41`); `SameSite` alone would leave a same-site origin
+free to drive `track` on an administrator's cookie. The vendored console calls
+no tools route, so it is unaffected. The legacy guard reads only the bearer
+header and `open` reads nothing, so neither is wrapped. The SAM
 template's `ToolsAuth` parameter does not offer the value (`apiKey` and
 `session` only), and because that variable overrides `ConfigFile` whenever
 `EnableTools` is on, a stack deployed from the template cannot reach this
 posture at all; a document deployed another way sets it.
 `cmd/auth/tools_test.go` `TestToolsAccessPostures` drives the console's
-credential (`202`), an anonymous caller (`401`), an ordinary user (`403`), and
-the refusal with no console mounted.
+secret (`202`), an anonymous caller (`401`), a wrong bearer under the legacy
+guard (`403`), a signed-in user `is-admin-flag` refuses (`403`) and one it
+admits (`202` by bearer; by cookie `403 CSRF_INVALID` without the header and
+`202` with it, also under `admin.cookiePrefix`), and the refusal with no
+console mounted.
 
 **CORS follows the reference's geometry around the mount.** The reference's
 CORS layer is `router.use(...)` inside the auth router

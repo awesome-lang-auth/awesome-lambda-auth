@@ -31,6 +31,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
+		"tools-admin-login-redirect-points-into-the-admin-mount",
 		"tools-api-key-refusal-is-the-cores-bare-401",
 		"tools-stream-is-not-mounted-on-api-gateway",
 		"uploaded-assets-carry-a-content-security-policy",
@@ -63,8 +64,9 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 }
 
 // TestDeviationsIndexIsComplete pins docs/deviations.md to the three registers:
-// every product id, every core id from auth.CompatibilityNotes() and every store
-// note must appear in it verbatim. The failure message names what to add.
+// every product id must open an index row of its own, and every core id from
+// auth.CompatibilityNotes() and every store note must appear in it verbatim.
+// The failure message names what to add.
 func TestDeviationsIndexIsComplete(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "deviations.md"))
 	if err != nil {

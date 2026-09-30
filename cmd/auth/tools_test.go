@@ -484,10 +484,12 @@ func TestToolsAccessPostures(t *testing.T) {
 			t.Errorf("track with the console's secret under admin = %d %s, want 202", admitted.StatusCode, admitted.Body)
 		}
 
-		// A session `session` would admit is not a console credential: an
-		// ordinary user's access token is recognised as a signed-in user the
-		// guard does not admit, and answered the console's 403 — the
-		// reference's shape for a user the policy refuses — never 202.
+		// A session `session` would admit is not a console credential. The
+		// legacy guard never verifies a token as anyone: it compares the
+		// bearer with the secret and answers the console's 403 to any bearer
+		// that is not it (core admin.go, authorise; admin.router.ts:197-199),
+		// so an ordinary user's access token gets that 403 and never 202. The
+		// refusal of a signed-in user a policy judges is the next subtest's.
 		reg := invoke(t, app, http.MethodPost, "/auth/register",
 			jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("tools-admin-posture@example.test"))
 		if reg.StatusCode != http.StatusCreated {
@@ -503,28 +505,109 @@ func TestToolsAccessPostures(t *testing.T) {
 		}
 	})
 
-	t.Run("admin under a policy refuses a signed-in user the console would refuse", func(t *testing.T) {
+	t.Run("admin under a policy is the console's decision, with the double-submit on the cookie", func(t *testing.T) {
 		t.Parallel()
+		bundle := newToolsBundle()
 		app := newToolsApp(t, toolsEnv(
 			"AWESOME_AUTH_TOOLS_AUTH", "admin",
 			"AWESOME_AUTH_ADMIN_ENABLED", "true",
 			"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
-		), nil)
+		), bundle)
 
-		reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody("not-an-admin@example.test"))
+		const email = "tools-admin-policy@example.test"
+		reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(email))
 		if reg.StatusCode != http.StatusCreated {
 			t.Fatalf("register = %d %s", reg.StatusCode, reg.Body)
 		}
-		var cookies []string
+		jar := map[string]string{}
 		for _, c := range reg.Cookies {
-			cookies = append(cookies, strings.SplitN(c, ";", 2)[0])
+			name, rest, _ := strings.Cut(c, "=")
+			value, _, _ := strings.Cut(rest, ";")
+			jar[name] = value
 		}
-		if len(cookies) == 0 {
-			t.Fatal("a cookie registration set no cookie, so this case proves nothing")
+		access, csrf := jar[auth.AccessTokenCookieName], jar[auth.CSRFTokenCookieName]
+		if access == "" || csrf == "" {
+			t.Fatalf("a cookie registration set no access-token or csrf-token cookie, so this case proves nothing: %v", reg.Cookies)
 		}
+		cookies := []string{auth.AccessTokenCookieName + "=" + access, auth.CSRFTokenCookieName + "=" + csrf}
+
+		// Refused while the flag is off. The matching X-CSRF-Token is sent, so
+		// the double-submit passes and what answers is the console's guard:
+		// its 403 {"error":"Forbidden"} with no code. The session guard would
+		// have answered 202 to the same request, and a CSRF refusal carries
+		// CSRF_INVALID, so neither can pass for this one.
+		refused := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(auth.CSRFHeaderName, csrf), cookies, `{}`)
+		if refused.StatusCode != http.StatusForbidden {
+			t.Fatalf("track with a non-admin session under admin/is-admin-flag = %d %s, want the console's 403 for a signed-in user the policy refuses, never 202", refused.StatusCode, refused.Body)
+		}
+		if body := decodeBody(t, refused); body["error"] != "Forbidden" || body["code"] != nil {
+			t.Errorf("a non-admin session's track under admin/is-admin-flag answered %s, want the console's {\"error\":\"Forbidden\"}", refused.Body)
+		}
+
+		// Admitted once the flag is set, through the writer the console's
+		// promote route uses: the guard reads the flag from the store on every
+		// request, so the token minted before the promotion is the credential.
+		user, err := bundle.bundle.GetUserByEmail(context.Background(), email, "")
+		if err != nil {
+			t.Fatalf("look up the registered user: %v", err)
+		}
+		if err := bundle.bundle.UpdateIsAdmin(context.Background(), user.ID, "", true); err != nil {
+			t.Fatalf("flag the user as an administrator: %v", err)
+		}
+		if rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders("authorization", "Bearer "+access), nil, `{}`); rec.StatusCode != http.StatusAccepted {
+			t.Errorf("track by bearer from a flagged user under admin/is-admin-flag = %d %s, want 202", rec.StatusCode, rec.Body)
+		}
+
+		// The same administrator on the cookie: held to the double-submit, as
+		// under `session`, so a same-site page cannot drive track on it.
 		rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(), cookies, `{}`)
 		if rec.StatusCode != http.StatusForbidden {
-			t.Errorf("track with a non-admin session under admin/is-admin-flag = %d %s, want the console's 403 for a signed-in user the policy refuses, never 202", rec.StatusCode, rec.Body)
+			t.Errorf("a flagged user's cookie track with no X-CSRF-Token = %d %s, want 403", rec.StatusCode, rec.Body)
+		} else if body := decodeBody(t, rec); body["error"] != "CSRF token validation failed" || body["code"] != "CSRF_INVALID" {
+			t.Errorf("a flagged user's cookie track with no X-CSRF-Token answered %s, want the reference's CSRF_INVALID envelope", rec.Body)
+		}
+		if rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(auth.CSRFHeaderName, csrf), cookies, `{}`); rec.StatusCode != http.StatusAccepted {
+			t.Errorf("a flagged user's cookie track with the matching X-CSRF-Token = %d %s, want 202", rec.StatusCode, rec.Body)
+		}
+		if rec := invoke(t, app, http.MethodGet, "/tools/telemetry", nil, cookies[:1], ""); rec.StatusCode != http.StatusOK {
+			t.Errorf("a flagged user's cookie GET /tools/telemetry = %d %s, want 200: a safe method needs no header", rec.StatusCode, rec.Body)
+		}
+	})
+
+	t.Run("admin holds a prefixed console cookie to the double-submit too", func(t *testing.T) {
+		t.Parallel()
+		// admin.cookiePrefix renames the cookie the console's guard reads, and
+		// the root login sets exactly that one; the double-submit has to look
+		// for the same name or a prefixed cookie would pass it unread.
+		app := newToolsApp(t, toolsEnv(
+			"AWESOME_AUTH_TOOLS_AUTH", "admin",
+			"AWESOME_AUTH_ADMIN_ENABLED", "true",
+			"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+			"AWESOME_AUTH_ADMIN_COOKIE_PREFIX", "console_",
+			"AWESOME_AUTH_ADMIN_ROOT_EMAIL", testAdminRootEmail,
+			"AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH", testRootHash,
+		), nil)
+		login := invoke(t, app, http.MethodPost, "/admin/login", jsonHeaders(), nil,
+			`{"email":"`+testAdminRootEmail+`","password":"`+testAdminRootPassword+`"}`)
+		if login.StatusCode != http.StatusOK {
+			t.Fatalf("POST /admin/login as root = %d %s", login.StatusCode, login.Body)
+		}
+		var console string
+		for _, c := range login.Cookies {
+			if pair := strings.SplitN(c, ";", 2)[0]; strings.HasPrefix(pair, "console_"+auth.AccessTokenCookieName+"=") {
+				console = pair
+			}
+		}
+		if console == "" {
+			t.Fatalf("the root login set no console_accessToken cookie: %v", login.Cookies)
+		}
+		const csrf = "a-csrf-token-value"
+		cookies := []string{console, auth.CSRFTokenCookieName + "=" + csrf}
+		if rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(), cookies, `{}`); rec.StatusCode != http.StatusForbidden {
+			t.Errorf("root's prefixed cookie track with no X-CSRF-Token = %d %s, want 403 CSRF_INVALID", rec.StatusCode, rec.Body)
+		}
+		if rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(auth.CSRFHeaderName, csrf), cookies, `{}`); rec.StatusCode != http.StatusAccepted {
+			t.Errorf("root's prefixed cookie track with the matching X-CSRF-Token = %d %s, want 202", rec.StatusCode, rec.Body)
 		}
 	})
 
@@ -556,6 +639,39 @@ func TestToolsAccessPostures(t *testing.T) {
 			t.Errorf("toolsAccess(admin, console off) = %v, want a refusal naming the missing console", err)
 		}
 	})
+}
+
+// TestToolsAdminPostureRedirectsIntoTheAdminMount pins the core-caused branch
+// registered as tools-admin-login-redirect-points-into-the-admin-mount: under a
+// session policy with admin.loginPath set, an unauthenticated browser request
+// to a tools route is redirected to the login with a redirect= the core builds
+// from the admin mount, a path nothing serves. The reference answers 401 on
+// every route but the panel since 1.10.0; the day the core does too, this test
+// fails and the entry is retired.
+func TestToolsAdminPostureRedirectsIntoTheAdminMount(t *testing.T) {
+	t.Parallel()
+	app := newToolsApp(t, toolsEnv(
+		"AWESOME_AUTH_TOOLS_AUTH", "admin",
+		"AWESOME_AUTH_ADMIN_ENABLED", "true",
+		"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_ADMIN_LOGIN_PATH", "/console/login",
+	), nil)
+
+	browser := invoke(t, app, http.MethodGet, "/tools/telemetry", map[string]string{"accept": "text/html"}, nil, "")
+	if browser.StatusCode != http.StatusFound {
+		t.Fatalf("unauthenticated text/html GET /tools/telemetry under admin with admin.loginPath = %d %s, want the core's 302; "+
+			"if this is now 401, the core answers as the reference does and the deviation "+
+			"tools-admin-login-redirect-points-into-the-admin-mount is to be retired", browser.StatusCode, browser.Body)
+	}
+	if got, want := browser.Headers["Location"], "/console/login?redirect=%2Fadmin%2Ftools%2Ftelemetry"; got != want {
+		t.Errorf("the redirect's Location = %q, want %q (the admin mount with the tools path appended)", got, want)
+	}
+
+	// Anything that is not a browser gets the console's 401, as in the reference.
+	api := invoke(t, app, http.MethodGet, "/tools/telemetry", map[string]string{"accept": "application/json"}, nil, "")
+	if body := decodeBody(t, api); api.StatusCode != http.StatusUnauthorized || body["error"] != "Unauthorized" {
+		t.Errorf("unauthenticated JSON GET /tools/telemetry under admin = %d %s, want the console's 401", api.StatusCode, api.Body)
+	}
 }
 
 // TestToolsMountFollowsTheReferenceCORSGeometry: the reference's CORS layer is
@@ -779,6 +895,46 @@ func TestGuardedPosturesArePricedAtColdStart(t *testing.T) {
 		}
 		if strings.Contains(out, "the tools routes answer any signed-in user") {
 			t.Errorf("the apiKey cold start carries the session posture's warning:\n%s", out)
+		}
+	})
+
+	adminEnv := func(policy string) map[string]string {
+		return toolsEnv(
+			"AWESOME_AUTH_TOOLS_AUTH", "admin",
+			"AWESOME_AUTH_ADMIN_ENABLED", "true",
+			"AWESOME_AUTH_ADMIN_ACCESS_POLICY", policy)
+	}
+
+	t.Run("admin", func(t *testing.T) {
+		t.Parallel()
+		out := logOf(t, adminEnv(config.AdminAccessPolicyIsAdmin))
+		for _, want := range []string{
+			"the tools routes answer whoever the admin console admits",
+			`"accessPolicy":"` + config.AdminAccessPolicyIsAdmin + `"`,
+			"tools-admin-login-redirect-points-into-the-admin-mount",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the admin cold start does not say %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "the tools routes are unguarded") {
+			t.Errorf("the admin cold start under is-admin-flag carries the unguarded warning:\n%s", out)
+		}
+	})
+
+	t.Run("admin behind an open console is the unguarded posture", func(t *testing.T) {
+		t.Parallel()
+		// The console's open guard reads no credential, so the tools routes
+		// behind it are `none` by another name and are announced as `none` is.
+		out := logOf(t, adminEnv(config.AdminAccessPolicyOpen))
+		for _, want := range []string{
+			`"level":"WARN"`,
+			"the tools routes are unguarded",
+			"attributes an event to any user named in the body",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the admin-under-open cold start does not say %q:\n%s", want, out)
+			}
 		}
 	})
 }

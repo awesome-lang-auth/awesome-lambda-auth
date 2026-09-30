@@ -216,9 +216,12 @@ import (
 // POSTs to a third party in its own name and under its own signature. `admin`
 // puts the routes behind the admin console's own guard — core.AdminGuard over
 // HTTPConfig.Admin, the value the adapter guards <admin>/api/* with — so the
-// callers are exactly the console's and a self-registered session is refused;
-// internal/config refuses the posture without admin.enabled, and the console's
-// own rules (RS-6, RS-18) come with it (toolsAccess).
+// callers are exactly the console's: a self-registered session is refused, and
+// under admin.accessPolicy: open everyone is admitted, which is warned about as
+// `none` is; a cookie caller under a session policy is held to the same
+// double-submit as under `session`; internal/config refuses the posture without
+// admin.enabled, and the console's own rules (RS-6, RS-18) come with it
+// (toolsAccess).
 //
 // ── the two seams left empty on purpose ──────────────────────────────────────
 //
@@ -631,21 +634,43 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		// the adapter builds for <admin>/api/* out of HTTPConfig.Admin — the
 		// policy admin.accessPolicy compiled to (admin.go, adminAccessPolicy),
 		// or the legacy bearer secret — so whoever the console admits reaches
-		// track, notify and the telemetry query, and nobody else does; a
-		// self-registered session that `session` would admit is refused here.
-		// The guard holds no per-request state and its own comment says a
-		// second value is fine (core admin.go, AdminGuard: "safe to call once
-		// per mount and share"). Its refusal is the console's, 401
-		// {"error":"Unauthorized"} (403 for a signed-in user the policy does
-		// not admit), not the auth router's envelope.
+		// track, notify and the telemetry query, and nobody else does. Under
+		// admin.accessPolicy: open that is everyone, because that guard reads
+		// no credential (core admin.go, authorise): the pair is `none` by
+		// another name, and collectWarnings and logToolsSurface say so as they
+		// do for `none`. Under every other decision a self-registered session
+		// that `session` would admit is refused here. The guard holds no
+		// per-request state and its own comment says a second value is fine
+		// (core admin.go, AdminGuard: "safe to call once per mount and
+		// share"). Its refusals are the console's, not the auth router's
+		// envelope: 401 {"error":"Unauthorized"} for no credential, 403
+		// {"error":"Forbidden"} for a bearer that is not the secret (legacy)
+		// or a signed-in user the policy does not admit — and, under a session
+		// policy with admin.loginPath set, a 302 for an unauthenticated
+		// Accept: text/html request, whose redirect= the core builds from the
+		// admin mount, not this one (registered:
+		// tools-admin-login-redirect-points-into-the-admin-mount).
 		//
-		// No double-submit is layered over it, because the reference puts none
-		// on its admin guard (core admin.go, "What is not wrapped around it").
-		// What stands between a cross-site form post and POST <tools>/track
-		// under this posture is the cookie's SameSite attribute, which RS-18
-		// holds off `none` whenever the console is enabled under a session
-		// policy — and internal/config requires admin.enabled for this posture.
-		// The assertion below is for a Config that bypassed the loader: RS-6
+		// The double-submit is layered over it under a session policy, as it
+		// is under `session`. The reference puts none on its console guard
+		// (core admin.go, "What is not wrapped around it"), but the guard
+		// the reference documents for the tools router is auth.middleware()
+		// (tools.router.ts:114), which performs it (auth.middleware.ts:33-41),
+		// and under a session policy this guard reads the same accessToken
+		// cookie `session` does — so without it an admitted administrator's
+		// cookie would carry POST <tools>/track from any same-site page, a
+		// weaker door than `session` on the most privileged callers. The
+		// console's own SPA never calls the tools routes (the vendored
+		// admin.js requests nothing outside the admin mount), so nothing
+		// shipped breaks. The cookie it looks for is the one the guard reads:
+		// <admin.cookiePrefix>accessToken when that knob is set (core admin.go,
+		// readToken), the three standard spellings otherwise. A bearer caller
+		// — an admin or access token in the header — is exempt, as there. The
+		// legacy guard reads only the bearer header and `open` reads nothing,
+		// so neither is wrapped.
+		//
+		// The assertion below is for a Config that bypassed the loader:
+		// internal/config requires admin.enabled for this posture, and RS-6
 		// makes an enabled console with no access decision unreachable through
 		// it.
 		if !base.AdminMounted() {
@@ -653,7 +678,23 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 				"config: refusing to start: tools.auth is %q, but the admin console is not mounted (admin.enabled with admin.accessPolicy or admin.bootstrapSecret), so there is no guard to put the tools routes behind",
 				config.ToolsAuthAdmin)
 		}
-		return auth.ToolsProtected(core.AdminGuard(base).Protect), nil
+		guard := core.AdminGuard(base).Protect
+		if p := base.Admin.AccessPolicy; p == nil || (p.Predicate == nil && p.Kind == auth.AdminPolicyOpen) {
+			return auth.ToolsProtected(guard), nil
+		}
+		adminCookie := func(r *http.Request) string {
+			if prefix := base.Admin.CookiePrefix; prefix != nil {
+				if c, err := r.Cookie(*prefix + auth.AccessTokenCookieName); err == nil {
+					return strings.TrimSpace(c.Value)
+				}
+				return ""
+			}
+			return auth.CookieValue(r, auth.AccessTokenCookieName)
+		}
+		csrf := doubleSubmitOn(cfg.Security.CSRF.Enabled, adminCookie)
+		return auth.ToolsProtected(func(next http.Handler) http.Handler {
+			return csrf(guard(next))
+		}), nil
 
 	case config.ToolsAuthNone:
 		// The reference's default, and here only ever the literal: the
@@ -709,6 +750,15 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 // With csrf off it is the identity, as the core's is: RS-3 refuses that in
 // production, and outside production it is the operator's stated choice.
 func toolsDoubleSubmit(enabled bool) func(http.Handler) http.Handler {
+	return doubleSubmitOn(enabled, func(r *http.Request) string {
+		return auth.CookieValue(r, auth.AccessTokenCookieName)
+	})
+}
+
+// doubleSubmitOn is toolsDoubleSubmit over the access-token cookie the guard
+// behind it reads, which is the one thing the admin posture's guard spells
+// differently (admin.cookiePrefix); the condition and the refusal are the same.
+func doubleSubmitOn(enabled bool, accessCookie func(*http.Request) string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if !enabled {
 			return next
@@ -720,7 +770,7 @@ func toolsDoubleSubmit(enabled bool) func(http.Handler) http.Handler {
 				return
 			}
 			if auth.BearerToken(r.Header.Get("Authorization")) != "" ||
-				auth.CookieValue(r, auth.AccessTokenCookieName) == "" {
+				accessCookie(r) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -792,12 +842,24 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 			slog.String("path", "tools.auth"),
 			slog.String("effect", "no scope is required, so every active key in the API-key store opens track, notify and the store-wide telemetry query, whatever it was minted for"),
 			slog.String("refusal", "the core's text/plain 401, not the reference's {error, code} envelope (deviation tools-api-key-refusal-is-the-cores-bare-401)"))
+	case config.ToolsAuthAdmin:
+		// Info, like apiKey: whoever the console admits is the posture working
+		// as documented — except under an open console, whose guard reads no
+		// credential, which is `none` and gets `none`'s warning below.
+		policy := cfg.Admin.AccessPolicy
+		if policy == "" {
+			policy = "(legacy bootstrap secret)"
+		}
+		log.Info("the tools routes answer whoever the admin console admits",
+			slog.String("path", "tools.auth"),
+			slog.String("accessPolicy", policy),
+			slog.String("refusal", "the console's 401 {\"error\":\"Unauthorized\"} and 403 {\"error\":\"Forbidden\"}; under a session policy with admin.loginPath set, an unauthenticated text/html request is redirected into the admin mount (deviation tools-admin-login-redirect-points-into-the-admin-mount)"))
 	}
-	if posture == config.ToolsAuthNone {
+	if posture == config.ToolsAuthNone || (posture == config.ToolsAuthAdmin && cfg.Admin.AccessPolicy == config.AdminAccessPolicyOpen) {
 		log.Warn("the tools routes are unguarded",
 			slog.String("path", "tools.auth"),
 			slog.String("problem", "POST "+mount+"/track attributes an event to any user named in the body and fans it out to that user's stream and to every matching outgoing webhook, signed in this deployment's name; POST "+mount+"/notify broadcasts to any topic; GET "+mount+"/telemetry reads every event"),
-			slog.String("remedy", "set tools.auth to session or apiKey unless the routes are deliberately public, for example behind a private network path"))
+			slog.String("remedy", "set tools.auth to apiKey, session, or admin beside a console under a policy other than open, unless the routes are deliberately public, for example behind a private network path"))
 	}
 	if cfg.Tools.SSE.Enabled {
 		log.Info("the SSE manager reaches no connection on this runtime",
