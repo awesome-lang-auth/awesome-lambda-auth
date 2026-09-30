@@ -1763,7 +1763,8 @@ cookie — `lax`, the reference's own default and this product's. RS-18 therefor
 **refuses the console beside `cookies.sameSite: none`**, and the SAM Rule
 `AdminConsoleNeedsSameSiteCookies` refuses the same pair at changeset time. The
 product's CORS layer is kept off the admin mount for the same reason the
-reference never puts one there (`cmd/auth/app.go`, `corsExemptMounts`).
+reference never puts one there (`cmd/auth/app.go`, `corsExemptMounts`), and
+off a tools mount beside the api prefix by the same test (§17.6).
 
 **`admin.cookiePrefix`, and the empty string.** The core's field is a `*string`
 because the reference distinguishes an explicit empty prefix — the bare name
@@ -1998,55 +1999,6 @@ values the reference hard-codes — and their defaults are those values, so a
 document that leaves them alone reports nothing. `ui.uploadDir` in its
 filesystem spelling is the third report (§15.4).
 
-## 17. Two worked postures
-
-**Mail through SES, templates from the artifact.** Every key that is not
-`email.*` here is load-bearing: `stores.enable.templates` needs a driver that
-backs a template store (§5.3), and the `stores` block has to name that driver,
-because the default is `memory` and rule RS-12 refuses it in production.
-
-```json
-{
-  "schemaVersion": 1,
-  "deployment": {"environment": "development", "publicUrl": "https://auth.example.com"},
-  "email": {
-    "siteUrls": ["https://app.example.com"],
-    "mailer": {"endpoint": "https://unused.invalid", "from": "no-reply@example.com", "fromName": "Example"},
-    "templatesDir": "/var/task/templates"
-  },
-  "stores": {"driver": "memory", "enable": {"users": true, "sessions": true, "tokens": true, "templates": true}}
-}
-```
-
-For production today, drop `templatesDir` and `stores.enable.templates`, keep
-`stores.driver: dynamodb`, and the built-in `en`/`it` templates render.
-
-**Every credential posted to a receiver you own.** A production document: no
-mailer block at all, so nothing is sent through SES or SNS, and the
-email-changed notice and the account-linking mail are not sent either. The
-`stores` block is what makes it a production document rather than a refusal —
-the default driver is `memory`, which RS-12 forbids in production.
-
-```json
-{
-  "schemaVersion": 1,
-  "deployment": {"environment": "production", "publicUrl": "https://auth.example.com"},
-  "email": {
-    "siteUrls": ["https://app.example.com"],
-    "deliveryWebhook": {
-      "url": "https://hooks.example.com/auth-delivery",
-      "timeoutMs": 2000,
-      "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}
-    }
-  },
-  "stores": {
-    "driver": "dynamodb",
-    "connection": {"tableName": "awesome-auth", "region": "eu-west-1"},
-    "enable": {"users": true, "sessions": true, "tokens": true}
-  }
-}
-```
-
 ## 17. `tools.*`, knob by knob
 
 The tools surface: `POST <tools>/track/{eventName}`, `POST <tools>/notify/{target}`,
@@ -2081,13 +2033,17 @@ listed by `driverStores` for both drivers (§4.1): `telemetry` (what track and
 the bridge write, what the query reads; **required** by `tools.telemetry.enabled`),
 `webhooks` (what every event is matched against for outgoing delivery), and
 `apiKeys` (**required** by `tools.auth: apiKey`). Subscription rows and API
-keys are *data* in those stores, written by the admin API (D8), not
-configuration. A flag switched on while its one consumer is off — any of the
-three with `tools.enabled` off, or `apiKeys` under a posture other than
-`apiKey` — validates and is read by nothing; the unwired-knob report names it
-at cold start (§17.1) rather than refusing it, because that is how a document
-is staged one deploy ahead of the block, and D8 gives all three a second
-consumer.
+keys are *data* in those stores, written through the admin console's
+`<admin>/api/webhooks` and `<admin>/api/api-keys` routes (§16), not
+configuration. The console is therefore the second consumer of `webhooks` and
+`apiKeys`, and a mounted console reads both whatever the tools block says;
+`telemetry` reaches a route through the tools block alone. A flag switched on
+while nothing consumes it — `telemetry` with `tools.enabled` off, or `webhooks`
+and `apiKeys` with the block off and no console mounted, or `apiKeys` under a
+posture other than `apiKey` with no console mounted — validates and is read by
+nothing; the unwired-knob report names it at cold start (§17.1) rather than
+refusing it, because that is how a document is staged one deploy ahead of the
+block that reads it.
 
 The smallest document that loads on this build, and why each line is there:
 
@@ -2122,8 +2078,11 @@ precisely so nobody has to discover them from behaviour — that the stream is
 until D9b**. `tools surface not mounted`, the default, says that no bus is
 built either, so the core's `identity.*` events go nowhere.
 
-`the tools routes are unguarded` is the warning for `tools.auth: none`, and
-repeats the price §17.6 puts on it. `the tools routes answer any signed-in
+`the tools routes are unguarded` is the warning for `tools.auth: none` — and
+for `tools.auth: admin` behind `admin.accessPolicy: open`, the same door — and
+repeats the price §17.6 puts on it. `the tools routes answer whoever the admin
+console admits` is the `admin` line — not a warning — naming the policy and the
+console's refusals, the redirect included. `the tools routes answer any signed-in
 user, and anyone can sign up` is the warning for `tools.auth: session`, for the
 same reason in a different key: it names the store-wide telemetry read, the
 body-supplied `userId` and the remedy (`apiKey`), and says whether a cookie
@@ -2134,8 +2093,10 @@ manager reaches no connection on this runtime` is what `tools.sse.enabled:
 true` gets. And the unwired-knob report names `tools.stream.enabled` on every
 tools deployment (and `tools.sse.enabled` when set), with the same remedy:
 leave them, D9c makes them live — and any of `stores.enable.telemetry`,
-`.webhooks` or `.apiKeys` that is on while nothing consumes it (the block off,
-or `apiKeys` under a posture other than `apiKey`).
+`.webhooks` or `.apiKeys` that is on while nothing consumes it (`telemetry` with
+the block off; `webhooks` and `apiKeys` with the block off and no admin console
+mounted; `apiKeys` under a posture other than `apiKey` with no console mounted,
+since the console's routes are the other reader of those two stores).
 
 ### 17.2 The bridge: the core's own events reach the sinks
 
@@ -2176,7 +2137,7 @@ embedding the package — `App.Events` carries what the library raised,
 What it costs: one telemetry `PutItem` per `identity.*` event, awaited on the
 request goroutine (about a millisecond against DynamoDB Local, single-digit
 milliseconds in a region), and one outgoing delivery per matching subscription.
-`docs/cost-model.md` §2.6 has the arithmetic.
+`docs/cost-model.md` §2.8 has the arithmetic.
 
 ### 17.3 The stream is not mounted on this runtime
 
@@ -2318,16 +2279,17 @@ SAM template's default**. The guard is the core's `APIKeyMiddleware`:
 `X-Api-Key: ak_…` or `Authorization: ApiKey ak_…`, looked up by prefix and
 verified by bcrypt against the API-key store, with the key's own IP allowlist
 and expiry honoured. It requires `stores.enable.apiKeys` (`STORE`), and keys
-are minted through the admin API (D8) — until that lands, a posture nobody
-holds a key for is a guard nobody can pass, which is safe and is also a surface
-that answers `401` to everyone. Two things about it are the core's and are
-stated rather than assumed. **It requires no scope**: the schema has no
-vocabulary for one, so *every* active key in the store passes — including one
-an administrator minted with a narrow scope for another purpose — because
-`nil` is "no requirement" to the core's scope check, not "no scope". Today the
-tools guard is the store's only consumer in this product, so every key is a
-tools key by construction; on the day D8 gives the store a second consumer,
-this is the sentence to remember. **And its refusal is a bare `text/plain 401
+are minted through the admin console's `<admin>/api/api-keys` routes (§16) —
+on a deployment with the posture and no console, a store nobody can write to
+is a guard nobody can pass, which is safe and is also a surface that answers
+`401` to everyone. Two things about it are the core's and are stated rather
+than assumed. **It requires no scope**: the schema has no vocabulary for one,
+so *every* active key in the store passes — including one an administrator
+minted with a narrow scope for another purpose — because `nil` is "no
+requirement" to the core's scope check, not "no scope". The console is the
+store's other consumer, so a key minted there for any purpose is a tools key
+here all the same; this is the sentence to remember when minting one. **And
+its refusal is a bare `text/plain 401
 unauthorized`** for every reason alike — no key, an unknown, revoked or expired
 one, a caller outside the IP allowlist — where the reference answers an
 `{error, code}` envelope with five distinct codes and a `403` for a blocked IP.
@@ -2403,9 +2365,72 @@ the configured seam and never from `X-Forwarded-For`
 (`tools-track-ip-comes-from-the-configured-seam`), so an anonymous caller can
 forge the *who* and not the *where from*.
 
-**`admin`** — the tools routes behind the admin console's own guard. The guard
-is D8's; on this build the posture is **refused at cold start** naming that
-block, and `internal/config` refuses it without `admin.enabled` in any build.
+**`admin`** — the tools routes behind the admin console's own guard: the value
+the adapter guards `<admin>/api/*` with, built from `admin.accessPolicy` (§16.1)
+or, in the legacy form, from `admin.bootstrapSecret` (`cmd/auth/tools.go`,
+`toolsAccess`). A caller is whoever the console would admit — the root user or a
+flagged user under `is-admin-flag`, a role or permission holder under the two
+RBAC spellings, the bearer of the secret under the legacy guard — and, under
+`admin.accessPolicy: open`, everyone: that guard reads no credential at all, so
+the pair is `none` by another name, and the loader and the cold start warn
+about it as they do about `none`. Under every other decision a self-registered
+session that `session` would admit is refused here. The refusals are the
+console's, not the auth router's envelope: `401 {"error":"Unauthorized"}` for
+no credential, and `403 {"error":"Forbidden"}` for a bearer that is not the
+secret under the legacy guard or for a signed-in user a session policy does not
+admit. One more branch is the core's: under a session policy with
+`admin.loginPath` set, an unauthenticated request whose `Accept` names
+`text/html` — a browser opening the URL — gets `302` to
+`<loginPath>?redirect=<admin mount><tools path>`, a path nothing serves, where
+the reference answers `401` on every route but the console's panel
+(registered: `tools-admin-login-redirect-points-into-the-admin-mount`).
+`internal/config` refuses the posture without `admin.enabled`, and the
+console's own rules come with it: RS-6 demands an access decision, and RS-18
+refuses a session policy beside `cookies.sameSite: none`. Under a session
+policy the guard reads the `accessToken` cookie as `session` does, so the
+product puts the same double-submit in front of it: a cookie-authenticated
+`POST` needs the matching `X-CSRF-Token` (the `csrf-token` cookie the auth
+router sets), a bearer caller does not, and the cookie looked for is
+`<admin.cookiePrefix>accessToken` when that knob is set. The reference's
+console guard performs none, but the guard it documents for the tools router
+is `auth.middleware()` (`tools.router.ts:114`), which does
+(`auth.middleware.ts:33-41`); `SameSite` alone would leave a same-site origin
+free to drive `track` on an administrator's cookie. The vendored console calls
+no tools route, so it is unaffected. The legacy guard reads only the bearer
+header and `open` reads nothing, so neither is wrapped. The SAM
+template's `ToolsAuth` parameter does not offer the value (`apiKey` and
+`session` only), and because that variable overrides `ConfigFile` whenever
+`EnableTools` is on, a stack deployed from the template cannot reach this
+posture at all; a document deployed another way sets it.
+`cmd/auth/tools_test.go` `TestToolsAccessPostures` drives the console's
+secret (`202`), an anonymous caller (`401`), a wrong bearer under the legacy
+guard (`403`), a signed-in user `is-admin-flag` refuses (`403`) and one it
+admits (`202` by bearer; by cookie `403 CSRF_INVALID` without the header and
+`202` with it, also under `admin.cookiePrefix`), and the refusal with no
+console mounted.
+
+**CORS follows the reference's geometry around the mount.** The reference's
+CORS layer is `router.use(...)` inside the auth router
+(`auth.router.ts:512-527`) and `createToolsRouter` sets no `Access-Control`
+header of its own, so a tools router mounted *beside* the api prefix — the
+shape `tools.router.ts:114` documents, and this product's default — never
+meets that layer, and the product's layer is kept off the mount as it is off
+the admin console (§16.2, `cmd/auth/app.go` `corsExemptMounts`); mounted
+*under* the prefix, as the Angular demo mounts it (`router.use('/tools', …)` on
+the router served at `/api/auth`, `ng-awesome-node-auth`
+`src/server/auth.routes.ts:98-99`), every request passes the auth router's
+layer first, so there the tools mount stays wrapped.
+`TestToolsMountFollowsTheReferenceCORSGeometry` pins both shapes. Under the
+prefix an allow-listed origin therefore gets credentialed CORS
+(`Access-Control-Allow-Credentials: true`) on the tools routes, and with
+`tools.auth: admin` those routes take a console credential: script on an
+allow-listed origin can call `GET <tools>/telemetry`, `track` and `notify`
+with an administrator's cookie and read the answers — the access the console
+itself is kept out of the layer to deny. Keep the mount beside the prefix
+under this posture unless every allow-listed origin is trusted with the
+console. A mount *above* the prefix (`/api` under `/api/auth`) is refused at
+load (`internal/config` `validateMounts`), because its exemption would take
+every auth route out of the layer.
 
 **Rate limiting.** `track` has no name in `rateLimit.scope` (§14.1), and that
 is a decision rather than an omission. The scope vocabulary is "the
@@ -2447,3 +2472,52 @@ through it and not through any route:
 | D9b | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field; retires `outgoing-webhook-delivery-races-the-response` |
 | D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
 | D9d | `InboundScriptRunner` as its own Lambda | `ScriptRunner: nil`, one field; retires RS-15 and `inbound-webhooks-are-refused-without-a-runner` |
+
+## 18. Two worked postures
+
+**Mail through SES, templates from the artifact.** Every key that is not
+`email.*` here is load-bearing: `stores.enable.templates` needs a driver that
+backs a template store (§5.3), and the `stores` block has to name that driver,
+because the default is `memory` and rule RS-12 refuses it in production.
+
+```json
+{
+  "schemaVersion": 1,
+  "deployment": {"environment": "development", "publicUrl": "https://auth.example.com"},
+  "email": {
+    "siteUrls": ["https://app.example.com"],
+    "mailer": {"endpoint": "https://unused.invalid", "from": "no-reply@example.com", "fromName": "Example"},
+    "templatesDir": "/var/task/templates"
+  },
+  "stores": {"driver": "memory", "enable": {"users": true, "sessions": true, "tokens": true, "templates": true}}
+}
+```
+
+For production today, drop `templatesDir` and `stores.enable.templates`, keep
+`stores.driver: dynamodb`, and the built-in `en`/`it` templates render.
+
+**Every credential posted to a receiver you own.** A production document: no
+mailer block at all, so nothing is sent through SES or SNS, and the
+email-changed notice and the account-linking mail are not sent either. The
+`stores` block is what makes it a production document rather than a refusal —
+the default driver is `memory`, which RS-12 forbids in production.
+
+```json
+{
+  "schemaVersion": 1,
+  "deployment": {"environment": "production", "publicUrl": "https://auth.example.com"},
+  "email": {
+    "siteUrls": ["https://app.example.com"],
+    "deliveryWebhook": {
+      "url": "https://hooks.example.com/auth-delivery",
+      "timeoutMs": 2000,
+      "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}
+    }
+  },
+  "stores": {
+    "driver": "dynamodb",
+    "connection": {"tableName": "awesome-auth", "region": "eu-west-1"},
+    "enable": {"users": true, "sessions": true, "tokens": true}
+  }
+}
+```

@@ -929,8 +929,9 @@ func TestLogAdminSurfaceNamesTheBackfill(t *testing.T) {
 	}
 }
 
-// TestDriverStoresListTheConsoleStores pins the widening that makes the five
-// flags real switches on both drivers, and the one that stays out.
+// TestDriverStoresListTheConsoleStores pins the widening that makes the
+// console's five flags and the tools block's telemetry real switches on both
+// drivers.
 func TestDriverStoresListTheConsoleStores(t *testing.T) {
 	t.Parallel()
 	for _, driver := range []string{config.StoreDriverDynamoDB, config.StoreDriverMemory} {

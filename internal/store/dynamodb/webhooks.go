@@ -182,7 +182,8 @@ func (s *Store) ListWebhooks(ctx context.Context, limit, offset int) ([]auth.Web
 //
 // Nothing is defaulted on the way in: Active, Retries and RetryDelay resolve nil
 // at the point of use, and the reference's own defaulting of events to ["*"] and
-// isActive to true happens in the admin route, which is D8's to reproduce. That
+// isActive to true happens in the admin route the console mounts (core
+// admin_credentials.go reproduces `events ?? ['*']` and `isActive ?? true`). That
 // is why the encoding below writes an absent optional as an absent attribute
 // rather than as its resolved value — a configuration stored without
 // allowedActions must not come back with [], and one stored without isActive

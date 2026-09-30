@@ -273,12 +273,6 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := checkUISupport(cfg); err != nil {
 		return nil, err
 	}
-	// Before the stores too, and for the same reason: the one tools posture
-	// this build cannot build needs no store to be recognised. See
-	// checkToolsSupport.
-	if err := checkToolsSupport(cfg); err != nil {
-		return nil, err
-	}
 
 	users, sessions, err := newStores(ctx, cfg, log)
 	if err != nil {
@@ -456,7 +450,8 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //     password verifier through a second per-request carrier of the same shape:
 //     a ctx cannot be mutated by the callee, so the HTTP layer installs an empty
 //     scope and the two ends fill and consume it. See migrationScopeMiddleware.
-//   - CORS, everywhere but the admin mount (corsExemptMounts).
+//   - CORS, everywhere but the admin mount and a tools mount beside the api
+//     prefix (corsExemptMounts).
 //   - The observability pair, whose order is the argument: the carrier has to
 //     exist before anything can read it, and the access log is one of the
 //     things that reads it. So correlationScope sits between them, and
@@ -490,8 +485,9 @@ func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adm
 	return handler
 }
 
-// corsExemptMounts names the mounts the CORS layer must not touch: today the
-// admin console, when it is mounted.
+// corsExemptMounts names the mounts the CORS layer must not touch: the admin
+// console when it is mounted, and the tools router when it is mounted beside
+// the api prefix.
 //
 // The reference's CORS layer is `router.use(cors(...))` INSIDE the auth router
 // (auth.router.ts:512-527); createAdminRouter is a separate Express router
@@ -503,14 +499,46 @@ func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adm
 // use a bearer. Exempting the mount rather than narrowing the layer to the api
 // prefix keeps every other path where it was (GET /healthz, and an
 // idProvider.jwksPath a document may place outside the prefix, whose discovery
-// document a browser client does fetch). The tools router is the reference's
-// other sibling router and will want the same exemption when its block lands.
+// document a browser client does fetch).
+//
+// The tools router is the reference's other sibling router and gets the same
+// answer by the same test, with one twist that is the reference's geometry
+// and not ours. createToolsRouter sets no Access-Control header either
+// (tools.router.ts, none anywhere in the file), and the mount it documents is
+// beside the auth router at app level — `app.use('/tools', createToolsRouter(
+// …))` (tools.router.ts:114) — where no CORS layer of the reference's ever
+// sees a request, so a tools mount beside the prefix, this product's default,
+// is exempt. The Angular demo mounts it the other way: `router.use('/tools',
+// …)` (ng-awesome-node-auth src/server/auth.routes.ts:98-99) on the same
+// router that mounts the auth router at '/' (:57-59) and is itself served at
+// /api/auth (src/server.ts:65), so every request enters the auth router first
+// and passes its CORS middleware before falling through to the tools router.
+// Under the prefix the reference therefore does apply CORS, so a
+// tools.basePath under http.apiPrefix stays inside the layer here as well.
+// The test is cfg.Tools.Enabled rather than HTTPConfig.ToolsMounted because
+// httpConfig carries no ToolsOptions — mountAuthSurface fills that field —
+// and toolsPath is the mount the adapter resolves (docs.go uses the same
+// pair). cmd/auth/tools_test.go TestToolsMountFollowsTheReferenceCORSGeometry
+// pins both shapes. Under the prefix, that also means an allow-listed origin
+// gets the reference's credentialed CORS on the tools routes; under tools.auth:
+// admin those routes accept a console credential, so script on such an origin
+// can call them with an administrator's cookie and read the answer — the
+// access the console itself is kept out of the layer to deny. It is the
+// reference's layout, reproduced, and the config reference says so (§17.6).
+// A mount above the prefix is refused by internal/config (validateMounts),
+// because exempting it would exempt every auth route below it.
 func corsExemptMounts(cfg *config.Config) []string {
 	hc := httpConfig(cfg)
-	if !hc.AdminMounted() {
-		return nil
+	var mounts []string
+	if hc.AdminMounted() {
+		mounts = append(mounts, hc.AdminPath())
 	}
-	return []string{hc.AdminPath()}
+	if cfg.Tools.Enabled {
+		if mount := toolsPath(cfg); !strings.HasPrefix(mount, hc.Prefix()+"/") {
+			mounts = append(mounts, mount)
+		}
+	}
+	return mounts
 }
 
 // buildCore turns the validated configuration and the opened stores into the
@@ -1056,8 +1084,10 @@ func driverStores(driver string) (map[string]bool, bool) {
 		//
 		// The listing is about the driver and cannot see the document, so it
 		// reopens the hole above for one combination: a flag switched on while
-		// its one consumer is off — any of the three with tools.enabled off,
-		// or apiKeys under a posture other than apiKey. That combination is
+		// every consumer it has is off — telemetry with tools.enabled off;
+		// webhooks with tools.enabled off and no admin console mounted; apiKeys
+		// with neither tools.auth: apiKey nor a mounted console, whose
+		// credential tabs are the other reader of those two. That combination is
 		// reported by toolsKnobGaps at every cold start rather than refused
 		// here, for the reason given there, and
 		// TestUnwiredKnobsIsExactlyTheDocumentedList pins the rows.

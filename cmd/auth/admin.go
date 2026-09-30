@@ -218,10 +218,10 @@ import (
 // GET <prefix>/me renders carries the user's metadata (core service.go:1295),
 // which is the reference's own behaviour with a metadata store passed.
 //
-// stores.enable.telemetry stays out of this slot and out of driverStores. The
-// telemetry store reaches a route only through ToolsOptions.TelemetryStore,
-// which is the tools block's and D9a's to hand over; listing it here would be
-// the very knob-that-does-nothing D6 refused.
+// stores.enable.telemetry stays out of this slot. The telemetry store reaches a
+// route only through ToolsOptions.TelemetryStore, which the tools block hands
+// over (tools.go, newToolsWiring); that, and nothing the console reads, is why
+// driverStores lists the flag.
 //
 // ── uploads, and the deviation this retires ──────────────────────────────────
 //

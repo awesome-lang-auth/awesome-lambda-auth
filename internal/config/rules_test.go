@@ -586,6 +586,23 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage:        "http.apiPrefix itself",
 		},
 		{
+			// Above the prefix: the tools mount would contain the auth router,
+			// and its CORS exemption would take every auth route out of the
+			// layer (validateMounts).
+			name: "the tools router mounted above the api prefix",
+			mutate: func(doc Document) {
+				set(doc, "http.apiPrefix", "/api/auth")
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.basePath", "/api")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.basePath",
+			wantMessage:        "is above http.apiPrefix",
+		},
+		{
 			// Two subtree routers on one mount is a duplicate ServeMux pattern,
 			// which is a panic inside the adapter rather than a diagnostic.
 			name: "the tools router mounted on the admin console's path",
@@ -1194,6 +1211,52 @@ func TestSessionPostureWithCrossSiteCookiesWarns(t *testing.T) {
 			}
 			if got != nil && !strings.Contains(got.Remedy, "bearer") {
 				t.Errorf("the remedy does not name the bearer token: %s", got.Remedy)
+			}
+		})
+	}
+}
+
+// TestAdminPostureBehindAnOpenConsoleWarns: tools.auth: admin puts the tools
+// routes behind the console's guard, and under admin.accessPolicy: open that
+// guard reads no credential, so the pair is the unguarded posture written as a
+// guard. It loads, as `none` does, and warns on tools.auth as `none` does
+// (collectWarnings); a console with a real decision does not.
+func TestAdminPostureBehindAnOpenConsoleWarns(t *testing.T) {
+	cases := []struct {
+		policy string
+		want   bool
+	}{
+		{AdminAccessPolicyOpen, true},
+		{AdminAccessPolicyIsAdmin, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.policy, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "admin")
+			set(doc, "tools.inboundWebhooks.enabled", false)
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.webhooks", true)
+			set(doc, "admin.enabled", true)
+			set(doc, "admin.accessPolicy", tc.policy)
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv()), AllowUnimplemented: true})
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			var got *Diagnostic
+			for i, w := range cfg.Warnings() {
+				if w.Path == "tools.auth" && strings.Contains(w.Problem, "unauthenticated") {
+					got = &cfg.Warnings()[i]
+				}
+			}
+			if tc.want && got == nil {
+				t.Fatalf("no unauthenticated-tools warning on tools.auth under an open console; got %v", cfg.Warnings())
+			}
+			if !tc.want && got != nil {
+				t.Fatalf("tools.auth admin under %q warned: %s", tc.policy, got.Error())
+			}
+			if got != nil && (!strings.Contains(got.Problem, "tools.auth: none") || !strings.Contains(got.Remedy, "is-admin-flag")) {
+				t.Errorf("the warning does not say it is the unguarded posture, or does not name a real decision: %s", got.Error())
 			}
 		})
 	}

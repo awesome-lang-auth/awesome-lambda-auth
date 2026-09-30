@@ -489,6 +489,18 @@ func collectWarnings(cfg *Config) {
 			"the admin console admits every request with no credential at all -- the user listing, the API-key and webhook-secret routes and promote included -- which is the reference's default and is only for a stack nobody outside your network can reach",
 			"set admin.accessPolicy: is-admin-flag and get in with admin.rootUser, or accept this on a stack behind a network boundary of your own")
 	}
+	// tools.auth: admin behind that open console is `none` by another name: the
+	// console's guard admits every request without reading a credential (core
+	// admin.go, authorise), and the tools routes are behind that guard. The
+	// literal `none` gets its warning above; this spelling of the same door
+	// gets one too, naming the routes, so that it is not quieter for having
+	// been written as a guard.
+	if cfg.Tools.Enabled && normalizeEnum(cfg.Tools.Auth) == ToolsAuthAdmin &&
+		cfg.Admin.Enabled && cfg.Admin.AccessPolicy == AdminAccessPolicyOpen {
+		cfg.warn("tools.auth",
+			"tools.auth is admin and admin.accessPolicy is open, so the tools endpoints -- track, notify and the store-wide telemetry query -- are unauthenticated exactly as under tools.auth: none",
+			"set admin.accessPolicy: is-admin-flag, or tools.auth to session or apiKey, unless the endpoints are deliberately public")
+	}
 	// The session posture with cross-site cookies. The tools router sits
 	// outside the auth router's CSRF chain — the core mounts it bare — and the
 	// product's session guard performs the reference's double-submit for a

@@ -402,7 +402,7 @@ func WireDeviations() []WireDeviation {
 				"is any self-registered user (docs/config-reference.md §17.6), which is why the SAM template defaults " +
 				"to `apiKey` and the cold start warns. cmd/auth/tools_test.go TestBridgeDeliversEachLoginOnce fails the " +
 				"day a login is delivered zero times or twice, or arrives without the caller's X-Correlation-Id.",
-			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.6; upstream auth_tools.go (the AuthTools type comment)",
+			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.8; upstream auth_tools.go (the AuthTools type comment)",
 		},
 		{
 			ID:      "outgoing-webhook-delivery-races-the-response",
@@ -428,7 +428,7 @@ func WireDeviations() []WireDeviation {
 				"Delivering synchronously on the request goroutine instead was considered and rejected: it would make a " +
 				"slow receiver a slow login, times the retry schedule, and would still lose the deliveries of the " +
 				"invocation that hit the function timeout.",
-			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.6; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
+			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.8; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
 		},
 		{
 			ID:      "inbound-webhooks-are-refused-without-a-runner",
@@ -476,6 +476,31 @@ func WireDeviations() []WireDeviation {
 				"body. The fix is upstream's (an envelope and a 403 in APIKeyMiddleware), and this entry retires with it. " +
 				"cmd/auth/tools_test.go TestToolsAccessPostures pins the status and the body.",
 			Spec: "docs/config-reference.md §17.6; upstream api_keys.go (APIKeyMiddleware)",
+		},
+		{
+			ID:      "tools-admin-login-redirect-points-into-the-admin-mount",
+			Surface: "every tools route under tools.auth: admin, with a session admin.accessPolicy and admin.loginPath set, for an unauthenticated request whose Accept names text/html",
+			Behaviour: "Answered 302 with Location <admin.loginPath>?redirect=<admin mount><tools path> -- for GET /tools/telemetry " +
+				"at the default mounts, redirect=%2Fadmin%2Ftools%2Ftelemetry -- a path no router serves, so a browser that opens a " +
+				"tools URL, signs in and is sent back lands on a 404. The same request without text/html is the console's 401.",
+			Reference: "Since 1.10.0 the session guard answers 401 {\"error\":\"Unauthorized\"} on every route but the console's " +
+				"HTML panel, whatever the Accept header: only the guard built with loginFormFallback redirects " +
+				"(src/router/admin.router.ts:439-458 and :684 on origin/main, v1.10.8; CHANGELOG [1.10.0]). The 1.9.0 working " +
+				"tree still redirects any text/html request, but builds redirect= from the router the guard is mounted on, " +
+				"req.baseUrl + req.path (admin.router.ts:311-314), which here would be /tools/telemetry.",
+			Why: "Core-caused and not fixable here: the redirect is the imported core's AdminGuard, which reproduces the 1.9.0 " +
+				"branch for every request it guards (admin.go:597-607) and builds redirect= from AdminPath() plus " +
+				"adminRouterPath, whose default arm returns the path unchanged for a request outside the admin mount " +
+				"(admin.go:1097-1105), so the tools path is appended to the admin mount. It is reachable at all because " +
+				"tools.auth: admin puts the tools routes behind that guard. Refusing admin.loginPath beside this posture was " +
+				"rejected, because the config reference recommends admin.loginPath at the hosted login as the way into the " +
+				"console that enforces the second factor (admin-login-skips-the-second-factor), and rewriting the request or " +
+				"the response would be a second copy of the guard's decision. Nothing is admitted by the redirect: it is a " +
+				"refusal with the wrong address on it, and every non-browser caller gets the 401. The fix is upstream's -- " +
+				"answer 401 outside the panel, as the reference does since 1.10.0 -- and this entry retires with it. " +
+				"cmd/auth/tools_test.go TestToolsAdminPostureRedirectsIntoTheAdminMount pins the 302 and its Location and " +
+				"fails the day the core answers 401 there.",
+			Spec: "docs/config-reference.md §17.6; upstream admin.go (AdminGuard.authorise, adminRelativePath)",
 		},
 	}
 }

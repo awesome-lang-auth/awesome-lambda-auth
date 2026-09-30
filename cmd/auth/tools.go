@@ -99,7 +99,7 @@ import (
 //
 // What the bridge costs: every identity.* event now writes one telemetry row
 // (awaited, on the request goroutine — one DynamoDB PutItem per login, refresh,
-// logout and the rest; docs/cost-model.md §2.6) and fires every matching
+// logout and the rest; docs/cost-model.md §2.8) and fires every matching
 // outgoing webhook.
 //
 // The bridge's context is the process's, not the cold start's. main.go bounds
@@ -214,9 +214,14 @@ import (
 // Track fans that attribution out to the telemetry store, to that user's
 // stream and to every matching outgoing webhook, which the deployment then
 // POSTs to a third party in its own name and under its own signature. `admin`
-// puts the routes behind the admin console's guard, which D8 builds; until it
-// lands the posture is refused at cold start rather than silently degraded,
-// and internal/config already refuses it without admin.enabled.
+// puts the routes behind the admin console's own guard — core.AdminGuard over
+// HTTPConfig.Admin, the value the adapter guards <admin>/api/* with — so the
+// callers are exactly the console's: a self-registered session is refused, and
+// under admin.accessPolicy: open everyone is admitted, which is warned about as
+// `none` is; a cookie caller under a session policy is held to the same
+// double-submit as under `session`; internal/config refuses the posture without
+// admin.enabled, and the console's own rules (RS-6, RS-18) come with it
+// (toolsAccess).
 //
 // ── the two seams left empty on purpose ──────────────────────────────────────
 //
@@ -280,24 +285,6 @@ type webhookStoreProvider interface {
 
 type apiKeyStoreProvider interface {
 	APIKeys() auth.APIKeyStore
-}
-
-// checkToolsSupport refuses, before any store is opened, the one tools posture
-// this build cannot build: `admin`, whose guard is the admin console's and
-// arrives with D8. internal/config has already refused the posture without
-// admin.enabled; this is the refusal for the build that has the knob and not
-// the console. When D8 lands, this function is where its guard's Protect is
-// handed to toolsAccess and the refusal is deleted.
-func checkToolsSupport(cfg *config.Config) error {
-	if !cfg.Tools.Enabled {
-		return nil
-	}
-	if cfg.Tools.Auth == config.ToolsAuthAdmin {
-		return fmt.Errorf(
-			"config: refusing to start: tools.auth is %q, but this build mounts no admin console and so has no admin guard to put the tools routes behind (it lands with D8) -- choose tools.auth: session or apiKey until then",
-			config.ToolsAuthAdmin)
-	}
-	return nil
 }
 
 // newToolsWiring builds the bus and the facade, or returns nil when the block
@@ -625,11 +612,12 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		// schema has no vocabulary for them — which means that EVERY active key
 		// in the store passes, including one an administrator minted with a
 		// narrow scope for some other purpose: nil is "no requirement" to the
-		// core's hasScopes, not "no scope". Today the tools guard is the store's
-		// only consumer in this product, so every key is a tools key by
-		// construction; the config reference says so (§17.6) so that it stays a
-		// stated fact on the day D8 gives the store a second consumer. The
-		// refusal it writes is the core's bare 401 and is registered
+		// core's hasScopes, not "no scope". The admin console is the store's
+		// other consumer — its <admin>/api/api-keys routes mint and revoke the
+		// rows — so a key an administrator minted there for some narrower
+		// purpose is a tools key here all the same; the config reference says
+		// so (§17.6) so that it stays a stated fact. The refusal it writes is
+		// the core's bare 401 and is registered
 		// (tools-api-key-refusal-is-the-cores-bare-401). The store is
 		// guaranteed by checkStoreRequirements and driverStores; the assertion
 		// is the refusal for a driver that lacks it.
@@ -642,9 +630,71 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		return auth.ToolsProtected(auth.APIKeyMiddleware(provider.APIKeys(), nil)), nil
 
 	case config.ToolsAuthAdmin:
-		// Unreachable: checkToolsSupport refused it before any store was
-		// opened. Kept as a branch so that D8's guard has a named place to go.
-		return nil, fmt.Errorf("config: refusing to start: tools.auth %q has no guard in this build", config.ToolsAuthAdmin)
+		// The admin console's own guard over the tools routes: the same value
+		// the adapter builds for <admin>/api/* out of HTTPConfig.Admin — the
+		// policy admin.accessPolicy compiled to (admin.go, adminAccessPolicy),
+		// or the legacy bearer secret — so whoever the console admits reaches
+		// track, notify and the telemetry query, and nobody else does. Under
+		// admin.accessPolicy: open that is everyone, because that guard reads
+		// no credential (core admin.go, authorise): the pair is `none` by
+		// another name, and collectWarnings and logToolsSurface say so as they
+		// do for `none`. Under every other decision a self-registered session
+		// that `session` would admit is refused here. The guard holds no
+		// per-request state and its own comment says a second value is fine
+		// (core admin.go, AdminGuard: "safe to call once per mount and
+		// share"). Its refusals are the console's, not the auth router's
+		// envelope: 401 {"error":"Unauthorized"} for no credential, 403
+		// {"error":"Forbidden"} for a bearer that is not the secret (legacy)
+		// or a signed-in user the policy does not admit — and, under a session
+		// policy with admin.loginPath set, a 302 for an unauthenticated
+		// Accept: text/html request, whose redirect= the core builds from the
+		// admin mount, not this one (registered:
+		// tools-admin-login-redirect-points-into-the-admin-mount).
+		//
+		// The double-submit is layered over it under a session policy, as it
+		// is under `session`. The reference puts none on its console guard
+		// (core admin.go, "What is not wrapped around it"), but the guard
+		// the reference documents for the tools router is auth.middleware()
+		// (tools.router.ts:114), which performs it (auth.middleware.ts:33-41),
+		// and under a session policy this guard reads the same accessToken
+		// cookie `session` does — so without it an admitted administrator's
+		// cookie would carry POST <tools>/track from any same-site page, a
+		// weaker door than `session` on the most privileged callers. The
+		// console's own SPA never calls the tools routes (the vendored
+		// admin.js requests nothing outside the admin mount), so nothing
+		// shipped breaks. The cookie it looks for is the one the guard reads:
+		// <admin.cookiePrefix>accessToken when that knob is set (core admin.go,
+		// readToken), the three standard spellings otherwise. A bearer caller
+		// — an admin or access token in the header — is exempt, as there. The
+		// legacy guard reads only the bearer header and `open` reads nothing,
+		// so neither is wrapped.
+		//
+		// The assertion below is for a Config that bypassed the loader:
+		// internal/config requires admin.enabled for this posture, and RS-6
+		// makes an enabled console with no access decision unreachable through
+		// it.
+		if !base.AdminMounted() {
+			return nil, fmt.Errorf(
+				"config: refusing to start: tools.auth is %q, but the admin console is not mounted (admin.enabled with admin.accessPolicy or admin.bootstrapSecret), so there is no guard to put the tools routes behind",
+				config.ToolsAuthAdmin)
+		}
+		guard := core.AdminGuard(base).Protect
+		if p := base.Admin.AccessPolicy; p == nil || (p.Predicate == nil && p.Kind == auth.AdminPolicyOpen) {
+			return auth.ToolsProtected(guard), nil
+		}
+		adminCookie := func(r *http.Request) string {
+			if prefix := base.Admin.CookiePrefix; prefix != nil {
+				if c, err := r.Cookie(*prefix + auth.AccessTokenCookieName); err == nil {
+					return strings.TrimSpace(c.Value)
+				}
+				return ""
+			}
+			return auth.CookieValue(r, auth.AccessTokenCookieName)
+		}
+		csrf := doubleSubmitOn(cfg.Security.CSRF.Enabled, adminCookie)
+		return auth.ToolsProtected(func(next http.Handler) http.Handler {
+			return csrf(guard(next))
+		}), nil
 
 	case config.ToolsAuthNone:
 		// The reference's default, and here only ever the literal: the
@@ -700,6 +750,15 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 // With csrf off it is the identity, as the core's is: RS-3 refuses that in
 // production, and outside production it is the operator's stated choice.
 func toolsDoubleSubmit(enabled bool) func(http.Handler) http.Handler {
+	return doubleSubmitOn(enabled, func(r *http.Request) string {
+		return auth.CookieValue(r, auth.AccessTokenCookieName)
+	})
+}
+
+// doubleSubmitOn is toolsDoubleSubmit over the access-token cookie the guard
+// behind it reads, which is the one thing the admin posture's guard spells
+// differently (admin.cookiePrefix); the condition and the refusal are the same.
+func doubleSubmitOn(enabled bool, accessCookie func(*http.Request) string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if !enabled {
 			return next
@@ -711,7 +770,7 @@ func toolsDoubleSubmit(enabled bool) func(http.Handler) http.Handler {
 				return
 			}
 			if auth.BearerToken(r.Header.Get("Authorization")) != "" ||
-				auth.CookieValue(r, auth.AccessTokenCookieName) == "" {
+				accessCookie(r) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -783,12 +842,24 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 			slog.String("path", "tools.auth"),
 			slog.String("effect", "no scope is required, so every active key in the API-key store opens track, notify and the store-wide telemetry query, whatever it was minted for"),
 			slog.String("refusal", "the core's text/plain 401, not the reference's {error, code} envelope (deviation tools-api-key-refusal-is-the-cores-bare-401)"))
+	case config.ToolsAuthAdmin:
+		// Info, like apiKey: whoever the console admits is the posture working
+		// as documented — except under an open console, whose guard reads no
+		// credential, which is `none` and gets `none`'s warning below.
+		policy := cfg.Admin.AccessPolicy
+		if policy == "" {
+			policy = "(legacy bootstrap secret)"
+		}
+		log.Info("the tools routes answer whoever the admin console admits",
+			slog.String("path", "tools.auth"),
+			slog.String("accessPolicy", policy),
+			slog.String("refusal", "the console's 401 {\"error\":\"Unauthorized\"} and 403 {\"error\":\"Forbidden\"}; under a session policy with admin.loginPath set, an unauthenticated text/html request is redirected into the admin mount (deviation tools-admin-login-redirect-points-into-the-admin-mount)"))
 	}
-	if posture == config.ToolsAuthNone {
+	if posture == config.ToolsAuthNone || (posture == config.ToolsAuthAdmin && cfg.Admin.AccessPolicy == config.AdminAccessPolicyOpen) {
 		log.Warn("the tools routes are unguarded",
 			slog.String("path", "tools.auth"),
 			slog.String("problem", "POST "+mount+"/track attributes an event to any user named in the body and fans it out to that user's stream and to every matching outgoing webhook, signed in this deployment's name; POST "+mount+"/notify broadcasts to any topic; GET "+mount+"/telemetry reads every event"),
-			slog.String("remedy", "set tools.auth to session or apiKey unless the routes are deliberately public, for example behind a private network path"))
+			slog.String("remedy", "set tools.auth to apiKey, session, or admin beside a console under a policy other than open, unless the routes are deliberately public, for example behind a private network path"))
 	}
 	if cfg.Tools.SSE.Enabled {
 		log.Info("the SSE manager reaches no connection on this runtime",
@@ -812,36 +883,48 @@ func csrfPostureOf(cfg *config.Config) string {
 // Two kinds. The stream and the SSE manager are runtime gaps — the core exposes
 // the field, API Gateway cannot carry the response — and both close with D9c.
 // The three store flags are the other kind: driverStores lists telemetry,
-// webhooks and apiKeys as supported from this block on, because the tools block
-// is what consumes them, and "supported" is a statement about the driver and
-// not about the document. A flag switched on with its one consumer switched off
-// therefore validates and is read by nothing — the state the comment on
-// driverStores says that map exists to refuse. It is reported here rather than
-// refused there because it is harmless and it is how a document is staged: an
-// operator who enables the store one deploy before the block has not made an
-// error, and D8 gives all three a second consumer, at which point these rows go.
+// webhooks and apiKeys as supported, because they are consumed by the tools
+// block and, for two of them, by the console, and "supported" is a statement
+// about the driver and not about the document. A flag switched on while every
+// consumer it has is off therefore validates and is read by nothing — the state
+// the comment on driverStores says that map exists to refuse. It is reported
+// here rather than refused there because it is harmless and it is how a
+// document is staged: an operator who enables the store one deploy before the
+// block has not made an error. The admin console is the second consumer of two
+// of the three: its routes mint and revoke API keys and manage webhook
+// subscriptions (admin.go, adminOptions hands both stores to the core), so with
+// the console mounted those two flags are read whatever the tools block says,
+// and only telemetry — which reaches a route through ToolsOptions alone — is
+// still inert with the block off.
 func toolsKnobGaps(cfg *config.Config) []knobGap {
 	var gaps []knobGap
 	inert := func(flag string, on bool, consumer, remedy string) {
 		if on {
 			gaps = append(gaps, knobGap{
 				Path:    "stores.enable." + flag,
-				Problem: "the store is switched on and nothing in this build reads it: its only consumer is " + consumer,
+				Problem: "the store is switched on and nothing in this build reads it: its only consumers are " + consumer,
 				Remedy:  remedy,
 			})
 		}
 	}
+	consoleMounted := httpConfig(cfg).AdminMounted()
 	if !cfg.Tools.Enabled {
-		const remedy = "set tools.enabled: true to use it, or leave it set for the admin console (D8); until then it costs nothing and does nothing"
-		inert("apiKeys", cfg.Stores.Enable.APIKeys, "the tools guard under tools.auth: apiKey, and tools.enabled is off", remedy)
-		inert("telemetry", cfg.Stores.Enable.Telemetry, "the tools block, and tools.enabled is off", remedy)
-		inert("webhooks", cfg.Stores.Enable.Webhooks, "the tools block, and tools.enabled is off", remedy)
+		const remedy = "set tools.enabled: true to use it, or turn the flag off; until then it costs nothing and does nothing"
+		if !consoleMounted {
+			inert("apiKeys", cfg.Stores.Enable.APIKeys,
+				"the tools guard under tools.auth: apiKey and the admin console's key routes, and tools.enabled is off with no console mounted",
+				"set tools.enabled: true with tools.auth: apiKey to verify keys, or admin.enabled: true to mint them; until then it costs nothing and does nothing")
+			inert("webhooks", cfg.Stores.Enable.Webhooks,
+				"the tools block's fan-out and the admin console's subscription routes, and tools.enabled is off with no console mounted",
+				"set tools.enabled: true to deliver to subscriptions, or admin.enabled: true to manage them; until then it costs nothing and does nothing")
+		}
+		inert("telemetry", cfg.Stores.Enable.Telemetry, "the tools block's track, bridge and query, and tools.enabled is off", remedy)
 		return gaps
 	}
-	if cfg.Tools.Auth != config.ToolsAuthAPIKey {
+	if cfg.Tools.Auth != config.ToolsAuthAPIKey && !consoleMounted {
 		inert("apiKeys", cfg.Stores.Enable.APIKeys,
-			fmt.Sprintf("the tools guard under tools.auth: %s, and tools.auth is %q", config.ToolsAuthAPIKey, cfg.Tools.Auth),
-			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or leave it set for the admin console (D8)")
+			fmt.Sprintf("the tools guard under tools.auth: %s and the admin console's key routes, and tools.auth is %q with no console mounted", config.ToolsAuthAPIKey, cfg.Tools.Auth),
+			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or admin.enabled: true to mint keys through the console")
 	}
 	mount := toolsPath(cfg)
 	if cfg.Tools.Stream.Enabled {

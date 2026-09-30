@@ -66,8 +66,8 @@ func runBackfillUsers(ctx context.Context, args []string, stdout, stderr *os.Fil
 
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "migrate backfill-users writes the GSI1 user-directory attributes onto every profile\n"+
-			"that lacks them, so that GET <admin>/api/users and the first-user access policy see\n"+
-			"accounts created before the store gained the directory.\n\n"+
+			"that lacks them, so that GET <admin>/api/users sees the accounts created before\n"+
+			"the store gained the directory.\n\n"+
 			"It is idempotent and safe to run while the table is serving: every write is a\n"+
 			"conditional UpdateItem naming the two index attributes and nothing else. Run it\n"+
 			"once per table before turning admin.enabled on.\n\n"+

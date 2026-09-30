@@ -72,14 +72,15 @@ const (
 	// refuses an enabled tools block that never says tools.auth, because the
 	// only value silence could resolve to is the reference's — no guard at all
 	// — and the imported core declined exactly that default on purpose
-	// (tools-router-requires-an-explicit-guard-decision). It is not in the §2
-	// table for the reason RS-13 is not: the table was extracted from a
-	// reference whose router is open when the host passes no middleware, so
-	// there was nothing to number. docs/spec/decisions.md D-21 records it.
+	// (tools-router-requires-an-explicit-guard-decision). The §2 table was
+	// extracted from a reference whose router is open when the host passes no
+	// middleware, so there was nothing to number there; the row it has now was
+	// written from this rule, as RS-13's was. docs/spec/decisions.md D-21
+	// records it.
 	RuleToolsAuthUnset = "RS-16"
 
-	// RS-14 to RS-16 belong to the tools block (D9a), which numbered them first
-	// and lands beside this one; the admin surface takes the two after them.
+	// RS-14 to RS-16 are the tools block's, above: D9a numbered them first,
+	// so the admin surface takes the two after them.
 	//
 	// RuleFirstUserRandomIDs refuses admin.accessPolicy: first-user on every
 	// driver, because the policy's premise does not hold here. The reference

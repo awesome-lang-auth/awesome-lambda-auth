@@ -809,6 +809,9 @@ func ttl(d *diagnostics, path string, v Duration, required bool) {
 //   - http.apiPrefix itself: the same happens to the api prefix — a misspelled
 //     or wrong-method auth request stops being the mux's own 404 or 405 and
 //     becomes that router's 404.
+//   - above http.apiPrefix (/api under /api/auth): the same, for every path
+//     under the prefix, and the CORS exemption a subtree mount beside the
+//     prefix gets would take the auth routes out of the CORS layer with it.
 //   - equal to, above or below the other subtree mount: equal is a duplicate
 //     ServeMux pattern, which is a panic inside the adapter at cold start with a
 //     stack trace and no knob named; nested is one router swallowing part of the
@@ -847,6 +850,12 @@ func validateMounts(c *Config, d *diagnostics) {
 			d.errf("", m.knob,
 				fmt.Sprintf("%q is http.apiPrefix itself, so this router would answer every path under the api prefix that no auth route claims", m.raw),
 				fmt.Sprintf("mount it beside the prefix (%s) or below it (%s%s)", Defaults().mountDefault(m.knob), prefix, Defaults().mountDefault(m.knob)))
+		default:
+			if m.mount != "/" && strings.HasPrefix(prefix, m.mount+"/") {
+				d.errf("", m.knob,
+					fmt.Sprintf("%q is above http.apiPrefix %q, so this router would answer every path under the api prefix that no auth route claims, and the CORS exemption this router's mount gets (cmd/auth corsExemptMounts) would lift the CORS layer from every auth route as well", m.raw, prefix),
+					fmt.Sprintf("mount it beside the prefix (%s) or below it (%s%s)", Defaults().mountDefault(m.knob), prefix, Defaults().mountDefault(m.knob)))
+			}
 		}
 	}
 	if len(mounts) == 2 {
