@@ -1,7 +1,7 @@
 import { Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
-import { AuthService } from 'ng-awesome-node-auth';
+import { AuthService } from '@awesome-lang-auth/angular';
 
 @Component({
   selector: 'app-register',

@@ -1,22 +1,21 @@
 import { Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { AuthService } from 'ng-awesome-node-auth';
+import { AuthService } from '@awesome-lang-auth/angular';
 
 /**
  * Iscrizione e disattivazione del TOTP.
  *
- * Due asimmetrie che questo demo rende visibili invece di nascondere:
+ * Il port non manda `qrCode` — è una deviazione registrata
+ * (`totp-setup-omits-qrcode`): un encoder QR non sta né nella stdlib né in
+ * golang.org/x/crypto, quindi tocca al client disegnarlo. La reference
+ * protegge il proprio rendering con `if (setupData.qrCode)` e degrada al
+ * segreto scritto a mano.
  *
- * 1. Il port non manda `qrCode` — è una deviazione registrata
- *    (`totp-setup-omits-qrcode`): un encoder QR non sta né nella stdlib né in
- *    golang.org/x/crypto, quindi tocca al client disegnarlo. La reference
- *    protegge il proprio rendering con `if (setupData.qrCode)` e degrada al
- *    segreto scritto a mano, che è esattamente ciò che si vede qui.
- *
- * 2. Il server manda `otpauthUrl`, da cui un QR si genererebbe, ma
- *    `AuthService.setup2fa()` mappa solo `secret` e `qrCode` e lo scarta per
- *    strada. Attraverso la libreria quel campo è irraggiungibile: è una lacuna
- *    di ng-awesome-node-auth, non del port.
+ * Il server manda `otpauthUrl`, da cui un QR si genera. Fino a
+ * ng-awesome-node-auth 1.9 `AuthService.setup2fa()` lo scartava per strada
+ * (ng#7); @awesome-lang-auth/angular 1.10.0 lo espone, e il demo lo mostra
+ * accanto al segreto, da incollare in un'app di autenticazione o in un
+ * generatore di QR. Il demo non aggiunge un encoder QR suo.
  *
  * I nomi dei campi sono asimmetrici anche lato server e la libreria lo
  * nasconde bene: `/2fa/verify-setup` vuole `token` e `secret`, `/2fa/verify`
@@ -41,9 +40,13 @@ import { AuthService } from 'ng-awesome-node-auth';
     } @else {
       <p>Aggiungi questo segreto alla tua app di autenticazione, poi conferma con un codice.</p>
       <p class="secret"><code>{{ secret() }}</code></p>
+      @if (otpauthUrl()) {
+        <p>URI di provisioning:</p>
+        <p class="secret"><code>{{ otpauthUrl() }}</code></p>
+      }
       <p class="note">
-        Nessun QR: il port non invia <code>qrCode</code> (deviazione registrata) e la
-        libreria non espone <code>otpauthUrl</code>, quindi il segreto va inserito a mano.
+        Nessun QR: il port non invia <code>qrCode</code> (deviazione registrata), quindi
+        il segreto va inserito a mano, oppure l'URI incollato in un generatore di QR.
       </p>
       <form (ngSubmit)="confirm()">
         <label>
@@ -70,6 +73,7 @@ export class TwoFactorPage {
 
   code = '';
   readonly secret = signal('');
+  readonly otpauthUrl = signal('');
   readonly busy = signal(false);
   readonly message = signal('');
   readonly failed = signal(false);
@@ -84,6 +88,7 @@ export class TwoFactorPage {
         return;
       }
       this.secret.set(res.secret);
+      this.otpauthUrl.set(res.otpauthUrl ?? '');
     });
   }
 
@@ -96,6 +101,7 @@ export class TwoFactorPage {
         return;
       }
       this.secret.set('');
+      this.otpauthUrl.set('');
       this.code = '';
       this.failed.set(false);
       this.message.set('TOTP attivato.');

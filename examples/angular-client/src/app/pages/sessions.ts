@@ -1,5 +1,5 @@
 import { Component, OnInit, inject, signal } from '@angular/core';
-import { AuthService, SessionInfo } from 'ng-awesome-node-auth';
+import { AuthService, SessionInfo } from '@awesome-lang-auth/angular';
 
 /**
  * Elenco delle sessioni attive e revoca per handle.

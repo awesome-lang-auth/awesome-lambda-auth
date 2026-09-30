@@ -1,6 +1,6 @@
 import { ApplicationConfig } from '@angular/core';
 import { provideRouter, withComponentInputBinding } from '@angular/router';
-import { provideAuth } from 'ng-awesome-node-auth';
+import { provideAuth } from '@awesome-lang-auth/angular';
 import { routes } from './app.routes';
 
 /**

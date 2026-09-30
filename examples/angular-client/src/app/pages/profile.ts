@@ -1,5 +1,5 @@
 import { Component, inject, signal } from '@angular/core';
-import { AuthService } from 'ng-awesome-node-auth';
+import { AuthService } from '@awesome-lang-auth/angular';
 
 /**
  * Il profilo che `GET /me` restituisce, mostrato campo per campo.

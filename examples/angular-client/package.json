@@ -15,7 +15,7 @@
     "@angular/forms": "^21.2.4",
     "@angular/platform-browser": "^21.2.4",
     "@angular/router": "^21.2.4",
-    "ng-awesome-node-auth": "^1.9.0",
+    "@awesome-lang-auth/angular": "^1.10.0",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0"
   },
