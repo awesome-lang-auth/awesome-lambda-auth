@@ -4,7 +4,7 @@ I client ufficiali della famiglia, **non modificati**, puntati a uno stack `awes
 
 | | libreria | trasporto |
 |---|---|---|
-| [`angular-client/`](angular-client/) | `ng-awesome-node-auth` da npm | cookie di sessione |
+| [`angular-client/`](angular-client/) | [`@awesome-lang-auth/angular`](https://github.com/awesome-lang-auth/awesome-angular-auth) da npm | cookie di sessione |
 | [`flutter-client/`](flutter-client/) | `awesome_node_auth_flutter` da pub.dev | cookie su web, bearer su Android |
 
 ## Perché esistono
