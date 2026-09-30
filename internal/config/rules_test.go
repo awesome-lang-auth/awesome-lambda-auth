@@ -500,6 +500,35 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage:        "tools.inboundWebhooks.enabled: false",
 		},
 		{
+			// RS-15 since D9d: the remedy names the knob that satisfies it,
+			// not only the one that switches the route off.
+			name: "RS-15 names the script runner as the remedy",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", true)
+				set(doc, "stores.enable.webhooks", true)
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsInboundWebhooks,
+			wantPath:           "tools.inboundWebhooks.enabled",
+			wantMessage:        "tools.inboundWebhooks.scriptRunnerFunction",
+		},
+		{
+			// A runner that is not a function name: shape only, the one
+			// thing a cold start can check without calling it.
+			name: "a script runner name with whitespace in it",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.scriptRunnerFunction", "my runner")
+				set(doc, "stores.enable.webhooks", true)
+			},
+			allowUnimplemented: true,
+			wantPath:           "tools.inboundWebhooks.scriptRunnerFunction",
+			wantMessage:        "whitespace",
+		},
+		{
 			// The apiKey posture verifies every key against the API-key store,
 			// so a posture with no store behind it is a guard nobody can pass.
 			name: "the apiKey posture with the API-key store disabled",

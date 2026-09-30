@@ -597,6 +597,15 @@ type InboundWebhooks struct {
 	// ScriptTimeoutMs bounds the sandboxed mapping script; the reference
 	// hardcodes 5000 (src/router/tools.router.ts:289).
 	ScriptTimeoutMs int `json:"scriptTimeoutMs"`
+	// ScriptRunnerFunction names the Lambda that runs the mapping scripts
+	// (D9d): a function name or ARN, invoked synchronously by the auth
+	// function across the core's InboundScriptRunner seam. [new] — the
+	// reference evaluates the script in an in-process vm and has nothing to
+	// name; the imported core evaluates nothing, so a deployment that mounts
+	// the inbound route has to say where its scripts run, and RS-15 refuses one
+	// that does not. The SAM template sets it to its own ScriptRunnerFunction;
+	// a deployment that runs the function elsewhere names that one here.
+	ScriptRunnerFunction string `json:"scriptRunnerFunction"`
 }
 
 // OutboundWebhooks covers tools.outboundWebhooks.*.

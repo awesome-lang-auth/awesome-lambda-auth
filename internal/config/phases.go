@@ -202,7 +202,8 @@ type domain struct {
 // `tools.sse.distributor.type` and `tools.inboundWebhooks.enabled` are
 // *refused* (RS-14, RS-15), because a document that names a distributor or
 // mounts the inbound route asks for something this build cannot be, and the
-// failure of pretending is silent in both cases. Neither is a phase gap: the
+// failure of pretending is silent in both cases — RS-15 since D9d only when
+// no tools.inboundWebhooks.scriptRunnerFunction names the runner. Neither is a phase gap: the
 // domain is wired, and a rule with a number is what a knob a later block
 // makes live gets in the meantime.
 //
