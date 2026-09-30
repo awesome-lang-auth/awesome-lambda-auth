@@ -1067,6 +1067,33 @@ func TestTheSseFunctionIsASubsetOfTheAuthFunction(t *testing.T) {
 			t.Errorf("SseFunction's role grants %s; nothing on the stream path needs it", forbidden)
 		}
 	}
+	// The one write, UpdateItem, is the API-key lastUsedAt stamp: its own
+	// policy, present only under the apiKey posture, held by LeadingKeys to the
+	// canonical API-key records (api_keys.go, UpdateLastUsed writes
+	// PK=APIKEY#<prefix>). UpdateItem creates a missing item, so anywhere else
+	// on this internet-facing function it would be a write to any partition.
+	if n := strings.Count(sse.body, "dynamodb:UpdateItem"); n != 1 {
+		t.Errorf("SseFunction grants dynamodb:UpdateItem %d times, want once, in SseApiKeyLastUsed", n)
+	}
+	if i := strings.Index(sse.body, "Sid: SseApiKeyLastUsed"); i < 0 {
+		t.Error("SseFunction has no SseApiKeyLastUsed statement")
+	} else {
+		before, stmt := sse.body[:i], sse.body[i:]
+		if end := strings.Index(stmt, "- !Ref 'AWS::NoValue'"); end >= 0 {
+			stmt = stmt[:end]
+		}
+		for _, want := range []string{"dynamodb:UpdateItem", "ForAllValues:StringLike:", "dynamodb:LeadingKeys:", "'APIKEY#*'"} {
+			if !strings.Contains(stmt, want) {
+				t.Errorf("SseApiKeyLastUsed lacks %s: the write must be held to the API-key records", want)
+			}
+		}
+		if j := strings.LastIndex(before, "- !If"); j < 0 || !strings.HasPrefix(strings.TrimSpace(before[j+len("- !If"):]), "- ToolsAuthApiKey") {
+			t.Error("SseApiKeyLastUsed is not under !If [ToolsAuthApiKey, …]: a stack on the session posture would still hold the write")
+		}
+		if strings.Contains(before, "dynamodb:UpdateItem") {
+			t.Error("dynamodb:UpdateItem is granted before SseApiKeyLastUsed, outside its condition")
+		}
+	}
 
 	for name, want := range map[string]string{"SseMemorySize": "128", "SseTimeout": "900", "SseReservedConcurrency": "'20'", "EnableSse": "'false'"} {
 		if got := tpl.parameters[name].fields["Default"]; got != want {

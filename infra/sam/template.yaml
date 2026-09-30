@@ -3420,11 +3420,19 @@ Resources:
       # internet-facing with no API Gateway in front of it, so it holds what
       # the stream path does and no more. GetItem, Query and BatchGetItem are
       # the guard (the session check, the user, the API key) and the event
-      # log's poll; UpdateItem is the core's API-key lastUsedAt stamp
-      # (data-model.md §1.5 #51), which the apiKey posture performs on every
-      # connection. No PutItem and no DeleteItem: nothing on the stream path
+      # log's poll. No PutItem and no DeleteItem: nothing on the stream path
       # writes an item, and a cold start that tried to — a ConfigFile seeding
       # runtime settings — fails here rather than being granted the write.
+      #
+      # The one write is its own statement, SseApiKeyLastUsed: the core's
+      # API-key lastUsedAt stamp, which the apiKey posture performs on a
+      # connect (data-model.md §1.5 #51, throttled to once a minute a key by
+      # its condition). It exists only under ToolsAuth=apiKey, and its
+      # LeadingKeys condition holds it to the canonical API-key records,
+      # PK=APIKEY#<prefix> — the item UpdateLastUsed writes (api_keys.go) —
+      # because UpdateItem creates an item that is missing, and granted on the
+      # whole table it would let this public function write any partition:
+      # users, sessions, roles, rate-limit counters.
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -3434,13 +3442,28 @@ Resources:
                 - dynamodb:GetItem
                 - dynamodb:Query
                 - dynamodb:BatchGetItem
-                - dynamodb:UpdateItem
               Resource: !GetAtt AuthTable.Arn
             - Sid: SseTableIndexQuery
               Effect: Allow
               Action:
                 - dynamodb:Query
               Resource: !Sub '${AuthTable.Arn}/index/GSI1'
+        # A policy of its own under !If, the shape the delivery webhook's grant
+        # uses, so that a stack on the session posture carries no write at all.
+        - !If
+          - ToolsAuthApiKey
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: SseApiKeyLastUsed
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AuthTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'APIKEY#*'
+          - !Ref 'AWS::NoValue'
         - Version: '2012-10-17'
           Statement:
             - Sid: ReadSigningSecrets
