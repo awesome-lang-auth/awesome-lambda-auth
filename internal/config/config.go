@@ -603,6 +603,18 @@ type InboundWebhooks struct {
 type OutboundWebhooks struct {
 	PayloadVersion string                  `json:"payloadVersion"`
 	Defaults       OutboundWebhookDefaults `json:"defaults"`
+
+	// QueueURL (D9b) is the SQS queue outgoing webhooks are enqueued on
+	// instead of being POSTed in process.
+	//
+	// [new] — the reference delivers in process and has no transport knob
+	// (webhook-sender.ts:36). Empty, the default, keeps the core's in-process
+	// HTTP deliverer, which on Lambda races the response (deviation
+	// outgoing-webhook-delivery-races-the-response); set, the auth function
+	// enqueues each signed attempt and cmd/webhook-worker delivers it on the
+	// reference's schedule. The SAM template sets it from EnableWebhookQueue.
+	// docs/config-reference.md §17.4 says which deliverer is in force.
+	QueueURL string `json:"queueUrl"`
 }
 
 // OutboundWebhookDefaults covers tools.outboundWebhooks.defaults.*; per-webhook

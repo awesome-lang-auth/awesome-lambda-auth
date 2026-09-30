@@ -636,6 +636,18 @@ func validateTools(c *Config, d *diagnostics) {
 			"use 3, the reference's per-webhook default")
 	}
 	atLeast(d, "tools.outboundWebhooks.defaults.retryDelayMs", c.Tools.OutboundWebhooks.Defaults.RetryDelayMs, 100)
+	// D9b. An SQS queue URL is https://sqs.<region>.amazonaws.com/<account>/<name>;
+	// only its shape is checked, because the region and the account are the
+	// template's to supply and a mistyped one is SendMessage's to refuse. The
+	// value is echoed: a queue URL is an address, not a capability — sending
+	// to it needs sqs:SendMessage on the queue.
+	if raw := strings.TrimSpace(c.Tools.OutboundWebhooks.QueueURL); raw != "" {
+		if u, err := url.Parse(raw); err != nil || u.Scheme != "https" || u.Host == "" || strings.Trim(u.Path, "/") == "" {
+			d.errf("", "tools.outboundWebhooks.queueUrl",
+				fmt.Sprintf("%q is not an https SQS queue URL", raw),
+				"use the queue's URL as SQS reports it, https://sqs.<region>.amazonaws.com/<account>/<name>, or leave it empty to deliver in process")
+		}
+	}
 }
 
 func validateRateLimit(c *Config, d *diagnostics) {
