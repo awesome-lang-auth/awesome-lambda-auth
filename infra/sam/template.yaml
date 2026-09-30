@@ -1597,6 +1597,20 @@ Rules:
   # hash is a root login that is served and can never succeed; the function
   # refuses it at cold start too (cmd/auth/admin.go, checkAdminRootUser), but
   # a Rule refuses it before anything is touched.
+  # D9b. Parameter-only: EnableTools is always set by this template and a
+  # ConfigFile cannot turn the block on, so a queue asked for without the
+  # block is knowably a queue nothing would fill. WebhookQueueEnabled ANDs
+  # the two and would silently create nothing; this says so instead.
+  WebhookQueueNeedsTheToolsBlock:
+    RuleCondition: !Equals [!Ref EnableWebhookQueue, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref EnableTools, 'true']
+        AssertDescription: >-
+          EnableWebhookQueue is "true", but EnableTools is "false": outgoing
+          webhooks are fanned out by the tools block, so without it nothing
+          would ever be enqueued and no queue is created. Set EnableTools to
+          "true", or EnableWebhookQueue to "false".
+
   AdminRootUserNeedsItsPasswordHash:
     RuleCondition: !Not [!Equals [!Ref AdminRootEmail, '']]
     Assertions:

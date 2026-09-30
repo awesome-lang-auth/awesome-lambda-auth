@@ -473,6 +473,13 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 	if got := tpl.parameters["EnableWebhookQueue"].fields["Default"]; got != "'false'" {
 		t.Errorf("EnableWebhookQueue defaults to %s, want 'false'", got)
 	}
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "WebhookQueueNeedsTheToolsBlock:") {
+		t.Error("the Rule refusing EnableWebhookQueue without EnableTools is gone; the stack would silently create nothing")
+	}
 
 	for _, name := range []string{"WebhookQueue", "WebhookDLQ"} {
 		q := tpl.resources[name]
