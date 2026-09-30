@@ -390,6 +390,12 @@ func (w *statusWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the writer beneath for what this
+// wrapper does not implement — in the SSE function (D9c), the write deadline
+// the core's SseManager sets on every frame, which the streaming writer
+// honours and which would otherwise stop here as "not supported".
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // accessLog emits one line per request.
 //
 // What is logged is the whole list: method, path, status, duration and response

@@ -191,6 +191,10 @@ type App struct {
 
 	adapter *lambdahttp.Adapter
 	tools   *toolsWiring
+
+	// stream is the SSE function's entry point (D9c, stream.go): the same
+	// composition, serving GET <tools>/stream alone over a Function URL.
+	stream bool
 }
 
 // Close releases what a cold start subscribed: today the bridge between the
@@ -236,6 +240,14 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// the property holds for a fifth without anyone remembering it. See
 	// correlatingClient: it copies, so Options.HTTPClient is not mutated.
 	opts.HTTPClient = correlatingClient(opts.HTTPClient)
+
+	// D9c: which function this process is — the auth function, or the SSE
+	// function serving the stream alone (stream.go). Read first, because an
+	// unknown value is a deployment that would serve the wrong contract.
+	stream, err := streamEntrypoint(getenv)
+	if err != nil {
+		return nil, err
+	}
 
 	doc, err := loadDocument(getenv, readFile)
 	if err != nil {
@@ -390,6 +402,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// D9c: the SSE function mounts the tools router with the stream on and
+	// everything else off, and the resume hook inside the guard (stream.go).
+	if stream {
+		if toolsOpts, err = streamToolsOptions(cfg, tools, toolsOpts, log); err != nil {
+			return nil, err
+		}
+	}
 	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
 		return nil, err
 	}
@@ -398,6 +417,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logAdminSurface(cfg, httpConfig(cfg), log)
 	logToolsSurface(cfg, tools, log)
 	logScriptRunnerSurface(cfg, tools, log) // D9d
+	logStreamSurface(cfg, tools, stream, log)
 
 	// The middleware chain is one function, assembleHandler, so that the test
 	// harness (admin_test.go newAdminSurface) builds the very chain New builds
@@ -410,7 +430,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, log), newInboundWebhookLimiter(cfg, counter, log)
 	handler := assembleHandler(cfg, log, mux, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
 
-	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools}
+	// D9c: the SSE function's Function URL answers GET <tools>/stream and
+	// nothing else, and the gate is the outermost handler (stream.go,
+	// streamOnly): a refused request never reaches the CORS layer, which would
+	// answer a preflight 204 for a route this function does not serve, nor the
+	// access log, whose line is the largest part of what an anonymous request
+	// costs on a URL nothing throttles, nor the console's login limiter, which
+	// spends the shared counter.
+	if stream {
+		handler = streamOnly(cfg, handler)
+	}
+
+	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools, stream: stream}
 	if tools != nil {
 		app.Tools = tools.tools
 		app.Events = tools.bus

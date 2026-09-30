@@ -741,9 +741,11 @@ Parameters:
       session reads the STORE-WIDE telemetry (every identity.* event the
       bridge records, emails, IP addresses, user agents and session ids
       included), attributes tracked events to any userId in the body and so
-      fires signed outgoing webhooks, and notifies any topic
-      (docs/config-reference.md §17.6). A cookie caller is held to the CSRF
-      double-submit; a bearer caller is not. The reference's default, "none",
+      fires signed outgoing webhooks, and notifies any topic; with EnableSse it
+      also opens GET <ToolsBasePath>/stream, whose global topic carries every
+      identity event's full record live and replays the event log's retention
+      on a hand-written cursor (docs/config-reference.md §17.6). A cookie
+      caller is held to the CSRF double-submit; a bearer caller is not. The reference's default, "none",
       is not offered here and is not reachable through this template at all:
       this variable is set whenever EnableTools is "true", and the
       environment layer overrides ConfigFile, so a document's tools.auth is
@@ -1015,6 +1017,105 @@ Parameters:
       the token and never consults the session store, so a revoked session's
       access token, and the console's own 24-hour admin token, stay admin
       credentials until they expire.
+
+  # -----------------------------------------------------------------------
+  # D9c: the SSE function — GET <ToolsBasePath>/stream on a Lambda Function
+  # URL with response streaming (docs/sse.md, docs/config-reference.md §17.3).
+  #
+  # Off by default, and off means no resource and no bill: with EnableSse
+  # "false" the function, its URL, its two permissions, its log group, its
+  # alarm and the CloudFront behaviour are all conditioned away, and neither
+  # function's environment changes.
+  #
+  # It is the auth function's own artifact started with a second entry point
+  # (AWESOME_AUTH_ENTRYPOINT=stream, cmd/auth/stream.go), so it verifies the
+  # same tokens, performs the same session check and applies the same
+  # ToolsAuth guard, from the same configuration; its environment below is a
+  # subset of AuthFunction's, value for value, which template_test.go pins.
+  # With it on, the auth function's SSE manager writes every broadcast to the
+  # event log in the table (tools.sse.distributor.type: dynamodb), and this
+  # function follows the log for the one connection each of its execution
+  # environments holds.
+  #
+  # THE CONNECTION IS THE UNIT OF COST (docs/cost-model.md §3.1): one held
+  # stream is one execution environment billed for as long as it is open,
+  # whether or not anything is sent. The three numbers below are the
+  # decision, and each is argued where it is declared.
+  # -----------------------------------------------------------------------
+
+  EnableSse:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Deploy the SSE function and give GET <ToolsBasePath>/stream a transport:
+      a Function URL (AuthType NONE, the handler's own ToolsAuth guard is the
+      gate) and, with EnableCloudFront, a behaviour on the distribution for the
+      same path. Requires EnableTools. Costs nothing at rest; a held connection
+      costs USD 0.006 an hour at the default 128 MB (docs/cost-model.md §3.1).
+
+  # 128 MB, the floor, because an idle stream needs no CPU: login is at 512 MB
+  # for bcrypt, and a connection at that size pays four times over for cycles it
+  # never uses — memory is the multiplier on the dominant line of the bill. The
+  # price is the cold start, which runs the whole composition at a fraction of
+  # a vCPU; it is paid once per execution environment, at connect.
+  SseMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 1024
+    Description: >-
+      Memory of the SSE function, in MB. Every held connection is billed at this
+      size for its whole life; 128 is the cheapest Lambda offers.
+
+  # Fifteen minutes is Lambda's ceiling and therefore the longest a connection
+  # segment can be: the stream ends five seconds before it (the request context
+  # is cancelled first so the response closes cleanly), and EventSource
+  # reconnects with Last-Event-ID. Shorter is cheaper when clients vanish
+  # without closing — an invocation whose client has gone is billed until it
+  # ends — and costs a reconnect and a replay Query per topic per segment.
+  SseTimeout:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+    Description: >-
+      Seconds. The longest one stream segment lives before the client
+      reconnects. 900 is Lambda's maximum.
+
+  # The ceiling before money. One stream holds one execution environment, so
+  # this is the number of simultaneous listeners, and at 128 MB it bounds the
+  # stream's compute at 20 x USD 0.006 = USD 0.12 an hour, USD 2.88 a day, about
+  # USD 88 a month if every slot were held around the clock. It also keeps the
+  # listeners out of the account pool the auth function draws from, so a crowd
+  # of streams cannot throttle a login. It caps the compute, not the bill: the
+  # poll's reads grow with the events a listener is sent, and refused requests
+  # share these slots (docs/cost-model.md §3.1). Past it a new connection is
+  # refused with 429, which a native EventSource does not retry — it fails on
+  # any status but 200 — so the page has to recreate it; SseConcurrencyAlarm
+  # says so first.
+  # Empty means no reservation, as ReservedConcurrentExecutions does; 0 is a
+  # real value and refuses every connection.
+  SseReservedConcurrency:
+    Type: String
+    Default: '20'
+    AllowedPattern: '^$|^[0-9]{1,5}$'
+    ConstraintDescription: >-
+      SseReservedConcurrency must be a whole number of execution environments,
+      or empty for no reservation.
+    Description: >-
+      Simultaneous SSE connections the stack will hold, and so the cap on the
+      stream's compute (not its reads, nor refused requests, which share the
+      slots). Reserved out of the account's concurrency pool.
+
+  SseConcurrencyAlarmThreshold:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    Description: >-
+      Alarm when this many streams have been held for fifteen minutes — three
+      quarters of the default SseReservedConcurrency, so the alarm arrives
+      before the reservation starts refusing listeners.
 
   # -----------------------------------------------------------------------
   # Content delivery. The hosted UI is served by the function, from assets
@@ -1487,6 +1588,17 @@ Conditions:
   HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
   HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
 
+  # D9c: the SSE function. SseEnabled carries ToolsEnabled as a term as well as
+  # the Rule below, so that a stack which somehow bypassed the Rule still
+  # creates nothing rather than a function whose cold start refuses. Its one
+  # alarm is gated on the function's own switch as well as on EnableAlarms, so
+  # a stack without SSE does not carry it (template_test.go counts the alarms
+  # enabled by default).
+  SseEnabled: !And [!Equals [!Ref EnableSse, 'true'], !Condition ToolsEnabled]
+  SseBehindCloudFront: !And [!Condition SseEnabled, !Condition CloudFrontEnabled]
+  HasSseReservedConcurrency: !Not [!Equals [!Ref SseReservedConcurrency, '']]
+  SseAlarmsEnabled: !And [!Condition AlarmsEnabled, !Condition SseEnabled]
+
   # The admin console. The switch gates every admin variable, the root user's
   # pair included: HasAdminRootPasswordHash carries the switch as its first
   # term, so a console turned off leaves no root-user variable behind and no
@@ -1688,6 +1800,19 @@ Rules:
           distribution would keep its *.cloudfront.net name and present the default
           certificate — the one you supplied would be attached to nothing. Set the
           domains, or clear the ARN.
+
+  # D9c. Parameter-only: the SSE function streams the tools block's events and
+  # this template is what switches that block on, so the pairing is knowable
+  # here — and a stream with no tools block is a function whose cold start
+  # refuses, billed once per EventSource retry.
+  SseNeedsTheToolsBlock:
+    RuleCondition: !Equals [!Ref EnableSse, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref EnableTools, 'true']
+        AssertDescription: >-
+          EnableSse needs EnableTools: the stream carries the tools block's
+          events (tracked, notified and bridged), and without the block there is
+          no event bus, no SSE manager and no event log to follow.
 
   # Both notification parameters name the same thing, and honouring one silently
   # over the other is how an operator ends up watching a topic nothing publishes
@@ -2330,6 +2455,15 @@ Resources:
           AWESOME_AUTH_STORES_MIGRATION_REGION: !If [MigratingFromCognito, !Ref CognitoRegion, !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID: !If [HasCognitoAppClient, !Ref CognitoAppClientId, !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_MIGRATION_MODE: !If [MigratingFromCognito, !Ref CognitoMigrationMode, !Ref 'AWS::NoValue']
+
+          # --- SSE, the publishing half (D9c) ----------------------------
+          # With EnableSse the manager is built and distributes through the
+          # event log in the table, so every broadcast is one PutItem per
+          # topic a stream can hold (docs/cost-model.md §3.1) and the SSE
+          # function below delivers it. Without it neither is set and the
+          # function is the function it was.
+          AWESOME_AUTH_SSE_ENABLED: !If [SseEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE: !If [SseEnabled, 'dynamodb', !Ref 'AWS::NoValue']
 
           # --- admin console ---------------------------------------------
           # Every variable here is absent while EnableAdminConsole is
@@ -3196,6 +3330,219 @@ Resources:
                 aws:SecureTransport: 'false'
 
   # ---------------------------------------------------------------------
+  # The SSE function (D9c) — see the EnableSse parameter for what it is and
+  # docs/sse.md for what it promises.
+  #
+  # ---- the log group, by the convention above ---------------------------
+  # ---------------------------------------------------------------------
+
+  SseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: SseEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-sse'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # The auth function's artifact, not a second one: the stream is the same
+  # composition with a different runtime contract (cmd/auth/stream.go says why
+  # a separate binary would have been a second, untestable copy of it), so
+  # CodeUri is the same zip and the 12 MiB budget is the one CI already checks.
+  #
+  # The environment is the subset of AuthFunction's that the stream path reads
+  # — deployment, store, prefix and CORS, cookies and CSRF, the session check,
+  # resource-server mode, the tools block, the SSE pair, the document, the two
+  # signing secrets — copied line for line, plus the entry point.
+  # template_test.go TestTheSseFunctionIsASubsetOfTheAuthFunction fails the day
+  # one of them differs. What is left out is what the stream never reaches:
+  # mail, SMS, the claims webhook, OAuth, the identity provider, the migration
+  # source, the admin console and uploads. A ConfigFile that switches the
+  # identity provider on reaches this function too, whose role holds no KMS
+  # grant: its cold start then fails, loudly, which is the direction to fail.
+  SseFunction:
+    Type: AWS::Serverless::Function
+    Condition: SseEnabled
+    DependsOn: SseLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-sse'
+      Description: !Sub 'awesome-lambda-auth SSE stream for ${AWS::StackName}'
+      CodeUri: ../../dist/auth-lambda.zip
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: !Ref SseMemorySize
+      Timeout: !Ref SseTimeout
+      ReservedConcurrentExecutions: !If [HasSseReservedConcurrency, !Ref SseReservedConcurrency, !Ref 'AWS::NoValue']
+      Environment:
+        Variables:
+          AWESOME_AUTH_ENTRYPOINT: stream
+
+          AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT: !Ref DeploymentEnvironment
+          AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL: !If [HasPublicUrl, !Ref PublicUrl, !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_STORES_DRIVER: dynamodb
+          AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME: !Ref AuthTable
+
+          AWESOME_AUTH_HTTP_API_PREFIX: !Ref ApiPrefix
+          AWESOME_AUTH_CORS_ORIGINS: !If [HasAllowedOrigins, !Ref AllowedOrigins, !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_COOKIES_SECURE: 'true'
+          AWESOME_AUTH_COOKIES_SAMESITE: !Ref CookieSameSite
+          AWESOME_AUTH_COOKIES_DOMAIN: !If [HasCookieDomain, !Ref CookieDomain, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_COOKIES_REFRESH_PATH: !If
+            - NeedsStagePrefixedCookiePath
+            - !Sub '/${StageName}${ApiPrefix}/refresh'
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_COOKIES_ALLOW_INSECURE_COOKIE_MODE: !Ref AllowInsecureCookieMode
+          AWESOME_AUTH_CSRF_ENABLED: 'true'
+
+          AWESOME_AUTH_SESSIONS_CHECK_ON: !Ref SessionCheckOn
+
+          AWESOME_AUTH_RS_ENABLED: !Ref EnableResourceServer
+          AWESOME_AUTH_RS_JWKS_URL: !If [ResourceServerEnabled, !Ref ResourceServerJwksUrl, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_RS_ISSUER: !If [HasResourceServerIssuer, !Ref ResourceServerIssuer, !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_TOOLS_ENABLED: !Ref EnableTools
+          AWESOME_AUTH_TOOLS_AUTH: !If [ToolsEnabled, !Ref ToolsAuth, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_BASE_PATH: !If [ToolsEnabled, !Ref ToolsBasePath, !Ref 'AWS::NoValue']
+          # The inbound-webhook trio is the auth function's, line for line (D9d):
+          # this function never mounts the route (streamToolsOptions sets
+          # DisableWebhook), but it loads the same document, and RS-15 refuses
+          # the route switched on with no runner named. Naming the runner here
+          # grants nothing: the runner is invoked only by the auth function.
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, !Ref EnableInboundWebhooks, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION: !If [InboundWebhooksEnabled, !Ref ScriptRunnerFunction, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS: !If [InboundWebhooksEnabled, !Ref InboundScriptTimeoutMs, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_ENABLE_TELEMETRY: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_ENABLE_WEBHOOKS: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_ENABLE_API_KEYS: !If [ToolsAuthApiKey, 'true', !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_SSE_ENABLED: !If [SseEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE: !If [SseEnabled, 'dynamodb', !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_CONFIG_FILE: !If [HasConfigFile, !Ref ConfigFile, !Ref 'AWS::NoValue']
+
+          AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER: !If
+            - GenerateJwtAccessSecret
+            - !Sub '${JwtSigningSecrets}#accessTokenSecret'
+            - !Ref JwtAccessSecretArn
+          AWESOME_AUTH_JWT_REFRESH_SECRET_SECRETSMANAGER: !If
+            - GenerateJwtRefreshSecret
+            - !Sub '${JwtSigningSecrets}#refreshTokenSecret'
+            - !Ref JwtRefreshSecretArn
+
+      # Narrower than AuthFunction's on purpose: this function is
+      # internet-facing with no API Gateway in front of it, so it holds what
+      # the stream path does and no more. GetItem, Query and BatchGetItem are
+      # the guard (the session check, the user, the API key) and the event
+      # log's poll. No PutItem and no DeleteItem: nothing on the stream path
+      # writes an item, and a cold start that tried to — a ConfigFile seeding
+      # runtime settings — fails here rather than being granted the write.
+      #
+      # The one write is its own statement, SseApiKeyLastUsed: the core's
+      # API-key lastUsedAt stamp, which the apiKey posture performs on a
+      # connect (data-model.md §1.5 #51, throttled to once a minute a key by
+      # its condition). It exists only under ToolsAuth=apiKey, and its
+      # LeadingKeys condition holds it to the canonical API-key records,
+      # PK=APIKEY#<prefix> — the item UpdateLastUsed writes (api_keys.go) —
+      # because UpdateItem creates an item that is missing, and granted on the
+      # whole table it would let this public function write any partition:
+      # users, sessions, roles, rate-limit counters.
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: SseTableReads
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+              Resource: !GetAtt AuthTable.Arn
+            - Sid: SseTableIndexQuery
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${AuthTable.Arn}/index/GSI1'
+        # A policy of its own under !If, the shape the delivery webhook's grant
+        # uses, so that a stack on the session posture carries no write at all.
+        - !If
+          - ToolsAuthApiKey
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: SseApiKeyLastUsed
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AuthTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'APIKEY#*'
+          - !Ref 'AWS::NoValue'
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadSigningSecrets
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !If [GenerateSigningSecrets, !Ref JwtSigningSecrets, !Ref 'AWS::NoValue']
+                - !If [GenerateJwtAccessSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtAccessSecretArn]]]
+                - !If [GenerateJwtRefreshSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtRefreshSecretArn]]]
+
+  # The Function URL, declared rather than left to SAM's FunctionUrlConfig so
+  # that both permissions it needs are in this file where a reader can see them.
+  #
+  # AuthType NONE, and the argument is docs/config-reference.md §17.3's: an
+  # AWS_IAM URL is reachable only through CloudFront's origin access control,
+  # which is off by default, and OAC signs the origin request with SigV4 in the
+  # Authorization header, so a bearer client's own header could not reach the
+  # guard at all. With NONE the gate is the handler's own: the path gate, the
+  # function's outermost handler, 404s everything but GET <ToolsBasePath>/stream,
+  # and then the ToolsAuth guard the auth function applies. Every request that
+  # reaches the URL is an invocation — about USD 0.38 a million for a 404, 0.51
+  # for a guard's refusal, log lines included — bounded in rate by
+  # SseReservedConcurrency and sharing its slots with the listeners
+  # (docs/config-reference.md §17.3.3 prices it, with the mitigations).
+  #
+  # No Cors block: CORS is the product's own layer, applied to this path exactly
+  # as on the auth function (a tools mount beside ApiPrefix is outside it, one
+  # under ApiPrefix inside it — cmd/auth/app.go, corsExemptMounts). Configuring
+  # the URL's as well is how a response ends up with two
+  # Access-Control-Allow-Origin headers, which a browser rejects. The URL's host
+  # is never a page's origin, so with CloudFront off and the mount beside
+  # ApiPrefix (the defaults) no browser page can use the stream; the table of
+  # which client reaches it under which posture and topology is docs/sse.md §2.
+  SseFunctionUrl:
+    Type: AWS::Lambda::Url
+    Condition: SseEnabled
+    Properties:
+      TargetFunctionArn: !GetAtt SseFunction.Arn
+      AuthType: NONE
+      InvokeMode: RESPONSE_STREAM
+
+  # The two grants a public Function URL needs: lambda:InvokeFunctionUrl scoped
+  # to AuthType NONE, and — for URLs created since October 2025 —
+  # lambda:InvokeFunction conditioned on the call arriving through a function
+  # URL, so neither lets anybody invoke the function directly.
+  SseFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: SseEnabled
+    Properties:
+      FunctionName: !Ref SseFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  SseFunctionInvokeViaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: SseEnabled
+    Properties:
+      FunctionName: !Ref SseFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  # ---------------------------------------------------------------------
   # Content delivery
   #
   # One distribution, one origin — this stack's own HTTP API — and no caching
@@ -3370,9 +3717,52 @@ Resources:
               # answering and turns a slow login into a 504 nothing logged.
               OriginReadTimeout: 30
               OriginKeepaliveTimeout: 5
+          # D9c: the SSE function's Function URL, when both are on. The host
+          # is the URL's own (https://<id>.lambda-url.<region>.on.aws/ split
+          # on "/"), because a Function URL answers only to its own Host —
+          # which AuthOriginRequestPolicy, forwarding every viewer header but
+          # Host, leaves CloudFront to set.
+          - !If
+            - SseBehindCloudFront
+            - Id: SseOrigin
+              DomainName: !Select [2, !Split ['/', !GetAtt SseFunctionUrl.FunctionUrl]]
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+                # CloudFront's default and its ceiling without a quota
+                # increase: an origin response that sends nothing for sixty
+                # seconds is cut. The stream's heartbeat is every thirty
+                # (tools.sse.heartbeatIntervalMs), which is what keeps a quiet
+                # stream inside it; the SSE function warns at cold start when
+                # the heartbeat would not.
+                OriginReadTimeout: 60
+                OriginKeepaliveTimeout: 5
+            - !Ref 'AWS::NoValue'
+        # D9c: the stream, and only the stream, goes to the SSE function. The
+        # path is ToolsBasePath's, which is the path the function serves; a
+        # client that hard-codes <apiPrefix>/tools/stream, as the family's
+        # clients do, is served when ToolsBasePath is <apiPrefix>/tools — the
+        # mount those clients' track and notify calls need anyway. Uncached by
+        # the same no-store policy, every viewer header, cookie and query
+        # string forwarded by the same request policy — ?token=,
+        # Last-Event-ID and the access-token cookie among them — and not
+        # compressed, because an edge that compresses a streamed response
+        # holds bytes back to fill its compression window.
+        CacheBehaviors: !If
+          - SseBehindCloudFront
+          - - PathPattern: !Sub '${ToolsBasePath}/stream'
+              TargetOriginId: SseOrigin
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS]
+              CachedMethods: [GET, HEAD]
+              Compress: false
+              CachePolicyId: !Ref AuthCachePolicy
+              OriginRequestPolicyId: !Ref AuthOriginRequestPolicy
+          - !Ref 'AWS::NoValue'
         DefaultCacheBehavior:
           TargetOriginId: HttpApiOrigin
-          # The whole surface is one behaviour on purpose. There is no path
+          # The whole surface is one behaviour on purpose (the stream behaviour
+          # above differs in its origin and nothing else). There is no path
           # under this origin that may be cached (see AuthCachePolicy), so a
           # second behaviour could only differ in ways that are wrong.
           ViewerProtocolPolicy: redirect-to-https
@@ -3799,6 +4189,51 @@ Resources:
         - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
         - !Ref 'AWS::NoValue'
 
+  # ── the SSE function (D9c) ──────────────────────────────────────────
+  #
+  # One alarm, not the per-function four, and it is the one that catches this
+  # function's failure mode: listeners held open. A held stream is billed for
+  # its whole life while answering nothing and erroring nothing, so Errors and
+  # Duration say nothing useful about it (every invocation runs to SseTimeout by
+  # design — a Duration alarm would be permanently in alarm), and Throttles only
+  # moves once SseReservedConcurrency is already refusing listeners, which this
+  # alarm, set below it, reports first. ConcurrentExecutions on this function is
+  # the listener count, a minute behind: the fastest spend signal the stream
+  # has (docs/cost-model.md §4).
+  #
+  # Gated on the function's own switch as well as EnableAlarms, so a stack
+  # without SSE does not have it (docs/cost-model.md §3.3 counts it with the
+  # other optional functions' alarms).
+  #
+  # Fifteen minutes sustained rather than the auth function's five, because a
+  # stream is minutes long by nature: five minutes of fifteen listeners is an
+  # ordinary afternoon, a quarter of an hour of it is a crowd or a leak.
+  SseConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: SseAlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-sse-concurrency'
+      AlarmDescription: >-
+        The SSE function has held this many streams for fifteen minutes. Each is
+        an execution environment billed for as long as it is open; past
+        SseReservedConcurrency new listeners are refused. Check who is holding
+        them before raising the reservation.
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref SseFunction}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 15
+      DatapointsToAlarm: 15
+      Threshold: !Ref SseConcurrencyAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
   # ── the logs ────────────────────────────────────────────────────────
   #
   # The bill retention cannot touch. RetentionInDays bounds what is STORED, at
@@ -4089,6 +4524,48 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-TableName'
 
+  # D9b. Where queued webhooks wait, and where the ones that gave up are.
+  WebhookQueueUrl:
+    Condition: WebhookQueueEnabled
+    Description: SQS queue the auth function enqueues outgoing webhooks on.
+    Value: !Ref WebhookQueue
+  WebhookDeadLetterQueueUrl:
+    Condition: WebhookQueueEnabled
+    Description: >-
+      Dead-letter queue of outgoing webhooks the worker gave up on, kept 14
+      days from the hand-off (less for one SQS redrove itself, which keeps its
+      enqueue time); each message carries DeadLetterReason and, after a
+      refusal, LastStatus. Nothing redelivers from it automatically.
+    Value: !Ref WebhookDLQ
+
+  # D9c. Where a client opens the stream: the distribution's path when
+  # CloudFront is on — same origin as the rest, which is what the family's
+  # clients assume — and the Function URL itself when it is not. The URL is
+  # reported either way, because the contract suite also reads it directly
+  # (AWESOME_AUTH_CONTRACT_SSE_URL) to tell an edge buffering change from a
+  # protocol break.
+  SseFunctionUrl:
+    Condition: SseEnabled
+    Description: >-
+      The SSE function's own Function URL. GET <ToolsBasePath>/stream on it is
+      the stream; every other path and method answers 404.
+    Value: !GetAtt SseFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-SseFunctionUrl'
+
+  SseStreamUrl:
+    Condition: SseEnabled
+    Description: >-
+      The URL an EventSource opens: on the distribution when EnableCloudFront is
+      true, on the Function URL otherwise.
+    Value: !If
+      - SseBehindCloudFront
+      - !Sub 'https://${AuthDistribution.DomainName}${ToolsBasePath}/stream'
+      - !Sub
+        - 'https://${Host}${Path}/stream'
+        - Host: !Select [2, !Split ['/', !GetAtt SseFunctionUrl.FunctionUrl]]
+          Path: !Ref ToolsBasePath
+
   # Where alarms actually go, whichever way it was configured — so that a second
   # stack, a chat bridge or a runbook can subscribe to the same topic instead of
   # growing a second one, and so that "which topic is this deployment using" is
@@ -4109,20 +4586,6 @@ Outputs:
     Value: !Ref AuthFunction
     Export:
       Name: !Sub '${AWS::StackName}-FunctionName'
-
-  # D9b. Where queued webhooks wait, and where the ones that gave up are.
-  WebhookQueueUrl:
-    Condition: WebhookQueueEnabled
-    Description: SQS queue the auth function enqueues outgoing webhooks on.
-    Value: !Ref WebhookQueue
-  WebhookDeadLetterQueueUrl:
-    Condition: WebhookQueueEnabled
-    Description: >-
-      Dead-letter queue of outgoing webhooks the worker gave up on, kept 14
-      days from the hand-off (less for one SQS redrove itself, which keeps its
-      enqueue time); each message carries DeadLetterReason and, after a
-      refusal, LastStatus. Nothing redelivers from it automatically.
-    Value: !Ref WebhookDLQ
 
   # The console's front door and, when it exists, the bucket behind its upload
   # tab. The URL is the API's own; behind the distribution the same path is

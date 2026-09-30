@@ -465,7 +465,53 @@ func TestRefuseToStartRules(t *testing.T) {
 			allowUnimplemented: true,
 			wantRule:           RuleToolsSSEDistributor,
 			wantPath:           "tools.sse.distributor.type",
-			wantMessage:        "own execution environment",
+			wantMessage:        "not implemented in this product",
+		},
+		{
+			// D9c: the one distributor the product implements is a partition
+			// of the DynamoDB table, so it is refused on any other driver
+			// rather than degrading to a per-process log that reaches one
+			// execution environment.
+			name: "RS-14 the dynamodb distributor on the memory driver",
+			mutate: func(doc Document) {
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.sse.enabled", true)
+				set(doc, "tools.sse.distributor.type", "dynamodb")
+				set(doc, "stores.driver", "memory")
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleToolsSSEDistributor,
+			wantPath:           "tools.sse.distributor.type",
+			wantMessage:        "partition of the DynamoDB table",
+		},
+		{
+			name: "the event log's poll interval above the back-off ceiling",
+			mutate: func(doc Document) {
+				set(doc, "tools.sse.pollIntervalMs", 6000)
+			},
+			wantRule:    "",
+			wantPath:    "tools.sse.pollIntervalMs",
+			wantMessage: "100-5000",
+		},
+		{
+			name: "the event log's retention shorter than two connection segments",
+			mutate: func(doc Document) {
+				set(doc, "tools.sse.eventLogRetentionSeconds", 900)
+			},
+			wantRule:    "",
+			wantPath:    "tools.sse.eventLogRetentionSeconds",
+			wantMessage: "1800-604800",
+		},
+		{
+			name: "the event log's replay limit at zero",
+			mutate: func(doc Document) {
+				set(doc, "tools.sse.replayLimit", 0)
+			},
+			wantRule:    "",
+			wantPath:    "tools.sse.replayLimit",
+			wantMessage: "1-10000",
 		},
 		{
 			// The type is the statement of intent: a distributor configured
@@ -1288,5 +1334,33 @@ func TestAdminPostureBehindAnOpenConsoleWarns(t *testing.T) {
 				t.Errorf("the warning does not say it is the unguarded posture, or does not name a real decision: %s", got.Error())
 			}
 		})
+	}
+}
+
+// TestTheDynamoDBDistributorLoads is RS-14's control since D9c: the event log
+// on the DynamoDB driver is the one distributor this product implements, and a
+// document naming it loads — through the environment as well, which is how the
+// SAM template sets it beside the SSE function.
+func TestTheDynamoDBDistributorLoads(t *testing.T) {
+	doc := baseDoc()
+	set(doc, "tools.enabled", true)
+	set(doc, "tools.auth", "session")
+	set(doc, "tools.inboundWebhooks.enabled", false)
+	set(doc, "tools.sse.enabled", true)
+	set(doc, "tools.telemetry.enabled", false)
+	env := baseEnv()
+	env["AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE"] = "dynamodb"
+	env["AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS"] = "250"
+	env["AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS"] = "3600"
+	cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+	if err != nil {
+		t.Fatalf("the dynamodb distributor on the dynamodb driver must load:\n%v", err)
+	}
+	if got := cfg.Tools.SSE.Distributor.Type; got != DistributorDynamoDB {
+		t.Errorf("tools.sse.distributor.type = %q, want %q", got, DistributorDynamoDB)
+	}
+	if cfg.Tools.SSE.PollIntervalMs != 250 || cfg.Tools.SSE.EventLogRetentionSeconds != 3600 {
+		t.Errorf("poll %d / retention %d, want 250 / 3600 from the environment",
+			cfg.Tools.SSE.PollIntervalMs, cfg.Tools.SSE.EventLogRetentionSeconds)
 	}
 }

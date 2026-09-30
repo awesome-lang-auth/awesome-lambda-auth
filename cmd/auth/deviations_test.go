@@ -35,6 +35,9 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"rate-limited-routes-answer-429",
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
+		// D9c.
+		"sse-event-ids-are-ulids",
+		"sse-resume-replays-from-the-event-log",
 		"templates-dir-only-seeds-absent-ids",
 		"tools-admin-login-redirect-points-into-the-admin-mount",
 		"tools-api-key-refusal-is-the-cores-bare-401",

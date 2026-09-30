@@ -392,6 +392,7 @@ func statedAllOnAlarms(t *testing.T) int {
 var offByDefaultAlarmGates = map[string]string{
 	"WebhookQueueAlarmed":       "EnableWebhookQueue",    // D9b
 	"ScriptRunnerAlarmsEnabled": "EnableInboundWebhooks", // D9d
+	"SseAlarmsEnabled":          "EnableSse",             // D9c
 }
 
 // TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled keeps the
@@ -971,5 +972,188 @@ func TestNoAccountIdArnOrAddressIsCommitted(t *testing.T) {
 					"every other address-shaped knob defaults to empty:\n%s", where, line)
 			}
 		}
+	}
+}
+
+// ── the SSE function (D9c) ──────────────────────────────────────────────────
+
+// envBlocks returns a function's environment variables, each as the text of
+// its whole definition — the key line and any continuation lines of a
+// multi-line !If — keyed by name.
+func envBlocks(t *testing.T, fn *resource) map[string]string {
+	t.Helper()
+	lines := strings.Split(fn.body, "\n")
+	blocks := map[string]string{}
+	in := false
+	current := ""
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "Variables:" {
+			in = true
+			continue
+		}
+		if !in || skip(line) {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		switch {
+		case indent == 10:
+			name, _, _ := strings.Cut(strings.TrimSpace(line), ":")
+			current = name
+			blocks[name] = strings.TrimSpace(line)
+		case indent > 10 && current != "":
+			blocks[current] += "\n" + strings.TrimSpace(line)
+		default:
+			return blocks
+		}
+	}
+	return blocks
+}
+
+// TestTheSseFunctionIsASubsetOfTheAuthFunction is the enforcement half of the
+// comment above SseFunction: the SSE function verifies the tokens the auth
+// function mints and applies the guard it applies, so every variable it reads
+// must be the auth function's, definition for definition. The entry point is
+// the one variable of its own.
+func TestTheSseFunctionIsASubsetOfTheAuthFunction(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	auth, sse := tpl.resources["AuthFunction"], tpl.resources["SseFunction"]
+	if auth == nil || sse == nil {
+		t.Fatal("AuthFunction or SseFunction is gone")
+	}
+	authEnv, sseEnv := envBlocks(t, auth), envBlocks(t, sse)
+	if len(sseEnv) < 10 || len(authEnv) < 10 {
+		t.Fatalf("read %d SSE and %d auth variables: the reader no longer understands the template", len(sseEnv), len(authEnv))
+	}
+	if got := sseEnv["AWESOME_AUTH_ENTRYPOINT"]; got != "AWESOME_AUTH_ENTRYPOINT: stream" {
+		t.Errorf("SseFunction's entry point is %q, want stream", got)
+	}
+	if _, ok := authEnv["AWESOME_AUTH_ENTRYPOINT"]; ok {
+		t.Error("AuthFunction sets AWESOME_AUTH_ENTRYPOINT; it is the default entry point and must not")
+	}
+	for name, def := range sseEnv {
+		if name == "AWESOME_AUTH_ENTRYPOINT" {
+			continue
+		}
+		if authEnv[name] != def {
+			t.Errorf("SseFunction's %s is\n%s\nwhich is not AuthFunction's\n%s", name, def, authEnv[name])
+		}
+	}
+	for _, name := range []string{
+		"AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER", "AWESOME_AUTH_SESSIONS_CHECK_ON",
+		"AWESOME_AUTH_TOOLS_AUTH", "AWESOME_AUTH_TOOLS_BASE_PATH", "AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE",
+		"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", "AWESOME_AUTH_HTTP_API_PREFIX", "AWESOME_AUTH_CONFIG_FILE",
+	} {
+		if _, ok := sseEnv[name]; !ok {
+			t.Errorf("SseFunction does not set %s, which the stream path reads", name)
+		}
+	}
+
+	for key, want := range map[string]string{
+		"CodeUri":                      auth.props["CodeUri"],
+		"Handler":                      "bootstrap",
+		"Runtime":                      "provided.al2023",
+		"Architectures":                "[arm64]",
+		"MemorySize":                   "!Ref SseMemorySize",
+		"Timeout":                      "!Ref SseTimeout",
+		"ReservedConcurrentExecutions": "!If [HasSseReservedConcurrency, !Ref SseReservedConcurrency, !Ref 'AWS::NoValue']",
+	} {
+		if got := sse.props[key]; got != want {
+			t.Errorf("SseFunction %s = %q, want %q", key, got, want)
+		}
+	}
+	for _, forbidden := range []string{"dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem", "kms:", "ses:", "sns:", "s3:", "cognito-idp:"} {
+		if strings.Contains(sse.body, forbidden) {
+			t.Errorf("SseFunction's role grants %s; nothing on the stream path needs it", forbidden)
+		}
+	}
+	// The one write, UpdateItem, is the API-key lastUsedAt stamp: its own
+	// policy, present only under the apiKey posture, held by LeadingKeys to the
+	// canonical API-key records (api_keys.go, UpdateLastUsed writes
+	// PK=APIKEY#<prefix>). UpdateItem creates a missing item, so anywhere else
+	// on this internet-facing function it would be a write to any partition.
+	if n := strings.Count(sse.body, "dynamodb:UpdateItem"); n != 1 {
+		t.Errorf("SseFunction grants dynamodb:UpdateItem %d times, want once, in SseApiKeyLastUsed", n)
+	}
+	if i := strings.Index(sse.body, "Sid: SseApiKeyLastUsed"); i < 0 {
+		t.Error("SseFunction has no SseApiKeyLastUsed statement")
+	} else {
+		before, stmt := sse.body[:i], sse.body[i:]
+		if end := strings.Index(stmt, "- !Ref 'AWS::NoValue'"); end >= 0 {
+			stmt = stmt[:end]
+		}
+		for _, want := range []string{"dynamodb:UpdateItem", "ForAllValues:StringLike:", "dynamodb:LeadingKeys:", "'APIKEY#*'"} {
+			if !strings.Contains(stmt, want) {
+				t.Errorf("SseApiKeyLastUsed lacks %s: the write must be held to the API-key records", want)
+			}
+		}
+		if j := strings.LastIndex(before, "- !If"); j < 0 || !strings.HasPrefix(strings.TrimSpace(before[j+len("- !If"):]), "- ToolsAuthApiKey") {
+			t.Error("SseApiKeyLastUsed is not under !If [ToolsAuthApiKey, …]: a stack on the session posture would still hold the write")
+		}
+		if strings.Contains(before, "dynamodb:UpdateItem") {
+			t.Error("dynamodb:UpdateItem is granted before SseApiKeyLastUsed, outside its condition")
+		}
+	}
+
+	for name, want := range map[string]string{"SseMemorySize": "128", "SseTimeout": "900", "SseReservedConcurrency": "'20'", "EnableSse": "'false'"} {
+		if got := tpl.parameters[name].fields["Default"]; got != want {
+			t.Errorf("%s defaults to %s, want %s (docs/cost-model.md §3.1)", name, got, want)
+		}
+	}
+
+	url := tpl.resources["SseFunctionUrl"]
+	if url == nil {
+		t.Fatal("SseFunctionUrl is gone")
+	}
+	for key, want := range map[string]string{"AuthType": "NONE", "InvokeMode": "RESPONSE_STREAM"} {
+		if got := url.props[key]; got != want {
+			t.Errorf("SseFunctionUrl %s = %q, want %q", key, got, want)
+		}
+	}
+	if strings.Contains(url.body, "Cors") {
+		t.Error("SseFunctionUrl configures CORS; the product's own layer does, and two would duplicate the header")
+	}
+	for _, name := range []string{"SseLogGroup", "SseFunction", "SseFunctionUrl", "SseFunctionUrlPermission", "SseFunctionInvokeViaUrlPermission"} {
+		if r := tpl.resources[name]; r == nil || r.condition != "SseEnabled" {
+			t.Errorf("%s is not conditioned on SseEnabled: a stack without SSE must carry none of it", name)
+		}
+	}
+	if p := tpl.resources["SseFunctionInvokeViaUrlPermission"]; p == nil || p.props["InvokedViaFunctionUrl"] != "true" || p.props["Action"] != "lambda:InvokeFunction" {
+		t.Error("the lambda:InvokeFunction grant is not conditioned on arriving through the function URL, so it would let anybody invoke the function directly")
+	}
+}
+
+// TestTheStreamBehaviourIsUncachedAndGoesToTheSseOrigin pins what the
+// distribution does with <ToolsBasePath>/stream when both switches are on.
+func TestTheStreamBehaviourIsUncachedAndGoesToTheSseOrigin(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	dist := tpl.resources["AuthDistribution"]
+	if dist == nil {
+		t.Fatal("AuthDistribution is gone")
+	}
+	i := strings.Index(dist.body, "CacheBehaviors: !If")
+	if i < 0 {
+		t.Fatal("AuthDistribution has no conditional CacheBehaviors for the stream")
+	}
+	behaviour := dist.body[i:]
+	if j := strings.Index(behaviour, "DefaultCacheBehavior:"); j > 0 {
+		behaviour = behaviour[:j]
+	}
+	for _, want := range []string{
+		"SseBehindCloudFront",
+		"PathPattern: !Sub '${ToolsBasePath}/stream'",
+		"TargetOriginId: SseOrigin",
+		"Compress: false",
+		"CachePolicyId: !Ref AuthCachePolicy",
+		"OriginRequestPolicyId: !Ref AuthOriginRequestPolicy",
+	} {
+		if !strings.Contains(behaviour, want) {
+			t.Errorf("the stream behaviour lacks %q:\n%s", want, behaviour)
+		}
+	}
+	k := strings.Index(dist.body, "Id: SseOrigin")
+	if k < 0 || !strings.Contains(dist.body[k:], "OriginReadTimeout: 60") {
+		t.Error("the SSE origin does not set OriginReadTimeout: 60, which the 30-second heartbeat is sized against")
 	}
 }

@@ -138,9 +138,12 @@ import (
 // the in-process manager, so Notify's `sse` channel and Track's step 3 broadcast
 // to whatever connections the manager holds, which on this runtime is none.
 // That is stated in the cold-start log rather than refused, because the manager
-// costs nothing and D9c makes it reach somebody. What *is* refused — RS-14 — is
-// a distributor, because a document that names one has asked for cross-instance
-// delivery and this build cannot provide it.
+// costs nothing. D9c made it reach somebody: with tools.sse.distributor.type:
+// dynamodb the manager distributes through the event log, which the SSE
+// function follows (stream.go). What *is* refused — RS-14 — is a distributor
+// this product does not implement, redis or sns, because a document that names
+// one has asked for cross-instance delivery and this build cannot provide it
+// that way.
 //
 // ── the access posture ───────────────────────────────────────────────────────
 //
@@ -223,7 +226,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the seams later blocks fill (D9b and D9d, each when configured) ─────────
+// ── the three seams later blocks fill (D9b, D9c, D9d, each when configured) ─
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries
@@ -249,6 +252,13 @@ import (
 // redelivers — so RS-15 refuses tools.inboundWebhooks.enabled with no function
 // named. The scriptTimeoutMs knob is the core's ScriptTimeout, the deadline on
 // the whole invocation.
+//
+// The SSE distributor is D9c's: with tools.sse.distributor.type: dynamodb the
+// manager distributes through the event log in the table (newToolsWiring, the
+// D9c region), which the SSE function — this same artifact, started with
+// AWESOME_AUTH_ENTRYPOINT=stream — follows for its one connection
+// (stream.go). With any other type the manager reaches nobody on this
+// runtime, and RS-14 refuses the two types this build does not implement.
 
 // toolsWiring is what the tools block builds before the core exists: the bus
 // the core will publish on, the facade the router will call, and the handle
@@ -267,6 +277,12 @@ type toolsWiring struct {
 	// that builds several Apps in one process should not leave subscriptions
 	// behind, and App.Close is where they go.
 	stopBridge func()
+
+	// sseLog is the event log the SSE manager distributes through (D9c), nil
+	// unless tools.sse.distributor.type is dynamodb. The auth function only
+	// publishes into it; the SSE function's stream hook follows it for its
+	// one connection (stream.go).
+	sseLog sseEventLog
 
 	// The stores that were wired, by name, for the cold-start log.
 	telemetry bool
@@ -405,10 +421,33 @@ func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStor
 			// WithSseHeartbeat(0); validate.go accepts any integer here.
 			auth.WithSseHeartbeat(time.Duration(cfg.Tools.SSE.HeartbeatIntervalMs) * time.Millisecond),
 			auth.WithSseDeduplicate(cfg.Tools.SSE.Deduplicate),
-			// No WithSseDistributor. RS-14 has refused any document that named
-			// one, and the in-process manager reaches the connections of this
-			// execution environment alone — which, with the stream unmounted,
-			// is none. D9c adds the distributor here.
+		}
+		// ── D9c: the event log is the distributor ──────────────────────────
+		//
+		// With tools.sse.distributor.type: dynamodb the manager distributes
+		// through the event log (docs/spec/data-model.md §1.5), in both
+		// functions. Here, in the auth function, that makes every Broadcast a
+		// write to the log and nothing else — the core does not deliver
+		// locally once a distributor is attached (sse.go), and this function
+		// holds no connection to deliver to. In the SSE function the same
+		// manager serves the one connection its environment holds, fed by the
+		// hook in stream.go following the log. With any other type the
+		// manager is the in-process one and reaches nobody on this runtime;
+		// RS-14 has refused the two types this product does not implement.
+		//
+		// Found structurally on the user store, like every other store this
+		// block consumes; RS-14 guarantees the dynamodb driver, and the
+		// refusal below is for a Config that bypassed the loader.
+		if cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB {
+			provider, ok := users.(sseLogProvider)
+			if !ok {
+				return nil, fmt.Errorf(
+					"config: refusing to start: tools.sse.distributor.type is %q, but the %s driver does not provide the SSE event log in this build",
+					config.DistributorDynamoDB, cfg.Stores.Driver)
+			}
+			sseLog := provider.SseLog(sseLogOptions(cfg))
+			opts.SSEOptions = append(opts.SSEOptions, auth.WithSseDistributor(sseLog))
+			tw.sseLog = sseLog
 		}
 	}
 
@@ -553,8 +592,9 @@ func toolsHTTPOptions(cfg *config.Config, tw *toolsWiring, core *auth.Auth, base
 		DisableNotify:    !cfg.Tools.Notify.Enabled,
 		// Unconditional. See the file header: behind API Gateway the stream is
 		// a spinner that bills, and 404 is the one answer EventSource does not
-		// retry. D9c sets this from tools.stream.enabled on a transport that
-		// can carry it.
+		// retry. It stays true here even with D9c: the transport that can
+		// carry the stream is the SSE function, whose streamToolsOptions
+		// (stream.go) clears it on that function alone.
 		DisableStream:  true,
 		DisableWebhook: !cfg.Tools.InboundWebhooks.Enabled,
 		// The router's own documentation pair, resolved the way docs.go
@@ -827,7 +867,7 @@ func toolsPath(cfg *config.Config) string {
 
 // logToolsSurface announces what the block resolved to, so an operator can tell
 // from the cold-start log which tools routes exist, behind what, fed by which
-// stores — and which two things this runtime does not do yet.
+// stores — and where the stream is served, which is not this function.
 func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	if tw == nil {
 		// toolsOptions has already said the block is off, at the point the
@@ -840,6 +880,12 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	// tools.enabled and toolsAccess refuses it again, so the posture logged is
 	// the posture the document wrote.
 	posture := cfg.Tools.Auth
+	// D9c: the auth function never mounts the stream; with the event log as the
+	// distributor the SSE function serves it (stream.go, logStreamSurface).
+	stream := "not mounted on this function: GET " + mount + "/stream answers 404 here whatever tools.stream.enabled says (deviation tools-stream-is-not-mounted-on-api-gateway)"
+	if cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB {
+		stream += "; the SSE function serves it on its Function URL, fed by the event log (docs/sse.md)"
+	}
 	log.Info("tools surface mounted",
 		slog.String("mount", mount),
 		slog.String("auth", posture),
@@ -851,7 +897,7 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 		slog.Bool("telemetryQuery", cfg.Tools.Telemetry.Enabled && tw.telemetry),
 		slog.Bool("docs", docsEnabled(cfg)),
 		slog.String("bridge", "on: every identity.* event the auth core raises is persisted to the telemetry store and delivered to every matching outgoing webhook"),
-		slog.String("stream", "not mounted on this runtime: GET "+mount+"/stream answers 404 whatever tools.stream.enabled says, until D9c (deviation tools-stream-is-not-mounted-on-api-gateway)"),
+		slog.String("stream", stream),
 		slog.String("outgoingWebhooks", outgoingWebhooksLine(cfg))) // D9b: which deliverer is in force
 
 	// What each guarded posture still costs, said where the operator reads what
@@ -894,10 +940,13 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 			slog.String("problem", "POST "+mount+"/track attributes an event to any user named in the body and fans it out to that user's stream and to every matching outgoing webhook, signed in this deployment's name; POST "+mount+"/notify broadcasts to any topic; GET "+mount+"/telemetry reads every event"),
 			slog.String("remedy", "set tools.auth to apiKey, session, or admin beside a console under a policy other than open, unless the routes are deliberately public, for example behind a private network path"))
 	}
-	if cfg.Tools.SSE.Enabled {
+	// D9c: with the event log as the distributor the manager does reach
+	// somebody — the SSE function's connections — and logStreamSurface
+	// (stream.go) says so instead.
+	if cfg.Tools.SSE.Enabled && cfg.Tools.SSE.Distributor.Type != config.DistributorDynamoDB {
 		log.Info("the SSE manager reaches no connection on this runtime",
 			slog.String("path", "tools.sse.enabled"),
-			slog.String("effect", "the manager is built and Track and Notify broadcast into it, but the stream is not mounted and there is no distributor, so nothing is listening until D9c"))
+			slog.String("effect", "the manager is built and Track and Notify broadcast into it, but the stream is not mounted and there is no distributor, so nothing is listening; tools.sse.distributor.type: dynamodb with the SSE function (the template's EnableSse) is the transport that carries it (docs/sse.md)"))
 	}
 }
 
@@ -914,7 +963,10 @@ func csrfPostureOf(cfg *config.Config) string {
 // and that change nothing as the document stands.
 //
 // Two kinds. The stream and the SSE manager are runtime gaps — the core exposes
-// the field, API Gateway cannot carry the response — and both close with D9c.
+// the field, API Gateway cannot carry the response — and both close with the
+// dynamodb distributor, which the SSE function follows (D9c); without it they
+// are still gaps, and so are the event log's own knobs, which nothing else
+// reads, and a distributor connection field the log has no use for.
 // The three store flags are the other kind: driverStores lists telemetry,
 // webhooks and apiKeys as supported, because they are consumed by the tools
 // block and, for two of them, by the console, and "supported" is a statement
@@ -960,20 +1012,71 @@ func toolsKnobGaps(cfg *config.Config) []knobGap {
 			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or admin.enabled: true to mint keys through the console")
 	}
 	mount := toolsPath(cfg)
-	if cfg.Tools.Stream.Enabled {
+	// D9c: with the event log as the distributor both knobs are live — the
+	// SSE function serves the stream, and this function's manager writes the
+	// log it follows — so neither is a gap. Without it, both still are.
+	streamed := cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB
+	if cfg.Tools.Stream.Enabled && !streamed {
 		gaps = append(gaps, knobGap{
 			Path: "tools.stream.enabled",
 			Problem: "GET " + mount + "/stream is not mounted on this runtime and answers 404: API Gateway buffers the response and cuts it at 29 seconds, " +
 				"which would turn a Server-Sent Events stream into a reconnect loop that bills a held-open invocation per client (deviation tools-stream-is-not-mounted-on-api-gateway)",
-			Remedy: "leave it set; the stream lands on a Lambda Function URL with response streaming in D9c, and this knob becomes live then",
+			Remedy: "the stream lands on a Lambda Function URL with response streaming: set tools.sse.enabled and tools.sse.distributor.type: dynamodb and deploy the SSE function (the template's EnableSse), which serves it (docs/sse.md)",
 		})
 	}
-	if cfg.Tools.SSE.Enabled {
+	if cfg.Tools.SSE.Enabled && !streamed {
 		gaps = append(gaps, knobGap{
 			Path:    "tools.sse.enabled",
 			Problem: "the SSE manager is built, but with the stream unmounted and no distributor it holds no connection, so every broadcast reaches nobody",
-			Remedy:  "leave it set if the same document is deployed to another port in the family, or for D9c; nothing here is lost, and nothing here is delivered either",
+			Remedy:  "set tools.sse.distributor.type: dynamodb and deploy the SSE function (the template's EnableSse) to deliver it (docs/sse.md), or leave it set if the same document is deployed to another port in the family; nothing here is lost, and nothing here is delivered either",
 		})
+	}
+	// ── D9c: the event log's knobs, and the distributor's connection ─────────
+	//
+	// pollIntervalMs, eventLogRetentionSeconds and replayLimit are read by the
+	// dynamodb distributor alone, so a value that differs from the default
+	// under any other type validates and changes nothing. The connection
+	// fields are the other way round: redis and sns would read them (and are
+	// refused, RS-14), the event log has no connection of its own — it is a
+	// partition of the store's table — so under dynamodb they are read by
+	// nothing.
+	if !streamed {
+		def := config.Defaults().Tools.SSE
+		for _, k := range []struct {
+			path     string
+			got, def int
+		}{
+			{"tools.sse.pollIntervalMs", cfg.Tools.SSE.PollIntervalMs, def.PollIntervalMs},
+			{"tools.sse.eventLogRetentionSeconds", cfg.Tools.SSE.EventLogRetentionSeconds, def.EventLogRetentionSeconds},
+			{"tools.sse.replayLimit", cfg.Tools.SSE.ReplayLimit, def.ReplayLimit},
+		} {
+			if k.got != k.def {
+				gaps = append(gaps, knobGap{
+					Path:    k.path,
+					Problem: "read by the dynamodb event log alone, and tools.sse.distributor.type is not dynamodb, so the value changes nothing",
+					Remedy:  "leave it out, or set tools.sse.distributor.type: dynamodb with the SSE function (the template's EnableSse)",
+				})
+			}
+		}
+	} else {
+		d := cfg.Tools.SSE.Distributor
+		for _, k := range []struct {
+			path string
+			set  bool
+		}{
+			{"tools.sse.distributor.endpoint", d.Endpoint != ""},
+			{"tools.sse.distributor.topicArn", d.TopicARN != ""},
+			{"tools.sse.distributor.username", d.Username != ""},
+			{"tools.sse.distributor.password", d.Password != (config.Secret{})},
+		} {
+			if k.set {
+				gaps = append(gaps, knobGap{
+					Path:    k.path,
+					Problem: "the dynamodb event log is a partition of the store's own table and takes no connection of its own, so the field is read by nothing",
+					Remedy:  "leave it out: the log uses stores.connection",
+				})
+			}
+		}
 	}
 	return gaps
 }

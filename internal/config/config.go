@@ -577,6 +577,33 @@ type SSE struct {
 	HeartbeatIntervalMs int         `json:"heartbeatIntervalMs"`
 	Deduplicate         bool        `json:"deduplicate"`
 	Distributor         Distributor `json:"distributor"`
+
+	// ── D9c: the event log the dynamodb distributor is ──────────────────────
+	//
+	// Both are [new]: the reference has no event log to poll and no replay to
+	// bound (sse-manager.ts reads Last-Event-ID nowhere), so neither knob has
+	// a reference default. Both are read by the dynamodb distributor alone and
+	// are inert under any other type.
+
+	// PollIntervalMs is how often the SSE function's poll loop reads the
+	// topics of its one connection while events are arriving. After a minute
+	// with nothing new the loop backs off to five seconds, and snaps back to
+	// this on the next event (internal/store/dynamodb/sse_log.go). 1000 by
+	// default, which docs/cost-model.md §3.1 prices against the connection's
+	// own GB-seconds.
+	PollIntervalMs int `json:"pollIntervalMs"`
+	// EventLogRetentionSeconds is how long a published event stays
+	// replayable: the TTL every event is written with, and the horizon past
+	// which a resume cursor is answered with a truncation comment instead of
+	// a replay (docs/sse.md). 86400 — a day — by default.
+	EventLogRetentionSeconds int `json:"eventLogRetentionSeconds"`
+	// ReplayLimit bounds how many events one resume replays. Past it the
+	// stream writes a truncation comment, moves the client's cursor to now
+	// and continues live (docs/sse.md §4), so that what a cursor costs —
+	// any credentialed caller can write one dated to the horizon — is a few
+	// pages of reads per connection and not the whole retention. 100 by
+	// default. [new], like the two above.
+	ReplayLimit int `json:"replayLimit"`
 }
 
 // Distributor covers tools.sse.distributor.*. Without one, events fan out only
@@ -930,6 +957,10 @@ func Defaults() *Config {
 				HeartbeatIntervalMs: 30_000,
 				Deduplicate:         true,
 				Distributor:         Distributor{Type: DistributorNone},
+				// D9c.
+				PollIntervalMs:           1000,
+				EventLogRetentionSeconds: 86_400,
+				ReplayLimit:              100,
 			},
 			InboundWebhooks: InboundWebhooks{
 				Enabled:         true,
@@ -1044,6 +1075,11 @@ const (
 	DistributorNone  = "none"
 	DistributorRedis = "redis"
 	DistributorSNS   = "sns"
+	// DistributorDynamoDB is the event log in the deployment's own table
+	// (D9c, docs/spec/data-model.md §1.5): the one distributor this product
+	// implements. redis and sns stay in the enum because a family document
+	// may name them, and RS-14 refuses both by name.
+	DistributorDynamoDB = "dynamodb"
 
 	RateLimitKeyByIP    = "ip"
 	RateLimitKeyByEmail = "email"

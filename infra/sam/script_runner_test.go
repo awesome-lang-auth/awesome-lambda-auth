@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -293,7 +294,10 @@ func TestCIBuildsEveryFunctionTheTemplateDeploys(t *testing.T) {
 		}
 		built = append(built, strings.Fields(trimmed)...)
 	}
+	// Two functions may deploy one artifact — the SSE function is the auth zip
+	// started with another entry point (D9c) — so the template's list is a set.
 	sort.Strings(deployed)
+	deployed = slices.Compact(deployed)
 	sort.Strings(built)
 	if len(deployed) == 0 || strings.Join(deployed, " ") != strings.Join(built, " ") {
 		t.Errorf("the template deploys %v and CI's LAMBDAS builds %v; they must name the same functions", deployed, built)
