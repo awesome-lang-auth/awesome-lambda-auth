@@ -58,7 +58,7 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 //
 // D9c narrowed the rule rather than retiring it. The product now ships one
 // distributor, `dynamodb` — the event log in the deployment's own table
-// (docs/spec/data-model.md §1.9), written by the auth function and polled by
+// (docs/spec/data-model.md §1.5), written by the auth function and polled by
 // the SSE function — and the rule refuses what is left:
 //
 //   - `redis` and `sns`, by name, as not implemented in this product. They stay

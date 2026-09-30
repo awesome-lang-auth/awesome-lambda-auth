@@ -379,7 +379,7 @@ func WireDeviations() []WireDeviation {
 				"(sse-resume-replays-from-the-event-log) is what makes the reconnect between segments lose nothing. " +
 				"cmd/auth/tools_test.go TestToolsRoutesComeFromTheAdapter fails the day the auth function answers the route, " +
 				"and cmd/auth/stream_test.go TestTheSSEFunctionAnswersTheStreamAlone the day the SSE function answers any other.",
-			Spec: "docs/spec/config-schema.md §1.14; docs/config-reference.md §17.3, §17.9; docs/cost-model.md §3.1; docs/sse.md; docs/spec/serverless-gap-analysis.md §1.5",
+			Spec: "docs/spec/config-schema.md §1.14; docs/config-reference.md §17.3; docs/cost-model.md §3.1; docs/sse.md; docs/spec/serverless-gap-analysis.md §1.5",
 		},
 		// ── D9c: the two guarantees and one difference the event log brings ──
 		{
@@ -416,7 +416,7 @@ func WireDeviations() []WireDeviation {
 				"a client that wants to know it missed something. cmd/auth/stream_test.go " +
 				"TestTheSSEFunctionStreamsWhatTheAuthFunctionPublishes replays across a disconnect; " +
 				"internal/store/dynamodb/sse_log_test.go pins the order, the retention and the cursor rules.",
-			Spec: "docs/sse.md; docs/spec/data-model.md §1.9; docs/config-reference.md §17.9; docs/cost-model.md §3.1",
+			Spec: "docs/sse.md; docs/spec/data-model.md §1.5; docs/config-reference.md §17.3; docs/cost-model.md §3.1",
 		},
 		{
 			ID:      "sse-event-ids-are-ulids",
@@ -434,7 +434,7 @@ func WireDeviations() []WireDeviation {
 				"the log's clock and never from the event's timestamp, which is the publisher's to fill and would let a " +
 				"future-dated event move every cursor past everything after it. A client that treats the id as opaque, which " +
 				"is what the reference's UUID invites, sees no difference; one that parsed it as a UUID would.",
-			Spec: "docs/spec/data-model.md §1.9; docs/sse.md",
+			Spec: "docs/spec/data-model.md §1.5; docs/sse.md",
 		},
 		{
 			ID:      "library-events-are-bridged-into-the-tools-fan-out",

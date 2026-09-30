@@ -268,6 +268,12 @@ type toolsWiring struct {
 	// behind, and App.Close is where they go.
 	stopBridge func()
 
+	// sseLog is the event log the SSE manager distributes through (D9c), nil
+	// unless tools.sse.distributor.type is dynamodb. The auth function only
+	// publishes into it; the SSE function's stream hook follows it for its
+	// one connection (stream.go).
+	sseLog sseEventLog
+
 	// The stores that were wired, by name, for the cold-start log.
 	telemetry bool
 	webhooks  bool
@@ -280,12 +286,6 @@ type toolsWiring struct {
 	// tools.outboundWebhooks.queueUrl is unset and the core's in-process
 	// deliverer is in force. App.Handle flushes it.
 	queue *webhookQueue
-
-	// sseLog is the event log the SSE manager distributes through (D9c), nil
-	// unless tools.sse.distributor.type is dynamodb. The auth function only
-	// publishes into it; the SSE function's stream hook follows it for its
-	// one connection (stream.go).
-	sseLog sseEventLog
 }
 
 // telemetryStoreProvider, webhookStoreProvider and apiKeyStoreProvider are what
@@ -415,7 +415,7 @@ func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStor
 		// ── D9c: the event log is the distributor ──────────────────────────
 		//
 		// With tools.sse.distributor.type: dynamodb the manager distributes
-		// through the event log (docs/spec/data-model.md §1.9), in both
+		// through the event log (docs/spec/data-model.md §1.5), in both
 		// functions. Here, in the auth function, that makes every Broadcast a
 		// write to the log and nothing else — the core does not deliver
 		// locally once a distributor is attached (sse.go), and this function

@@ -54,7 +54,7 @@ import (
 // ── what the SSE function serves: the stream, and nothing else ───────────────
 //
 // The Function URL is a second front door onto the same handler, and an
-// AuthType: NONE URL (docs/config-reference.md §17.9 argues the choice) is
+// AuthType: NONE URL (docs/config-reference.md §17.3 argues the choice) is
 // internet-facing with no API Gateway in front of it. So the stream role
 // answers GET, HEAD and OPTIONS on exactly <tools>/stream and 404 to every
 // other request, before any route is reached (streamOnly) — without that gate
@@ -81,7 +81,7 @@ import (
 // Gateway is still the 404 of tools-stream-is-not-mounted-on-api-gateway, and
 // the stream reaches a client through the SSE function — the CloudFront
 // behaviour for <tools>/stream when the distribution is on, the Function URL
-// itself when it is off (docs/config-reference.md §17.9).
+// itself when it is off (docs/config-reference.md §17.3).
 
 // EntrypointEnv selects the runtime contract main.go starts. It is not a
 // configuration knob — it says which function this process is, not how the

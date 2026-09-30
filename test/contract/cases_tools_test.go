@@ -26,12 +26,12 @@ import (
 // toolsDoubleSubmit, pinned in-process by TestSessionPostureDoubleSubmit) —
 // which is why the CapTools probe, a cookie caller, sends it.
 //
-// What is deliberately *not* here: the stream. GET <tools>/stream on this
-// product is the registered deviation tools-stream-is-not-mounted-on-api-gateway
-// and answers 404 in every configuration; against the reference it is a
-// long-lived text/event-stream. A case that had to hold a connection open would
-// flake on one and skip on the other, so the route is pinned in
-// cmd/auth/tools_test.go instead, where the absence is the assertion.
+// What is deliberately *not* here: the stream. It is cases_sse_test.go's (D9c),
+// which reads it over plain net/http with a bounded deadline and closes it as
+// soon as the first frames are asserted — the one way to test a long-lived
+// response without holding it open. The auth function's own 404 for the route
+// behind API Gateway (tools-stream-is-not-mounted-on-api-gateway) stays pinned
+// in cmd/auth/tools_test.go, where the absence is the assertion.
 
 // trackedEventName is unique per run so a deployment that keeps telemetry
 // never answers a query with another run's rows.

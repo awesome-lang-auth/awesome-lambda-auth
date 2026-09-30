@@ -43,6 +43,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | DynamoDB stream, unconsumed | 0.00 | Enabled from day one; nothing at rest |
 | Lambda, HTTP API | 0.00 | Purely per-request |
 | CloudFront, if enabled | 0.00 | No hourly or monthly charge; the two policies are free |
+| SSE function, `EnableSse=true` only (D9c) | 0.00 | Per connection-hour only (§3.1); its URL, permissions and CloudFront behaviour are free, and its alarm is the tenth metric (§3.3) |
 | CloudWatch Logs storage | ~0.00 | At 14-day retention and this traffic, a few MB |
 | **The nine alarms** | **0.00** | Nine alarm metrics enabled by default, against a free allowance of ten; each optional function adds its own, gated on its switch and counted in §3.3 |
 | **SNS topic + subscription** | **0.00** | No charge at rest; first 1 000 email notifications a month are free |
@@ -294,21 +295,20 @@ the queue off — the default — everything above stands.
 
 **What the block does not cost.** No new resource, no new parameter with a
 standing charge, no IAM statement: the three stores are partitions of the one
-table and the actions are the ones the function already holds. The SSE manager,
-when `tools.sse.enabled` is set, holds no connection on this runtime and costs
-nothing; the stream that would cost USD 0.024 per connection-hour (§3.1) is
-not mounted (`tools-stream-is-not-mounted-on-api-gateway`) precisely so that
-it cannot.
+table and the actions are the ones the function already holds. The SSE manager
+costs nothing in this function either way: without `EnableSse` it holds no
+connection on this runtime, and with it (D9c) every broadcast is a write to the
+event log, which §3.1 prices with the SSE function that holds the connections.
 
 ---
 
-## 3. What is coming, and what shape it costs
+## 3. The SSE function, and what is still coming
 
-The block that adds SSE (D9c) needs these numbers **before** it chooses a
-transport, not after — which is why this section exists in a document written
-before that block starts.
+This section was written before D9c chose a transport, so that the numbers
+would decide it rather than follow it. §3.1 is now what D9c deployed; §3.2 is
+the trade it made; §3.3 is what the remaining functions cost.
 
-### 3.1 An SSE connection is GB-seconds for its whole lifetime
+### 3.1 The SSE function: a connection is GB-seconds for its whole lifetime
 
 Lambda bills for the duration of an invocation. A response-streaming invocation
 is alive for as long as the connection is, so **the connection is the unit of
@@ -316,33 +316,89 @@ cost and the messages are noise**:
 
 | memory | USD per connection-hour | USD per 1 000 connections per day |
 |---|---|---|
-| 512 MB | **0.0240** | **576** |
+| 512 MB | 0.0240 | 576 |
 | 256 MB | 0.0120 | 288 |
-| 128 MB | 0.0060 | 144 |
+| **128 MB — what D9c deploys** | **0.0060** | **144** |
 
-The polling half of it barely registers. A DynamoDB read per poll at the
-reference's 30-second heartbeat interval (`sse-manager.ts`, `heartbeatIntervalMs`
-defaults to 30 000) is 120 strongly consistent reads an hour, or
-**USD 0.00003 per connection-hour** — about one eight-hundredth of the
-GB-seconds at 512 MB. Even at a one-second poll it is USD 0.0009, still
-twenty-five times smaller.
+(0.125 GB × USD 0.0000133334 × 3 600 s. The four invocations an hour that a
+fifteen-minute segment costs add USD 0.0000008.)
 
-Three consequences that are decisions, not observations:
+**What D9c decided, and why each number is that number.**
 
-1. **The SSE function must be its own function with its own `MemorySize`.** The
-   auth router is at 512 MB because login is CPU-bound on bcrypt; an idle
-   connection needs none of that CPU and pays four times over for it. Splitting
-   them is worth 4× on the dominant line.
-2. **Concurrency is the ceiling before money is.** One connection holds one
-   execution environment, so an account's default 1 000 concurrent executions is
-   1 000 simultaneous listeners — and the thousand-and-first login is throttled
-   by the listeners. This is why `ConcurrentExecutions` is alarmed and why
-   `ReservedConcurrentExecutions` exists as a parameter.
-3. **Lambda caps an invocation at 15 minutes**, so a connection is a sequence of
-   segments and the client reconnects. That is a wire question as much as a cost
-   one: the reference has no `Last-Event-ID` resume to inherit
-   ([serverless-gap-analysis.md](spec/serverless-gap-analysis.md) §1.5), so
-   whatever D9c does about the gap between segments is net-new surface.
+1. **Its own function at 128 MB** (`SseMemorySize`). The auth router is at
+   512 MB because login is CPU-bound on bcrypt; an idle connection needs none
+   of that CPU and would pay four times over for it. The SSE function is the
+   same artifact with a second entry point (`cmd/auth/stream.go`), so it
+   cold-starts the whole composition — measured at ~207 ms of `Init Duration`
+   at 512 MB (infra/sam/README.md) with 26–38 MB of memory used — and at a
+   quarter of the CPU that init is expected to take well under a second:
+   paid once per connection segment, at connect, and not measured yet on a
+   real deployment.
+2. **A ceiling of 20 simultaneous connections** (`SseReservedConcurrency`).
+   One connection holds one execution environment, so the reservation is the
+   listener count and the hard cap on this line of the bill: **USD 0.12 an
+   hour, USD 2.88 a day, about USD 88 a month** with every slot held around
+   the clock. It also keeps listeners out of the account pool, so a crowd of
+   streams cannot throttle a login. `SseConcurrencyAlarm` fires at 15 held for
+   fifteen minutes (§4).
+3. **Fifteen-minute segments** (`SseTimeout`, 900). Lambda's cap, so a
+   connection is a sequence of segments and the client reconnects, and the
+   resume guarantee (`docs/sse.md`) is what makes that lose nothing. A client
+   that vanishes without closing is billed until its segment ends — Lambda
+   does not end an invocation because its client went away — so the worst
+   case of an abandoned tab is fifteen minutes, USD 0.0015. A shorter timeout
+   trades that for more reconnects, each one an invocation and one replay
+   Query per topic.
+
+**The poll, which is not noise any more.** The earlier version of this section
+priced a strongly consistent read every 30 seconds and found it an
+eight-hundredth of the compute. The poll D9c built is one Query per subscribed
+topic per interval, and the interval is a second, because a second is the
+latency an event on a live stream is allowed:
+
+| poll | per connection-hour, 2 topics (`global`, `user:<u>`) | 3 topics (a tenant as well) | against 128 MB compute |
+|---|---|---|---|
+| every 1 s, events arriving | 3 600 RRU, USD 0.0009 | 5 400 RRU, USD 0.00135 | 15–23 % |
+| every 5 s, after a minute of silence | 720 RRU, USD 0.00018 | 1 080 RRU, USD 0.00027 | 3–5 % |
+
+Each Query is **eventually consistent, at DynamoDB's floor of 0.5 RRU** when
+nothing new is returned, which is most polls: the three-second look-back that
+makes an eventually consistent cursor safe (data-model.md §1.5) re-reads a few
+hundred bytes on a busy topic and nothing on a quiet one. A strongly consistent
+poll would cost twice as much and close only half the race the look-back
+exists for. **These are counted, not measured** — the 0.5 RRU floor is
+DynamoDB's documented minimum for a Query — and the check after the first
+deploy is `ConsumedReadCapacityUnits` on the table against the number of
+connections held. The back-off (`tools.sse.pollIntervalMs` then five seconds
+after sixty of silence, snapping back on the next event) is what keeps an idle
+listener, which is most listeners, at the bottom row: a minute is long enough
+that an active conversation never backs off, and four seconds of added latency
+on the first event after a quiet minute is the whole price.
+
+**The publishing half, in the auth function.** With `EnableSse`, every
+broadcast is a `PutItem` per topic a stream can hold — `global` and
+`user:<u>`, and `tenant:<t>` when there is one; the `session:<sid>` copy every
+identity event is also fanned to is not written, since no stream can hold it
+(data-model.md §1.5). Each item is under 1 KB for an ordinary event:
+
+| what | units | USD per million |
+|---|---|---|
+| one identity event, single-tenant | 2 WCU | 2.50 per million events |
+| one login (two events, §2.8) | 4 WCU | **5.00 more per million logins**, on top of §2.2 and §2.8 |
+| storage at the default 24 h retention | ~1 KB per topic-copy, resident a day | a million events a month is ~70 MB resident, ~USD 0.02 a month |
+
+The writes are awaited on the request goroutine, as the telemetry row is, so
+they are on a login's latency too: two single-digit-millisecond `PutItem`s.
+The TTL delete is free.
+
+**Refused requests.** The Function URL is `AuthType: NONE`
+(docs/config-reference.md §17.3), so a caller with no credential costs an
+invocation that answers `404` or the guard's refusal in a few milliseconds:
+about **USD 0.21 per million**, bounded in rate by the reservation.
+
+**What it adds at rest: nothing.** The function, its URL, its two permissions,
+its log group and the CloudFront behaviour have no standing charge, and all of
+them exist only with `EnableSse`. Its alarm is the tenth metric (§3.3).
 
 ### 3.2 What the alternatives cost, so the trade is explicit
 
@@ -365,7 +421,8 @@ reference's SSE costs about three orders of magnitude on idle connections.** Tha
 may well be the right price — wire compatibility is the product's whole premise
 and this stack's traffic is nowhere near a thousand listeners — but it should be
 paid knowingly, with a per-deployment ceiling on concurrent streams, and that is
-D9c's decision to record rather than this document's to make.
+D9c's decision to record rather than this document's to make, and D9c recorded it:
+128 MB and a ceiling of twenty (§3.1).
 
 ### 3.3 The other functions coming
 
@@ -389,6 +446,7 @@ is the number written here.
 | webhook worker | **Landed (D9b)**, below |
 | script runner | **Landed (D9d)**, below. Per run, and the run is **caller-initiated** — the inbound route is unauthenticated — so the exposure is a stranger's rate times a script that loops, capped by a reservation |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
+| SSE function | **Landed (D9c)**, priced in §3.1. One alarm, not four: `SseConcurrencyAlarm`, gated on `EnableSse` as well as `EnableAlarms`, so **nine alarms by default, ten with SSE** — free in an account with no others — **and eleven with SSE and the webhook queue (D9b) both on**, USD 0.10 a month for the eleventh past the free ten. Errors and duration say nothing about a held stream (every invocation runs to its timeout by design), and throttles move only once the reservation is refusing, which the concurrency alarm, set below it, reports first |
 
 #### The webhook queue and its worker (D9b)
 
@@ -595,7 +653,8 @@ alarm that catches it and roughly what an unnoticed hour costs.
 
 | incident | per unnoticed hour | caught by |
 |---|---|---|
-| 1 000 SSE connections held open at 512 MB | **~24** | `ConcurrentExecutions` ≥ 50 for 5 min |
+| 20 SSE connections held open at 128 MB — the default reservation, full (D9c) | **~0.12**, and no more: past the reservation new listeners are refused | `SseConcurrencyAlarm`, ≥ 15 for 15 min |
+| 1 000 SSE connections held open at 512 MB, had the stream no function and no reservation of its own | ~24 | `ConcurrentExecutions` ≥ 50 for 5 min — the auth function's alarm, which is why the stream is not in that function |
 | Function timing out at 10 s instead of answering in 300 ms | ~33× the duration bill for the same traffic | `Duration` ≥ 8 000 ms twice running |
 | Recursive invocation at 50 concurrent, 10 s each | **~24**, plus DynamoDB per iteration | `ConcurrentExecutions`, then `Throttles` |
 | Credential stuffing at 100/s | ~0.45 in limiter writes, ~0.43 in platform | `ConsumedWriteCapacityUnits`, then `WriteThrottleEvents` |

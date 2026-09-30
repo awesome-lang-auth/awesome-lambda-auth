@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// The ULID the SSE event log keys on (data-model.md §1.9): 48 bits of Unix
+// The ULID the SSE event log keys on (data-model.md §1.5): 48 bits of Unix
 // milliseconds followed by 80 random bits, written as 26 characters of
 // Crockford's base32. Two properties are the whole reason for the choice, and
 // both are properties of the encoding rather than of any library:

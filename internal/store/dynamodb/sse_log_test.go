@@ -12,7 +12,7 @@ import (
 	auth "github.com/nik2208/awesome-go-auth"
 )
 
-// The SSE event log against DynamoDB Local (data-model.md §1.9): what Publish
+// The SSE event log against DynamoDB Local (data-model.md §1.5): what Publish
 // writes, that the ULIDs it keys on are ordered, and what Follow hands the
 // manager — in order, once, after a cursor, and not past the retention.
 //

@@ -1018,7 +1018,7 @@ Parameters:
 
   # -----------------------------------------------------------------------
   # D9c: the SSE function — GET <ToolsBasePath>/stream on a Lambda Function
-  # URL with response streaming (docs/sse.md, docs/config-reference.md §17.9).
+  # URL with response streaming (docs/sse.md, docs/config-reference.md §17.3).
   #
   # Off by default, and off means no resource and no bill: with EnableSse
   # "false" the function, its URL, its two permissions, its log group, its
@@ -3455,7 +3455,7 @@ Resources:
   # The Function URL, declared rather than left to SAM's FunctionUrlConfig so
   # that both permissions it needs are in this file where a reader can see them.
   #
-  # AuthType NONE, and the argument is docs/config-reference.md §17.9's: an
+  # AuthType NONE, and the argument is docs/config-reference.md §17.3's: an
   # AWS_IAM URL is reachable only through CloudFront's origin access control,
   # which is off by default, and OAC signs the origin request with SigV4 in the
   # Authorization header, so a bearer client's own header could not reach the
@@ -4482,27 +4482,6 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-TableName'
 
-  # Where alarms actually go, whichever way it was configured — so that a second
-  # stack, a chat bridge or a runbook can subscribe to the same topic instead of
-  # growing a second one, and so that "which topic is this deployment using" is
-  # answerable without reading the parameters. Absent when neither parameter is
-  # set, which is also the deployment where every alarm is decoration.
-  AlarmNotificationTopic:
-    Condition: HasAlarmTarget
-    Description: >-
-      SNS topic every alarm, budget notification and cost anomaly publishes to.
-      If this stack created it, the email subscription on it is PENDING until the
-      confirmation mail is clicked — until then the topic delivers to nobody.
-    Value: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
-    Export:
-      Name: !Sub '${AWS::StackName}-AlarmNotificationTopic'
-
-  FunctionName:
-    Description: Lambda function running the auth router.
-    Value: !Ref AuthFunction
-    Export:
-      Name: !Sub '${AWS::StackName}-FunctionName'
-
   # D9b. Where queued webhooks wait, and where the ones that gave up are.
   WebhookQueueUrl:
     Condition: WebhookQueueEnabled
@@ -4544,6 +4523,27 @@ Outputs:
         - 'https://${Host}${Path}/stream'
         - Host: !Select [2, !Split ['/', !GetAtt SseFunctionUrl.FunctionUrl]]
           Path: !Ref ToolsBasePath
+
+  # Where alarms actually go, whichever way it was configured — so that a second
+  # stack, a chat bridge or a runbook can subscribe to the same topic instead of
+  # growing a second one, and so that "which topic is this deployment using" is
+  # answerable without reading the parameters. Absent when neither parameter is
+  # set, which is also the deployment where every alarm is decoration.
+  AlarmNotificationTopic:
+    Condition: HasAlarmTarget
+    Description: >-
+      SNS topic every alarm, budget notification and cost anomaly publishes to.
+      If this stack created it, the email subscription on it is PENDING until the
+      confirmation mail is clicked — until then the topic delivers to nobody.
+    Value: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmNotificationTopic'
+
+  FunctionName:
+    Description: Lambda function running the auth router.
+    Value: !Ref AuthFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
 
   # The console's front door and, when it exists, the bucket behind its upload
   # tab. The URL is the API's own; behind the distribution the same path is

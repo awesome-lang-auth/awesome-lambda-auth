@@ -1068,7 +1068,7 @@ const (
 	DistributorRedis = "redis"
 	DistributorSNS   = "sns"
 	// DistributorDynamoDB is the event log in the deployment's own table
-	// (D9c, docs/spec/data-model.md §1.9): the one distributor this product
+	// (D9c, docs/spec/data-model.md §1.5): the one distributor this product
 	// implements. redis and sns stay in the enum because a family document
 	// may name them, and RS-14 refuses both by name.
 	DistributorDynamoDB = "dynamodb"

@@ -2020,9 +2020,12 @@ core publish its `identity.*` events at all.
 | `tools.basePath` | absolute path | `/tools` | `AWESOME_AUTH_TOOLS_BASE_PATH` |
 | `tools.telemetry.enabled` | boolean | `true` — mounts `track`, and the query when `stores.enable.telemetry` is on | `AWESOME_AUTH_TOOLS_TELEMETRY` |
 | `tools.notify.enabled` | boolean | `true` | `AWESOME_AUTH_TOOLS_NOTIFY` |
-| `tools.stream.enabled` | boolean | `true` — **honoured by nothing on this runtime**, §17.3 | `AWESOME_AUTH_TOOLS_STREAM` |
-| `tools.sse.enabled` | boolean | `false` — builds the in-process manager, which nothing listens to yet, §17.3 | `AWESOME_AUTH_SSE_ENABLED` |
+| `tools.stream.enabled` | boolean | `true` — never mounted on the auth function; served by the SSE function when `tools.sse.distributor.type` is `dynamodb` (D9c), §17.3 | `AWESOME_AUTH_TOOLS_STREAM` |
+| `tools.sse.enabled` | boolean | `false` — builds the manager; with the `dynamodb` distributor it publishes to the event log and the SSE function delivers, otherwise nothing listens, §17.3 | `AWESOME_AUTH_SSE_ENABLED` |
 | `tools.sse.heartbeatIntervalMs` / `.deduplicate` | int / boolean | `30000` / `true` — passed to the manager | `AWESOME_AUTH_TOOLS_SSE_HEARTBEAT_INTERVAL_MS`, `…_DEDUPLICATE` |
+| `tools.sse.distributor.type: dynamodb` (D9c) | enum value | the one distributor this product implements — the event log in the table, which the SSE function polls; needs `stores.driver: dynamodb` (RS-14); the refusal in the row below now applies to `redis` and `sns`, §17.3 | `AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE` |
+| `tools.sse.pollIntervalMs` (D9c) | int 100–5000 | `1000` — the SSE function's poll period while events arrive; backs off to 5 s after a minute of silence, §17.3 | `AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS` |
+| `tools.sse.eventLogRetentionSeconds` (D9c) | int 1800–604800 | `86400` — the event log's TTL and the replay horizon, §17.3 | `AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS` |
 | `tools.sse.distributor.*` | block | `type: none` — **anything else is refused (RS-14)**, §17.3 | — (file-only) |
 | `tools.inboundWebhooks.enabled` | boolean | `true` — **refused (RS-15) unless `scriptRunnerFunction` is set; otherwise write `false`**, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS` |
 | `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — the core's `ScriptTimeout`: the deadline on one **whole** script run, cut to what the auth invocation has left; read only with the route mounted (reported as inert otherwise when changed), §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
@@ -2173,26 +2176,164 @@ the one status `EventSource` treats as terminal: the specification fails the
 connection on any status but 200 and does not reconnect. A client learns the
 absence at once.
 
-**`tools.sse.distributor` of any type but `none` is refused at cold start
-(RS-14).** On Lambda a distributor is not an optimisation but the whole feature:
-every concurrent invocation is its own process, so a manager without one
-reaches only the connections of the environment that happened to serve the
-tracking request — which is almost never the environment serving a stream —
-and nothing says so. A document that names `redis` or `sns` has asked for
-cross-instance delivery this build cannot provide, and refusing it is what
-keeps that from being discovered by watching one stream miss events. The rule
-fires under `tools.enabled` whether or not `tools.sse.enabled` is set, because
-the type is the statement of intent.
+**`tools.sse.distributor` must be `dynamodb` for anything to listen, and
+`redis` and `sns` are refused as not implemented in this product (RS-14).** On
+Lambda a distributor is not an optimisation but the whole feature: every
+concurrent invocation is its own process, so a manager without one reaches
+only the connections of the environment that happened to serve the tracking
+request — which is almost never the environment serving a stream — and nothing
+says so. A document that names `redis` or `sns` has asked for cross-instance
+delivery this build does not provide, and refusing it is what keeps that from
+being discovered by watching one stream miss events. `dynamodb` on a driver
+that is not DynamoDB is refused by the same rule: the log is a partition of
+the table. The rule fires under `tools.enabled` whether or not
+`tools.sse.enabled` is set, because the type is the statement of intent.
 
-`tools.sse.enabled: true` is honoured as far as it goes: the in-process manager
-is built, `Track` and `Notify` broadcast into it, and the cold start says that
-nothing is listening. It is not refused, because the manager costs nothing and
-D9c makes it reach somebody.
+`tools.sse.enabled: true` with no distributor is honoured as far as it goes:
+the in-process manager is built, `Track` and `Notify` broadcast into it, and
+the cold start says that nothing is listening.
 
-**What D9c brings:** the stream on a Lambda Function URL with response
-streaming, its own function at its own memory size (the cost model says why),
-and a distributor, mandatory there. That block clears the unconditional
-`DisableStream`, adds the distributor, retires RS-14 and retires the deviation.
+**What D9c brought** is the rest of this section: the stream on a Lambda
+Function URL with response streaming, in a function of its own at its own
+memory size, joined to the auth function by the event log. The auth function
+is unchanged in what it serves — `DisableStream` stays set there, and the
+deviation stays, because a client of the API Gateway URL still gets `404` —
+and RS-14 is narrowed rather than retired.
+
+#### 17.3.1 The SSE function (D9c)
+
+The SSE function is the auth function's own artifact started with a second
+entry point, `AWESOME_AUTH_ENTRYPOINT=stream` (`cmd/auth/stream.go`). It is the
+same composition — the same configuration document, the same two signing
+secrets, the same stores, the same core, the same `tools.auth` guard — with a
+different Lambda runtime contract: a Function URL in `RESPONSE_STREAM` mode
+hands it an event and takes back a reader, where the auth function takes JSON
+and returns JSON. A separate binary with its own composition was considered
+and rejected: Go cannot import a main package, so it would have been a second
+copy of the token verification, the session check and the four postures that
+no test could hold to the first. The template gives the SSE function a subset
+of the auth function's environment, value for value
+(`template_test.go` `TestTheSseFunctionIsASubsetOfTheAuthFunction`).
+
+What it serves is `GET`, `HEAD` and `OPTIONS` on `<tools>/stream`, and `404`
+for every other request, before any route is reached; its tools router has
+every feature but the stream switched off. The route is the core's own chain —
+`?token=` copied into `Authorization: Bearer`, then the guard, then
+`StreamTopics` and `SseManager.Serve` — with one hook between the guard and
+the handler that resolves the client's `Last-Event-ID`, follows the event log
+for the connection's topics, and writes the resume prelude after the
+`connected` frame. [docs/sse.md](sse.md) states what a client receives and is
+promised.
+
+It refuses to start without `tools.enabled`, `tools.stream.enabled`,
+`tools.sse.enabled` and the `dynamodb` distributor, because a Function URL
+that answered `404` or `503` to every connection would bill an invocation per
+`EventSource` retry, forever, while looking deployed.
+
+#### 17.3.2 The event log and its two knobs
+
+`tools.sse.distributor.type: dynamodb` makes every broadcast in the auth
+function one `PutItem` per topic a stream can hold (`global`, `tenant:<t>`,
+`user:<u>`; a `session:` or `custom:` copy is not written, since no stream can
+hold it), and the SSE function polls the log for its one connection
+([spec/data-model.md](spec/data-model.md) §1.5, "The SSE event log"). The
+SAM template sets it, with `tools.sse.enabled`, on both functions whenever
+`EnableSse` is on.
+
+- `tools.sse.pollIntervalMs` (default `1000`, 100–5000) is the poll period
+  while events arrive. After a minute with nothing new the loop polls every
+  five seconds, and the next event snaps it back. The numbers are argued
+  against the poll's read bill in `docs/cost-model.md` §3.1: a poll is one
+  eventually-consistent Query per topic, and at one second on three topics it
+  is about a fifth of a 128 MB connection's compute; the back-off takes an
+  idle connection's reads down five-fold for at most four seconds of added
+  latency on the first event after a quiet minute.
+- `tools.sse.eventLogRetentionSeconds` (default `86400`, 1800–604800) is the
+  log's TTL and the replay horizon. The floor is two fifteen-minute segments,
+  because a quiet segment leaves a client with a cursor a segment old, and a
+  retention shorter than that would answer an ordinary reconnect with "replay
+  truncated". Storage is the cost of a longer one (§3.1 of the cost model).
+
+#### 17.3.3 `AuthType: NONE`, and what each choice costs
+
+A Function URL is either `AWS_IAM` — reachable only with a SigV4 signature,
+which a browser does not have, so in practice only through CloudFront's origin
+access control — or `NONE`, public, with the function's own code as the gate.
+The two shapes on the table were:
+
+1. **`AWS_IAM` behind OAC, with the stack refusing `EnableSse` without
+   `EnableCloudFront`.** The URL stays private. The costs: SSE would require
+   the distribution, which is off by default, and OAC signs the origin request
+   in the `Authorization` header — so a bearer client's own `Authorization`
+   could not reach the guard, and only `?token=` and the cookie would work.
+   An anonymous caller costs CloudFront a request (inside the free tier) and
+   the function nothing.
+2. **`NONE`, the handler's own guard as the only gate.** Reachable with or
+   without CloudFront, every credential form works, and a caller with no
+   credential costs **one short invocation and a refusal before any stream
+   starts**: the path gate answers `404` to anything but the stream, and the
+   guard answers the stream's refusal. At 128 MB and a few milliseconds that
+   is about USD 0.21 per million refused requests — the Lambda request charge
+   and almost nothing of duration — bounded in rate by the reservation below,
+   and invisible to API Gateway throttling and to any WAF on the distribution
+   when the caller goes to the URL directly.
+
+**This product takes (2).** A stream that only works with CloudFront on would
+make the feature depend on a switch that is off by default, and would break
+the one credential form service clients use; the exposure it avoids is
+refused requests at a fifth of a dollar a million. What (2) does not bound is
+an *authenticated* caller holding streams open — every held stream is billed
+whoever holds it, and under `tools.auth: session` anyone can register — which
+is what `SseReservedConcurrency` is for.
+
+#### 17.3.4 The concurrency ceiling
+
+`SseReservedConcurrency`, default **20**: the number of simultaneous
+listeners, since one stream holds one execution environment. At 128 MB that
+bounds the stream's compute at USD 0.12 an hour — about USD 88 a month if
+every slot were held around the clock — and keeps listeners out of the pool
+the auth function's logins draw from. Past it a new connection is refused with
+`429`, which `EventSource` retries. `SseConcurrencyAlarm` fires at 15
+(`SseConcurrencyAlarmThreshold`) held for fifteen minutes, before the
+reservation starts refusing. Empty means no reservation; an account whose
+concurrency limit is low — new accounts can start at 10 — cannot reserve 20
+and should set a smaller number or none.
+
+#### 17.3.5 Which URL a client opens, and the CloudFront behaviour
+
+With `EnableCloudFront` on, the distribution gains one behaviour: the path
+`<ToolsBasePath>/stream` goes to the Function URL, uncached (the stack's
+no-store policy), every viewer header, cookie and query string forwarded
+(`Last-Event-ID`, the access-token cookie, `?token=`), not compressed — an edge
+that compresses a streamed response holds bytes back — with an origin read
+timeout of 60 seconds that the 30-second heartbeat keeps a quiet stream
+inside. Clients then open the stream on the same origin as everything else.
+With CloudFront off they open it on the Function URL itself. The `SseStreamUrl`
+output is whichever applies; `SseFunctionUrl` is always the URL itself.
+
+The family's clients hard-code `<apiPrefix>/tools/stream`. That is served when
+`ToolsBasePath` is `<apiPrefix>/tools` — the mount their `track` and `notify`
+calls need anyway — which is why the behaviour follows `ToolsBasePath` rather
+than hard-coding a prefix.
+
+#### 17.3.6 CORS, decided by the same rule
+
+The Function URL carries no CORS configuration of its own. The product's CORS
+layer runs in the SSE function exactly as in the auth function, so the stream
+path is answered as the tools mount is: outside the layer when the mount is
+beside `http.apiPrefix` (the reference's tools router has none), inside it
+when the mount is under the prefix (§17 above, `corsExemptMounts`).
+Configuring the URL's CORS as well is how a response ends up with two
+`Access-Control-Allow-Origin` headers, which a browser rejects. Behind
+CloudFront the stream is same-origin and CORS does not arise.
+
+#### 17.3.7 What the cold start says
+
+The auth function logs `the SSE manager publishes to the event log`; the SSE
+function logs `SSE function: serving GET <tools>/stream and nothing else` with
+the two knobs, and warns when the heartbeat is off or 60 seconds or more,
+because CloudFront would cut a quiet stream. Without the `dynamodb`
+distributor both stream knobs are reported as unwired (§17.1), as before.
 
 ### 17.4 Outgoing webhooks: in process by default, queued with `tools.outboundWebhooks.queueUrl`
 

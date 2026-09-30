@@ -18,7 +18,7 @@ import (
 	auth "github.com/nik2208/awesome-go-auth"
 )
 
-// This file is the SSE event log (D9c, data-model.md §1.9): the
+// This file is the SSE event log (D9c, data-model.md §1.5): the
 // auth.SseDistributor this product implements, and the thing that makes a
 // resume cursor mean something.
 //
@@ -84,7 +84,7 @@ const (
 	DefaultSseIdleAfter    = time.Minute
 
 	// DefaultSseSettle is how far behind the newest delivered event each poll
-	// looks again. data-model.md §1.9 argues it: an eventually consistent read,
+	// looks again. data-model.md §1.5 argues it: an eventually consistent read,
 	// or a second publisher's slower write, can make an older ULID visible
 	// after a newer one, and a cursor that only moved forward would skip it.
 	// Three seconds covers DynamoDB's sub-second consistency window and a
@@ -227,7 +227,7 @@ var _ auth.SseDistributor = (*SseLog)(nil)
 // authorises exactly three shapes (auth_tools.go) and every topic a connection
 // holds comes from it, so an event published anywhere else — the session:<sid>
 // copy EventTopics fans every identity event to, a custom: notify target — is
-// an item nobody could ever read. data-model.md §1.9 argues skipping it;
+// an item nobody could ever read. data-model.md §1.5 argues skipping it;
 // TestStreamTopicsAuthoriseOnlyTheLoggedShapes fails the day the core
 // authorises a fourth shape.
 func streamableTopic(topic string) bool {
@@ -241,7 +241,7 @@ func streamableTopic(topic string) bool {
 // The event's id is replaced by a ULID in the log, the same ULID for every
 // topic the one event is published to: Broadcast calls Publish once per topic
 // with the event it built once, and the id it minted is the key the memo maps.
-// The id Broadcast minted is kept as coreId. See data-model.md §1.9 for why the
+// The id Broadcast minted is kept as coreId. See data-model.md §1.5 for why the
 // ULID comes from this store's clock and never from event.Timestamp.
 func (l *SseLog) Publish(ctx context.Context, topic string, event auth.StreamEvent) error {
 	if !streamableTopic(topic) {
@@ -376,7 +376,7 @@ func sseEventFromItem(m map[string]types.AttributeValue) (ulid, auth.StreamEvent
 		Timestamp: getS(m, attrSseTimestamp),
 		Topic:     getS(m, attrSseTopic),
 		// The payload's own bytes, handed back as a RawMessage so the frame
-		// writer emits them unchanged (data-model.md §1.9).
+		// writer emits them unchanged (data-model.md §1.5).
 		Data:     json.RawMessage(getS(m, attrSseData)),
 		UserID:   getS(m, attrUserID),
 		TenantID: getS(m, attrTenantID),
@@ -676,7 +676,7 @@ func (l *SseLog) readTopic(ctx context.Context, topic string, lower ulid, seen m
 		},
 		// Eventually consistent, on purpose: the look-back is what makes a
 		// stale read safe, and it halves the line that dominates the poll's
-		// bill. data-model.md §1.9.
+		// bill. data-model.md §1.5.
 		ConsistentRead:   aws.Bool(false),
 		ScanIndexForward: aws.Bool(true),
 		Limit:            aws.Int32(int32(l.opts.Page)),
@@ -693,7 +693,7 @@ func (l *SseLog) readTopic(ctx context.Context, topic string, lower ulid, seen m
 			if err != nil {
 				return nil, false, err
 			}
-			// TTL deletion is lazy; the horizon is not (data-model.md §1.9).
+			// TTL deletion is lazy; the horizon is not (data-model.md §1.5).
 			if bytes.Compare(id[:], horizon[:]) < 0 {
 				continue
 			}
