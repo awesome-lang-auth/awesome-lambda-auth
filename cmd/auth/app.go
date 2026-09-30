@@ -450,7 +450,8 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //     password verifier through a second per-request carrier of the same shape:
 //     a ctx cannot be mutated by the callee, so the HTTP layer installs an empty
 //     scope and the two ends fill and consume it. See migrationScopeMiddleware.
-//   - CORS, everywhere but the admin mount (corsExemptMounts).
+//   - CORS, everywhere but the admin mount and a tools mount beside the api
+//     prefix (corsExemptMounts).
 //   - The observability pair, whose order is the argument: the carrier has to
 //     exist before anything can read it, and the access log is one of the
 //     things that reads it. So correlationScope sits between them, and
@@ -518,7 +519,14 @@ func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adm
 // httpConfig carries no ToolsOptions — mountAuthSurface fills that field —
 // and toolsPath is the mount the adapter resolves (docs.go uses the same
 // pair). cmd/auth/tools_test.go TestToolsMountFollowsTheReferenceCORSGeometry
-// pins both shapes.
+// pins both shapes. Under the prefix, that also means an allow-listed origin
+// gets the reference's credentialed CORS on the tools routes; under tools.auth:
+// admin those routes accept a console credential, so script on such an origin
+// can call them with an administrator's cookie and read the answer — the
+// access the console itself is kept out of the layer to deny. It is the
+// reference's layout, reproduced, and the config reference says so (§17.6).
+// A mount above the prefix is refused by internal/config (validateMounts),
+// because exempting it would exempt every auth route below it.
 func corsExemptMounts(cfg *config.Config) []string {
 	hc := httpConfig(cfg)
 	var mounts []string

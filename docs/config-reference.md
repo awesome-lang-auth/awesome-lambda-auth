@@ -2396,7 +2396,17 @@ the admin console (§16.2, `cmd/auth/app.go` `corsExemptMounts`); mounted
 the router served at `/api/auth`, `ng-awesome-node-auth`
 `src/server/auth.routes.ts:98-99`), every request passes the auth router's
 layer first, so there the tools mount stays wrapped.
-`TestToolsMountFollowsTheReferenceCORSGeometry` pins both shapes.
+`TestToolsMountFollowsTheReferenceCORSGeometry` pins both shapes. Under the
+prefix an allow-listed origin therefore gets credentialed CORS
+(`Access-Control-Allow-Credentials: true`) on the tools routes, and with
+`tools.auth: admin` those routes take a console credential: script on an
+allow-listed origin can call `GET <tools>/telemetry`, `track` and `notify`
+with an administrator's cookie and read the answers — the access the console
+itself is kept out of the layer to deny. Keep the mount beside the prefix
+under this posture unless every allow-listed origin is trusted with the
+console. A mount *above* the prefix (`/api` under `/api/auth`) is refused at
+load (`internal/config` `validateMounts`), because its exemption would take
+every auth route out of the layer.
 
 **Rate limiting.** `track` has no name in `rateLimit.scope` (§14.1), and that
 is a decision rather than an omission. The scope vocabulary is "the

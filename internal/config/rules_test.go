@@ -586,6 +586,23 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage:        "http.apiPrefix itself",
 		},
 		{
+			// Above the prefix: the tools mount would contain the auth router,
+			// and its CORS exemption would take every auth route out of the
+			// layer (validateMounts).
+			name: "the tools router mounted above the api prefix",
+			mutate: func(doc Document) {
+				set(doc, "http.apiPrefix", "/api/auth")
+				set(doc, "tools.enabled", true)
+				set(doc, "tools.auth", "session")
+				set(doc, "tools.inboundWebhooks.enabled", false)
+				set(doc, "tools.basePath", "/api")
+			},
+			allowUnimplemented: true,
+			wantRule:           "",
+			wantPath:           "tools.basePath",
+			wantMessage:        "is above http.apiPrefix",
+		},
+		{
 			// Two subtree routers on one mount is a duplicate ServeMux pattern,
 			// which is a panic inside the adapter rather than a diagnostic.
 			name: "the tools router mounted on the admin console's path",

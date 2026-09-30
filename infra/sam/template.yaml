@@ -756,9 +756,9 @@ Parameters:
       AWESOME_AUTH_TOOLS_BASE_PATH — where the tools router mounts: beside
       ApiPrefix by default, and it may be placed under it — the Angular demo
       mounts it at <apiPrefix>/tools; set this to "/auth/tools" to follow it.
-      It may not be "/", ApiPrefix itself, or the admin console's mount or a
-      path inside it; each of those is refused at cold start rather than
-      mounted (internal/config, validateMounts).
+      It may not be "/", ApiPrefix itself, a path above ApiPrefix, or the
+      admin console's mount or a path inside it; each of those is refused at
+      cold start rather than mounted (internal/config, validateMounts).
 
   # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
