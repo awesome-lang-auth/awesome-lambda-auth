@@ -2884,12 +2884,12 @@ through it and not through any route:
   `Track`, and an `identity.*` event tracked *by the host* is simply a second
   event with that name, recorded and delivered as such.
 
-### 17.8 What waits for the three blocks that follow
+### 17.8 The three seams the blocks after D9a filled
 
 | Block | Seam | What it replaces in `cmd/auth/tools.go` |
 |---|---|---|
 | D9b (landed) | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field, behind `tools.outboundWebhooks.queueUrl`; `outgoing-webhook-delivery-races-the-response` stays for the default, unqueued configuration (§17.4) |
-| D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
+| D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` — **landed** | `DisableStream` stays `true` on the auth function and is cleared on the SSE function alone (`stream.go`, `streamToolsOptions`); `WithSseDistributor` is the `dynamodb` event log. RS-14 is narrowed to `redis`, `sns` and the event log on a driver with no table, and `tools-stream-is-not-mounted-on-api-gateway` is rewritten rather than retired: the route still answers `404` behind API Gateway (§17.3) |
 | D9d | `InboundScriptRunner` as its own Lambda — **landed** | `ScriptRunner` is `LambdaScriptRunner` when `scriptRunnerFunction` is named; RS-15 and `inbound-webhooks-are-refused-without-a-runner` are narrowed to a route with no runner rather than retired (§17.5) |
 
 ## 18. Two worked postures

@@ -682,11 +682,12 @@ the same mistake in slow motion.
 `EnableAlarms` is `true` by default. The set is **nine standard-resolution alarm
 metrics against CloudWatch's always-free ten**, which is a design constraint and
 not a coincidence: in an account with no other alarms this section is free, and
-it is $0.90/month in one that has already spent the allowance. The D9b webhook
-queue (`EnableWebhookQueue`) adds exactly one, its dead-letter depth, gated on
-its own switch, so a stack with the queue has ten — still free — and the
-worker's other four metrics are left unalarmed on purpose
-(docs/cost-model.md §3.3).
+it is $0.90/month in one that has already spent the allowance. Each optional
+function adds exactly one, gated on its own switch: the D9b webhook queue
+(`EnableWebhookQueue`) its dead-letter depth, the D9d script runner
+(`EnableInboundWebhooks`) its duration, the D9c SSE function (`EnableSse`) its
+concurrency. Their other metrics are left unalarmed on purpose, and the all-on
+total is stated once, in docs/cost-model.md §3.3.
 
 | alarm | metric | fires at | the incident |
 |---|---|---|---|
@@ -840,7 +841,8 @@ at rest or billed per request:
   ten, the topic and its subscription have no standing charge (and the first
   1 000 email notifications a month are free), the budget is the free second of
   two, and cost anomaly detection is free. In an account that has already spent
-  its ten alarm metrics elsewhere, $0.90/month ($1.00 with the webhook queue).
+  its ten alarm metrics elsewhere, $0.90/month, plus $0.10 for each optional
+  function's alarm (cost-model §3.3).
 - S3 artifact bucket: a few megabytes per deployed version. Cents.
 - Admin uploads bucket (`EnableAdminUploads=true`): storage at ~$0.023 per
   GB-month — cents for a handful of logos — plus ~$0.0004 per thousand

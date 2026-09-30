@@ -66,12 +66,15 @@ const (
 	// names that day. D9d's did: RS-15 now refuses inbound webhooks only when
 	// no tools.inboundWebhooks.scriptRunnerFunction names the runner, which is
 	// the same failure with a remedy that can finally be written down, so it
-	// kept its number.
+	// kept its number. D9c's did too: RS-14 now refuses only the distributors
+	// this build does not implement (redis, sns) and the dynamodb event log on
+	// a driver with no table to hold it, and kept its number for the same
+	// reason. Neither retires.
 	RuleToolsSSEDistributor  = "RS-14"
 	RuleToolsInboundWebhooks = "RS-15"
 
 	// RuleToolsAuthUnset is the rule about who may reach the tools routes, and
-	// unlike the two above it does not retire: it waits on no transport. RS-16
+	// unlike the two above it never waited on a transport. RS-16
 	// refuses an enabled tools block that never says tools.auth, because the
 	// only value silence could resolve to is the reference's — no guard at all
 	// — and the imported core declined exactly that default on purpose

@@ -43,7 +43,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | DynamoDB stream, unconsumed | 0.00 | Enabled from day one; nothing at rest |
 | Lambda, HTTP API | 0.00 | Purely per-request |
 | CloudFront, if enabled | 0.00 | No hourly or monthly charge; the two policies are free |
-| SSE function, `EnableSse=true` only (D9c) | 0.00 | Per connection-hour only (§3.1); its URL, permissions and CloudFront behaviour are free, and its alarm is the tenth metric (§3.3) |
+| SSE function, `EnableSse=true` only (D9c) | 0.00 | Per connection-hour only (§3.1); its URL, permissions and CloudFront behaviour are free, and its alarm is counted with the other optional functions' in §3.3 |
 | CloudWatch Logs storage | ~0.00 | At 14-day retention and this traffic, a few MB |
 | **The nine alarms** | **0.00** | Nine alarm metrics enabled by default, against a free allowance of ten; each optional function adds its own, gated on its switch and counted in §3.3 |
 | **SNS topic + subscription** | **0.00** | No charge at rest; first 1 000 email notifications a month are free |
@@ -459,7 +459,7 @@ A legitimate `apiKey` connect pays the same bcrypt once per segment, about USD
 
 **What it adds at rest: nothing.** The function, its URL, its two permissions,
 its log group and the CloudFront behaviour have no standing charge, and all of
-them exist only with `EnableSse`. Its alarm is the tenth metric (§3.3).
+them exist only with `EnableSse`. Its alarm is counted in §3.3.
 
 ### 3.2 What the alternatives cost, so the trade is explicit
 
@@ -490,15 +490,16 @@ D9c's decision to record rather than this document's to make, and D9c recorded i
 Each one brings **a log group that must be declared explicitly or it will never
 expire** — see §5 — and alarms. It would bring four alarm metrics (errors,
 throttles, duration, concurrency) at USD 0.10 a month past the free ten if it
-took the auth function's set; the webhook worker and the script runner take one
-each. The template counts the alarms **enabled by default** against the free
+took the auth function's set; the webhook worker, the script runner and the SSE
+function take one each. The template counts the alarms **enabled by default** against the free
 ten, so an optional function's alarms are gated on its own switch and priced
 here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`): **nine
 alarms by default**, and one more for each optional function switched on —
 `WebhookDeadLetterAlarm` with `EnableWebhookQueue`, `ScriptRunnerDurationAlarm`
-with `EnableInboundWebhooks`. **All-on total: 11 alarm metrics**, one past the
-free ten: USD 0.10 a month in an account with no other alarms, USD 1.10 in one
-whose allowance is already spent. `TestTheAlarmSetStaysInsideTheFreeAllowance`
+with `EnableInboundWebhooks`, `SseConcurrencyAlarm` with `EnableSse`.
+**All-on total: 12 alarm metrics**, two past the free ten: USD 0.20 a month in
+an account with no other alarms, USD 1.20 in one whose allowance is already
+spent. `TestTheAlarmSetStaysInsideTheFreeAllowance`
 asserts that sentence against the template, and fails unless the all-on total
 is the number written here.
 
@@ -507,7 +508,7 @@ is the number written here.
 | webhook worker | **Landed (D9b)**, below |
 | script runner | **Landed (D9d)**, below. Per run, and the run is **caller-initiated** — the inbound route is unauthenticated — so the exposure is a stranger's rate times a script that loops, capped by a reservation |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
-| SSE function | **Landed (D9c)**, priced in §3.1. One alarm, not four: `SseConcurrencyAlarm`, gated on `EnableSse` as well as `EnableAlarms`, so **nine alarms by default, ten with SSE** — free in an account with no others — **and eleven with SSE and the webhook queue (D9b) both on**, USD 0.10 a month for the eleventh past the free ten. Errors and duration say nothing about a held stream (every invocation runs to its timeout by design), and throttles move only once the reservation is refusing, which the concurrency alarm, set below it, reports first |
+| SSE function | **Landed (D9c)**, priced in §3.1. One alarm, not four: `SseConcurrencyAlarm`, gated on `EnableSse` as well as `EnableAlarms` and counted in the paragraph above. Errors and duration say nothing about a held stream (every invocation runs to its timeout by design), and throttles move only once the reservation is refusing, which the concurrency alarm, set below it, reports first |
 
 #### The webhook queue and its worker (D9b)
 
@@ -740,7 +741,7 @@ behind. **For this product the fastest spend alarm is not a spend alarm.**
 | | USD / month |
 |---|---|
 | Nine alarm metrics enabled by default, standard resolution | 0.00 (free ten) / 0.90 beyond |
-| The optional functions' alarms, one each (§3.3: the dead-letter alarm with `EnableWebhookQueue`, the script runner's duration alarm with `EnableInboundWebhooks`) | 0.10 each past the free ten; all on, 11 metrics — 0.10 in an account with no other alarms |
+| The optional functions' alarms, one each (§3.3: the dead-letter alarm with `EnableWebhookQueue`, the script runner's duration alarm with `EnableInboundWebhooks`, the SSE concurrency alarm with `EnableSse`) | 0.10 each past the free ten; all on, 12 metrics — 0.20 in an account with no other alarms |
 | SNS topic, one email subscription | 0.00 (first 1 000 notifications free; 2.00 per 100 000 after) |
 | One budget | 0.00 (second of two free per account) |
 | Cost anomaly detection | 0.00 |

@@ -1592,8 +1592,8 @@ Conditions:
   # the Rule below, so that a stack which somehow bypassed the Rule still
   # creates nothing rather than a function whose cold start refuses. Its one
   # alarm is gated on the function's own switch as well as on EnableAlarms, so
-  # a stack without SSE carries the nine alarms X4a counted and not ten
-  # (template_test.go counts the alarms enabled by default).
+  # a stack without SSE does not carry it (template_test.go counts the alarms
+  # enabled by default).
   SseEnabled: !And [!Equals [!Ref EnableSse, 'true'], !Condition ToolsEnabled]
   SseBehindCloudFront: !And [!Condition SseEnabled, !Condition CloudFrontEnabled]
   HasSseReservedConcurrency: !Not [!Equals [!Ref SseReservedConcurrency, '']]
@@ -3404,7 +3404,14 @@ Resources:
           AWESOME_AUTH_TOOLS_ENABLED: !Ref EnableTools
           AWESOME_AUTH_TOOLS_AUTH: !If [ToolsEnabled, !Ref ToolsAuth, !Ref 'AWS::NoValue']
           AWESOME_AUTH_TOOLS_BASE_PATH: !If [ToolsEnabled, !Ref ToolsBasePath, !Ref 'AWS::NoValue']
-          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, 'false', !Ref 'AWS::NoValue']
+          # The inbound-webhook trio is the auth function's, line for line (D9d):
+          # this function never mounts the route (streamToolsOptions sets
+          # DisableWebhook), but it loads the same document, and RS-15 refuses
+          # the route switched on with no runner named. Naming the runner here
+          # grants nothing: the runner is invoked only by the auth function.
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, !Ref EnableInboundWebhooks, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION: !If [InboundWebhooksEnabled, !Ref ScriptRunnerFunction, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS: !If [InboundWebhooksEnabled, !Ref InboundScriptTimeoutMs, !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_ENABLE_TELEMETRY: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_ENABLE_WEBHOOKS: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_ENABLE_API_KEYS: !If [ToolsAuthApiKey, 'true', !Ref 'AWS::NoValue']
@@ -4195,9 +4202,8 @@ Resources:
   # has (docs/cost-model.md §4).
   #
   # Gated on the function's own switch as well as EnableAlarms, so a stack
-  # without SSE has the nine alarms X4a counted; with SSE it has ten, which is
-  # still the free allowance in an account with no others (§3.3 prices the
-  # tenth where it is not).
+  # without SSE does not have it (docs/cost-model.md §3.3 counts it with the
+  # other optional functions' alarms).
   #
   # Fifteen minutes sustained rather than the auth function's five, because a
   # stream is minutes long by nature: five minutes of fifteen listeners is an

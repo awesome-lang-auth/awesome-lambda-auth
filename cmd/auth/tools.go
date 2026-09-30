@@ -226,7 +226,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the seams later blocks fill (D9b and D9d, each when configured) ─────────
+// ── the three seams later blocks fill (D9b, D9c, D9d, each when configured) ─
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries
@@ -252,6 +252,13 @@ import (
 // redelivers — so RS-15 refuses tools.inboundWebhooks.enabled with no function
 // named. The scriptTimeoutMs knob is the core's ScriptTimeout, the deadline on
 // the whole invocation.
+//
+// The SSE distributor is D9c's: with tools.sse.distributor.type: dynamodb the
+// manager distributes through the event log in the table (newToolsWiring, the
+// D9c region), which the SSE function — this same artifact, started with
+// AWESOME_AUTH_ENTRYPOINT=stream — follows for its one connection
+// (stream.go). With any other type the manager reaches nobody on this
+// runtime, and RS-14 refuses the two types this build does not implement.
 
 // toolsWiring is what the tools block builds before the core exists: the bus
 // the core will publish on, the facade the router will call, and the handle
@@ -860,7 +867,7 @@ func toolsPath(cfg *config.Config) string {
 
 // logToolsSurface announces what the block resolved to, so an operator can tell
 // from the cold-start log which tools routes exist, behind what, fed by which
-// stores — and which two things this runtime does not do yet.
+// stores — and where the stream is served, which is not this function.
 func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	if tw == nil {
 		// toolsOptions has already said the block is off, at the point the
@@ -873,6 +880,12 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	// tools.enabled and toolsAccess refuses it again, so the posture logged is
 	// the posture the document wrote.
 	posture := cfg.Tools.Auth
+	// D9c: the auth function never mounts the stream; with the event log as the
+	// distributor the SSE function serves it (stream.go, logStreamSurface).
+	stream := "not mounted on this function: GET " + mount + "/stream answers 404 here whatever tools.stream.enabled says (deviation tools-stream-is-not-mounted-on-api-gateway)"
+	if cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB {
+		stream += "; the SSE function serves it on its Function URL, fed by the event log (docs/sse.md)"
+	}
 	log.Info("tools surface mounted",
 		slog.String("mount", mount),
 		slog.String("auth", posture),
@@ -884,7 +897,7 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 		slog.Bool("telemetryQuery", cfg.Tools.Telemetry.Enabled && tw.telemetry),
 		slog.Bool("docs", docsEnabled(cfg)),
 		slog.String("bridge", "on: every identity.* event the auth core raises is persisted to the telemetry store and delivered to every matching outgoing webhook"),
-		slog.String("stream", "not mounted on this runtime: GET "+mount+"/stream answers 404 whatever tools.stream.enabled says, until D9c (deviation tools-stream-is-not-mounted-on-api-gateway)"),
+		slog.String("stream", stream),
 		slog.String("outgoingWebhooks", outgoingWebhooksLine(cfg))) // D9b: which deliverer is in force
 
 	// What each guarded posture still costs, said where the operator reads what
@@ -1015,7 +1028,7 @@ func toolsKnobGaps(cfg *config.Config) []knobGap {
 		gaps = append(gaps, knobGap{
 			Path:    "tools.sse.enabled",
 			Problem: "the SSE manager is built, but with the stream unmounted and no distributor it holds no connection, so every broadcast reaches nobody",
-			Remedy:  "leave it set if the same document is deployed to another port in the family, or for D9c; nothing here is lost, and nothing here is delivered either",
+			Remedy:  "set tools.sse.distributor.type: dynamodb and deploy the SSE function (the template's EnableSse) to deliver it (docs/sse.md), or leave it set if the same document is deployed to another port in the family; nothing here is lost, and nothing here is delivered either",
 		})
 	}
 	// ── D9c: the event log's knobs, and the distributor's connection ─────────
