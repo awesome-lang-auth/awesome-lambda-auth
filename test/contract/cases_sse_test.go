@@ -85,6 +85,15 @@ func init() {
 				switch {
 				case s.status == 404:
 					why = append(why, fmt.Sprintf("%s answered 404", s.target))
+				case s.status == 401 || s.status == 403:
+					// A stream mounted behind a guard this suite's bearer
+					// cannot pass: under tools.auth apiKey — the SAM
+					// template's default — ?token= becomes Authorization:
+					// Bearer, which the API-key guard does not read, and the
+					// admin posture wants the console's token. Not a fault;
+					// the capability is absent for this credential, as
+					// classifyTools says of the tools router itself.
+					why = append(why, fmt.Sprintf("%s answered %d: mounted behind a guard this suite's session cannot pass (tools.auth is apiKey or admin)", s.target, s.status))
 				case s.status != 200 || !strings.HasPrefix(s.contentType, "text/event-stream"):
 					broken = fmt.Sprintf("%s answered %d %q, which is neither a stream nor a declared absence", s.target, s.status, s.contentType)
 				default:
@@ -204,16 +213,19 @@ func (s *sseStream) next() (sseFrameRead, error) {
 	}
 }
 
-// nextEvent reads frames until one carries an event line, skipping heartbeats
-// and the cursor frame.
-func (s *sseStream) nextEvent(t *testing.T, what string) sseFrameRead {
+// nextEvent reads frames until one carries an event line whose type starts
+// with prefix, skipping heartbeats, the cursor frame and every other event.
+// Other events are expected: every connection holds the global topic, which
+// carries every login on the deployment — the suite's own included — and on
+// this product a resume re-delivers what the look-back below the cursor holds.
+func (s *sseStream) nextEvent(t *testing.T, prefix, what string) sseFrameRead {
 	t.Helper()
 	for {
 		f, err := s.next()
 		if err != nil {
 			t.Fatalf("%s: the stream ended before %s: %v", s.target, what, err)
 		}
-		if f.event != "" {
+		if f.event != "" && strings.HasPrefix(f.event, prefix) {
 			return f
 		}
 	}
@@ -258,7 +270,7 @@ func init() {
 
 						eventType := fmt.Sprintf("contract.sse.%d", time.Now().UnixNano())
 						notifyUser(t, e, token, uid, eventType, map[string]any{"n": 1, "s": "<b>&</b>"})
-						f := s.nextEvent(t, "the notified event")
+						f := s.nextEvent(t, eventType, "the notified event")
 						if f.event != eventType || f.id == "" {
 							t.Fatalf("frame = %+v, want event %q with an id", f, eventType)
 						}
@@ -295,7 +307,7 @@ func init() {
 
 						s := openConnected(t, e, origin, token, nil)
 						notifyUser(t, e, token, uid, earlier, map[string]any{"which": "earlier"})
-						first := s.nextEvent(t, "the earlier event")
+						first := s.nextEvent(t, earlier, "the earlier event")
 						if first.event != earlier {
 							t.Fatalf("first event %q, want %q", first.event, earlier)
 						}
@@ -304,12 +316,18 @@ func init() {
 						notifyUser(t, e, token, uid, later, map[string]any{"which": "later"})
 
 						resumed := openConnected(t, e, origin, token, http.Header{"Last-Event-ID": {first.id}})
-						got := resumed.nextEvent(t, "the replayed event")
-						if got.event == earlier {
-							t.Fatalf("the reconnect replayed the event at the cursor (%s), which it had already received", earlier)
-						}
-						if got.event != later {
-							t.Fatalf("the reconnect was handed %q, want the event raised while disconnected, %q", got.event, later)
+						// Only this run's two events are asserted: the look-back
+						// below the cursor may re-deliver anything else the
+						// window holds (at-least-once), and never the cursor's
+						// own event.
+						for {
+							got := resumed.nextEvent(t, "contract.sse.", "the replayed event")
+							if got.event == earlier {
+								t.Fatalf("the reconnect replayed the event at the cursor (%s), which it had already received", earlier)
+							}
+							if got.event == later {
+								break
+							}
 						}
 					})
 				}

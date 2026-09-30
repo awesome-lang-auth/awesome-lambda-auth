@@ -474,12 +474,45 @@ TypeScript cast is a no-op at runtime and `{"userId":5}` is tracked with the
 number 5 in a string field. The typed decode is the registered core deviation
 and the `202`-that-recorded-something-else is the hazard it closes.
 
-Not covered: `GET <tools>/stream`. On this product it answers `404` in every
-configuration — the product deviation `tools-stream-is-not-mounted-on-api-gateway`
-([deviations.md](../../docs/deviations.md)), pinned in `cmd/auth/tools_test.go`
-where the absence is the assertion — and against the reference it is a
-long-lived `text/event-stream`, so a case that held the connection would flake
-on one and skip on the other. It joins the suite with the transport that carries
+**The stream (D9c).** `GET <tools>/stream` is read over plain `net/http` with a
+bounded deadline, never through the suite's buffering client, and only its first
+frames are asserted; the connection is closed as soon as a case has what it
+needs. Two targets: `<base><tools>/stream` — the CloudFront behaviour in front
+of the SSE function on this product, the tools router itself on the reference —
+and, when `AWESOME_AUTH_CONTRACT_SSE_URL` names it, the Function URL directly,
+so an edge that starts buffering is told apart from a protocol break. Events are
+triggered through the base URL, where `POST <tools>/notify` lives.
+
+The probe logs the provisioned account in with a bearer strategy and opens each
+target with `?token=`:
+
+- `sse` is **on** when a target answers `200 text/event-stream` with a
+  `connected` first frame; **absent** when every target answers `404` (no
+  transport, as behind API Gateway alone — `tools-stream-is-not-mounted-on-api-gateway`)
+  or `401`/`403` (mounted behind a guard this suite's session cannot pass:
+  under `tools.auth: apiKey`, the SAM template's default, `?token=` becomes
+  `Authorization: Bearer`, which the API-key guard does not read — the reading
+  `classifyTools` gives the tools router); **broken** on anything else.
+- `sse-resume` is **on** when an id-only frame follows the `connected` frame,
+  which is this product's cursor frame (`sse-resume-replays-from-the-event-log`),
+  and **absent** otherwise — the reference writes none, so against it the
+  resume case skips as a declared absence.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `sse/stream-emits-named-frames-with-rawData` | reference `sse-manager.ts:140-146`, `:250-252`, `tools.router.ts:185-220` — `?token=` authenticates, the first frame is `connected`, and a notified event arrives as `id:`/`event:`/`data:` whose JSON carries the payload under `rawData`, no `data` key, and `topic: user:<id>` | `tools`, `sse` |
+| `sse/resume-replays-after-last-event-id` | the product deviation `sse-resume-replays-from-the-event-log` — a reconnect with `Last-Event-ID` set to an event already received is handed the event raised while it was away, and never the one at the cursor; anything else the look-back below the cursor re-delivers is skipped, as at-least-once permits | `tools`, `sse`, `sse-resume` |
+
+Both cases skip every event that is not their own: each connection holds the
+`global` topic, which carries every login on the deployment, the suite's own
+included.
+
+Before this block the stream was not covered: through API Gateway it answers
+`404` in every configuration — the product deviation `tools-stream-is-not-mounted-on-api-gateway`
+([deviations.md](../../docs/deviations.md)), which still holds for that URL and
+is pinned in `cmd/auth/tools_test.go` — and against the reference it is a
+long-lived `text/event-stream`, so the cases above read its first frames and
+close it. They joined the suite with the transport that carries
 it (D9c). Also not covered: the inbound webhook route, which this product refuses
 to mount until a script runner exists (RS-15), and the email and SMS channels of
 notify, which no HTTP route reaches in either tree.
