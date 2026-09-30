@@ -406,7 +406,7 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID:      "outgoing-webhook-delivery-races-the-response",
-			Surface: "every outgoing webhook delivery, whether the event was tracked or bridged",
+			Surface: "every outgoing webhook delivery, whether the event was tracked or bridged, while tools.outboundWebhooks.queueUrl is unset -- which is the default, and the SAM template's unless EnableWebhookQueue is \"true\"",
 			Behaviour: "Deliveries are made in process by the core's HTTP deliverer, on a goroutine detached from the request, " +
 				"and the response is written without waiting for them. On Lambda the execution environment is frozen the " +
 				"moment the response is written, so a delivery that has not completed by then completes -- if the same " +
@@ -424,12 +424,69 @@ func WireDeviations() []WireDeviation {
 				"receiver's log must be able to learn from the cold-start line why a delivery arrived a minute late or " +
 				"never. The seam the core built for this is WebhookDeliverer, which receives a fully built, signed, numbered " +
 				"attempt with no secret in it; D9b implements it as an SQS enqueue with a dead-letter queue and a worker " +
-				"that reproduces the schedule from Retries() and RetryDelay(), which is when this entry is retired. " +
+				"that reproduces the schedule from Retries() and RetryDelay(), behind tools.outboundWebhooks.queueUrl. " +
+				"The entry is not retired by that: the queue is opt-in, because it is two AWS resources and a second " +
+				"function, and an empty parameter adds no resource and no cost -- so the default deployment is still this " +
+				"one, and queued-webhooks-are-delivered-at-least-once is the entry for the other. " +
 				"Delivering synchronously on the request goroutine instead was considered and rejected: it would make a " +
 				"slow receiver a slow login, times the retry schedule, and would still lose the deliveries of the " +
 				"invocation that hit the function timeout.",
 			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.8; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
 		},
+		// ── D9b: outgoing webhooks from a queue ──
+		{
+			ID: "queued-webhooks-are-delivered-at-least-once",
+			Surface: "every outgoing webhook delivery with tools.outboundWebhooks.queueUrl set (the SAM template's " +
+				"EnableWebhookQueue), and the receiver's view of it",
+			Behaviour: "The response waits (at most two seconds) until each matching delivery is stored on SQS, and " +
+				"cmd/webhook-worker then POSTs it with the headers and body the core built and signed. A delivery " +
+				"survives the auth function's execution environment being frozen or recycled, is retried on the " +
+				"reference's schedule -- at most Retries() further attempts, the first after RetryDelay(), each wait " +
+				"twice the last -- and, when the attempts are spent, is moved to a dead-letter queue kept fourteen " +
+				"days, with an alarm on its depth. Delivery is at-least-once: a worker that stops after the receiver " +
+				"answered and before the ledger recorded it (data-model.md §1.9) is retried, and the receiver sees " +
+				"the request twice. Four limits of the transport shape the schedule: a wait is whole seconds, " +
+				"rounded up; no wait exceeds just under twelve hours (SQS's visibility maximum); a subscription " +
+				"wanting more attempts than the queue's maxReceiveCount (template default 12) is dead-lettered at " +
+				"that ceiling with reason receive-ceiling; and an enqueue that fails spends one attempt of the " +
+				"subscription's budget, because the core numbers attempts before the transport sees them. An " +
+				"envelope over 256 KiB cannot be queued at all and is reported through the fan-out log.",
+			Reference: "Delivery is at-most-once and in process: send is not awaited (src/tools/auth-tools.ts:266), " +
+				"retries run on setTimeout in the same process (src/tools/webhook-sender.ts:18-46), a process that " +
+				"exits drops them, the final failure is swallowed (.catch(() => {}), auth-tools.ts:280) and nothing " +
+				"records that a delivery gave up.",
+			Why: "A guarantee the reference does not give is a difference as much as one it gives and this product " +
+				"withholds, and this one is visible from the receiver's side: a receiver written against the reference " +
+				"may never have seen a duplicate, and here it can. The core's contract names at-least-once as the " +
+				"host's to buy, by making the enqueue durable before returning nil (webhook_sender.go, " +
+				"WebhookDeliverer), and on Lambda durable before return also means before the response, which is why " +
+				"App.Handle waits for the enqueue. Deduplication at the receiver is not possible on the reference's " +
+				"own header (a fresh X-Webhook-Delivery per attempt), so the worker keeps a ledger keyed on the id the " +
+				"core minted and makes one successful POST per delivery the normal case; exactly-once over HTTP to a " +
+				"third party is not available to anyone. The ceiling exists because SQS has one maxReceiveCount per " +
+				"queue and the reference's retry count is per subscription; the worker enforces the subscription's " +
+				"count itself and the queue's is a backstop for a worker that crashes on a message.",
+			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §3.3; docs/spec/data-model.md §1.9; " +
+				"internal/integration/aws/sqs.go; cmd/webhook-worker/worker.go",
+		},
+		{
+			ID:      "queued-webhook-retries-reuse-the-delivery-id",
+			Surface: "the X-Webhook-Delivery header of every retry of a queued outgoing webhook (tools.outboundWebhooks.queueUrl set)",
+			Behaviour: "Every attempt at one queued delivery carries the same X-Webhook-Delivery: the id the core minted " +
+				"for the attempt it handed the queue. A receiver sees one id per event and subscription, however many " +
+				"times it is retried.",
+			Reference: "A fresh randomUUID() per attempt, minted inside the retry loop (src/tools/webhook-sender.ts:27), " +
+				"so two attempts at one event carry two ids.",
+			Why: "The core's WebhookDeliverer contract tells a host that redelivers from a queue to resend the header it " +
+				"was handed rather than mint one of its own, so that the identifiers a receiver sees are ones the core " +
+				"issued; the worker cannot mint a core id, and minting its own would be exactly what that forbids. The " +
+				"id also becomes a key the worker's ledger can deduplicate on. The difference is observable only to a " +
+				"receiver that compared the ids of two retries, and a receiver deduplicating on the header -- which the " +
+				"reference makes impossible -- now gets the answer it wanted.",
+			Spec: "docs/config-reference.md §17.4; upstream webhook_sender.go (WebhookDeliverer, Idempotency; " +
+				"WebhookAttempt.DeliveryID)",
+		},
+		// ── end D9b ──
 		{
 			ID:      "inbound-webhooks-are-refused-without-a-runner",
 			Surface: "POST <tools>/webhook/{provider}, and the tools.inboundWebhooks.enabled knob behind it",

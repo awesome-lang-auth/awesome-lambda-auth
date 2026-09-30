@@ -77,8 +77,11 @@ import (
 //     arrives on the receive that the queue would redrive next, the worker
 //     dead-letters it itself with reason "receive-ceiling", so that nothing
 //     reaches the DLQ without saying why except a message the worker crashed
-//     on maxReceiveCount times. The template's default ceiling is ten
-//     receives against the default four attempts.
+//     on maxReceiveCount times. The template's default ceiling is twelve
+//     receives: the largest attempt count the schema lets
+//     tools.outboundWebhooks.defaults.maxRetries produce (10 retries, 11
+//     attempts) plus one receive of slack for a duplicate or a crash. Only a
+//     row given more retries through the admin API meets the ceiling.
 
 // ledger is the slice of the DynamoDB store the worker uses: the delivery
 // ledger and nothing else. *ddbstore.Store satisfies it.
