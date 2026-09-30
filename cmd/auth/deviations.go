@@ -402,7 +402,7 @@ func WireDeviations() []WireDeviation {
 				"is any self-registered user (docs/config-reference.md §17.6), which is why the SAM template defaults " +
 				"to `apiKey` and the cold start warns. cmd/auth/tools_test.go TestBridgeDeliversEachLoginOnce fails the " +
 				"day a login is delivered zero times or twice, or arrives without the caller's X-Correlation-Id.",
-			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.6; upstream auth_tools.go (the AuthTools type comment)",
+			Spec: "docs/config-reference.md §17.2; docs/cost-model.md §2.8; upstream auth_tools.go (the AuthTools type comment)",
 		},
 		{
 			ID:      "outgoing-webhook-delivery-races-the-response",
@@ -428,7 +428,7 @@ func WireDeviations() []WireDeviation {
 				"Delivering synchronously on the request goroutine instead was considered and rejected: it would make a " +
 				"slow receiver a slow login, times the retry schedule, and would still lose the deliveries of the " +
 				"invocation that hit the function timeout.",
-			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.6; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
+			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §2.8; upstream webhook_sender.go (WebhookEmitter.Emit, WebhookDeliverer)",
 		},
 		{
 			ID:      "inbound-webhooks-are-refused-without-a-runner",

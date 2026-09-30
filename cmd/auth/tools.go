@@ -99,7 +99,7 @@ import (
 //
 // What the bridge costs: every identity.* event now writes one telemetry row
 // (awaited, on the request goroutine — one DynamoDB PutItem per login, refresh,
-// logout and the rest; docs/cost-model.md §2.6) and fires every matching
+// logout and the rest; docs/cost-model.md §2.8) and fires every matching
 // outgoing webhook.
 //
 // The bridge's context is the process's, not the cold start's. main.go bounds

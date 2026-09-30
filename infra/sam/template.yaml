@@ -701,7 +701,7 @@ Parameters:
   # of the one table, and the IAM statement below already grants every action
   # they use. What the block adds when on is one telemetry write per identity
   # event and one outbound request per matching webhook (docs/cost-model.md
-  # §2.6). The SSE stream is NOT mounted on this runtime whatever the
+  # §2.8). The SSE stream is NOT mounted on this runtime whatever the
   # configuration says — API Gateway buffers the response and cuts it at 29
   # seconds, which is a reconnect loop that bills, not SSE — and the
   # transport that carries it is D9c's Function URL (docs/config-reference.md

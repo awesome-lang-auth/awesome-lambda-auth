@@ -73,8 +73,11 @@ func TestDeviationsIndexIsComplete(t *testing.T) {
 	doc := strings.ReplaceAll(string(raw), "\r\n", "\n")
 
 	for _, d := range WireDeviations() {
-		if !strings.Contains(doc, "`"+d.ID+"`") {
-			t.Errorf("docs/deviations.md does not index product deviation `%s`", d.ID)
+		// A row of its own, not a mention in another row: the index once lost
+		// templates-dir-only-seeds-absent-ids in a merge and a bare
+		// substring check still passed, because a sibling row cites it.
+		if !strings.Contains(doc, "\n| `"+d.ID+"` |") {
+			t.Errorf("docs/deviations.md has no index row for product deviation `%s`", d.ID)
 		}
 	}
 	for _, d := range auth.CompatibilityNotes().KnownDeviations {

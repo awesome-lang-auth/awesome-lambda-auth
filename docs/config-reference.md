@@ -2134,7 +2134,7 @@ embedding the package — `App.Events` carries what the library raised,
 What it costs: one telemetry `PutItem` per `identity.*` event, awaited on the
 request goroutine (about a millisecond against DynamoDB Local, single-digit
 milliseconds in a region), and one outgoing delivery per matching subscription.
-`docs/cost-model.md` §2.6 has the arithmetic.
+`docs/cost-model.md` §2.8 has the arithmetic.
 
 ### 17.3 The stream is not mounted on this runtime
 
