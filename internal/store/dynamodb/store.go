@@ -299,8 +299,8 @@ func (s *Store) CompatibilityNotes() []string {
 		"GET /linked-accounts returns bindings ordered by provider then provider account id; the reference returns them in insertion order (data-model.md §1.5 #54).",
 		"Re-linking a provider account that is already linked moves the binding and deletes the previous link id; the reference leaves the old id resolvable and still listed under its old owner (upstream nik2208/awesome-go-auth#37).",
 		"POST /link-verify answers INVALID_LINK_TOKEN for an expired account-link token, where the reference answers LINK_TOKEN_EXPIRED: the store refuses to return an entry past its deadline, so the route's own expiry branch is never reached (data-model.md §4.5).",
-		"Mail templates list sorted by id and UI translations sorted by page, which GET /admin/api/templates/mail and /ui will expose once the admin surface is mounted; the reference lists both in first-insertion order (data-model.md §1.6).",
-		"Listing users without naming a tenant orders them by tenant then id, which GET /admin/api/users and the first-user access policy will expose once the admin surface is mounted; the reference's normative order is id alone (data-model.md §1.4 #47).",
+		"Mail templates list sorted by id and UI translations sorted by page, which GET /admin/api/templates/mail and /ui expose; the reference lists both in first-insertion order (data-model.md §1.6).",
+		"Listing users without naming a tenant orders them by tenant then id, which GET /admin/api/users exposes; the reference's normative order is id alone (data-model.md §1.4 #47).",
 		"Webhook subscriptions are listed, matched and looked up by provider in id order rather than in first-insertion order, so a deployment holding two inbound webhooks for one provider gets whichever has the lower id (data-model.md §1.5 #72).",
 		"Telemetry queries treat an absent tenant as the untenanted tenant rather than as every tenant, and refuse outright in multi-tenant mode; the reference reads an absent tenant as no filter at all (data-model.md §1.5 #60).",
 	}
