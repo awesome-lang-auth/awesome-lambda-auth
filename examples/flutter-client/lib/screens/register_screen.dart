@@ -1,4 +1,4 @@
-import 'package:awesome_node_auth_flutter/awesome_node_auth_flutter.dart';
+import 'package:awesome_flutter_auth/awesome_flutter_auth.dart';
 import 'package:flutter/material.dart';
 
 class RegisterScreen extends StatefulWidget {

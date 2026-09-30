@@ -5,13 +5,13 @@ I client ufficiali della famiglia, **non modificati**, puntati a uno stack `awes
 | | libreria | trasporto |
 |---|---|---|
 | [`angular-client/`](angular-client/) | `ng-awesome-node-auth` da npm | cookie di sessione |
-| [`flutter-client/`](flutter-client/) | `awesome_node_auth_flutter` da pub.dev | cookie su web, bearer su Android |
+| [`flutter-client/`](flutter-client/) | [`awesome_flutter_auth`](https://github.com/awesome-lang-auth/awesome-flutter-auth) da pub.dev | cookie su web, bearer su Android |
 
 ## Perché esistono
 
 La suite in [`test/contract/`](../test/contract/) verifica il contratto HTTP e basta. Non sa nulla di come un client lo consuma davvero: quali campi casta non-nullabili, dove legge il token CSRF, come reagisce a un `401 SESSION_REVOKED`. Questi demo lo esercitano.
 
-Il ritorno è già arrivato: costruendoli sono emersi tre difetti dei client che nessun test HTTP poteva vedere — [flutter#21](https://github.com/nik2208/awesome-node-auth-flutter/issues/21), [flutter#22](https://github.com/nik2208/awesome-node-auth-flutter/issues/22), [ng#7](https://github.com/nik2208/ng-awesome-node-auth/issues/7). I primi due fanno **terminare** il client, non degradare, ed è la stessa causa del campo `sub` mancante chiuso da [awesome-go-auth#46](https://github.com/nik2208/awesome-go-auth/pull/46).
+Il ritorno è già arrivato: costruendoli sono emersi tre difetti dei client che nessun test HTTP poteva vedere — [flutter#21](https://github.com/awesome-lang-auth/awesome-flutter-auth/issues/21), [flutter#22](https://github.com/awesome-lang-auth/awesome-flutter-auth/issues/22), [ng#7](https://github.com/nik2208/ng-awesome-node-auth/issues/7). I primi due facevano **terminare** il client, non degradare (chiusi in `awesome_flutter_auth` 1.10.1), ed è la stessa causa del campo `sub` mancante chiuso da [awesome-go-auth#46](https://github.com/nik2208/awesome-go-auth/pull/46).
 
 ## La forma di ospitalità che entrambi richiedono
 

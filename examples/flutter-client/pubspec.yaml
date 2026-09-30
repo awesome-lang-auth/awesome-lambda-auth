@@ -15,7 +15,7 @@ dependencies:
     sdk: flutter
   # Il pacchetto pubblicato, non un path locale: il senso del demo e' provare
   # cio' che un utente scaricherebbe davvero.
-  awesome_node_auth_flutter: ^1.10.0
+  awesome_flutter_auth: ^1.10.5
   # Serve solo al ramo web di open_url.dart, per avviare il download dell'APK.
   # Dichiarato esplicitamente e non ereditato per via transitiva dalla libreria
   # di auth: dipendere di striscio e' fragile e l'analizzatore lo segnala.
