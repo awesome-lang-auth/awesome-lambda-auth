@@ -613,7 +613,8 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		// other consumer — its <admin>/api/api-keys routes mint and revoke the
 		// rows — so a key an administrator minted there for some narrower
 		// purpose is a tools key here all the same; the config reference says
-		// so (§17.6) so that it stays a stated fact. The refusal it writes is the core's bare 401 and is registered
+		// so (§17.6) so that it stays a stated fact. The refusal it writes is
+		// the core's bare 401 and is registered
 		// (tools-api-key-refusal-is-the-cores-bare-401). The store is
 		// guaranteed by checkStoreRequirements and driverStores; the assertion
 		// is the refusal for a driver that lacks it.
@@ -827,29 +828,41 @@ func csrfPostureOf(cfg *config.Config) string {
 // driverStores says that map exists to refuse. It is reported here rather than
 // refused there because it is harmless and it is how a document is staged: an
 // operator who enables the store one deploy before the block has not made an
-// error, and D8 gives all three a second consumer, at which point these rows go.
+// error. The admin console is the second consumer of two of the three: its
+// routes mint and revoke API keys and manage webhook subscriptions
+// (admin.go, adminOptions hands both stores to the core), so with the console
+// mounted those two flags are read whatever the tools block says, and only
+// telemetry — which reaches a route through ToolsOptions alone — is still
+// inert with the block off.
 func toolsKnobGaps(cfg *config.Config) []knobGap {
 	var gaps []knobGap
 	inert := func(flag string, on bool, consumer, remedy string) {
 		if on {
 			gaps = append(gaps, knobGap{
 				Path:    "stores.enable." + flag,
-				Problem: "the store is switched on and nothing in this build reads it: its only consumer is " + consumer,
+				Problem: "the store is switched on and nothing in this build reads it: its only consumers are " + consumer,
 				Remedy:  remedy,
 			})
 		}
 	}
+	consoleMounted := httpConfig(cfg).AdminMounted()
 	if !cfg.Tools.Enabled {
-		const remedy = "set tools.enabled: true to use it, or leave it set for the admin console (D8); until then it costs nothing and does nothing"
-		inert("apiKeys", cfg.Stores.Enable.APIKeys, "the tools guard under tools.auth: apiKey, and tools.enabled is off", remedy)
-		inert("telemetry", cfg.Stores.Enable.Telemetry, "the tools block, and tools.enabled is off", remedy)
-		inert("webhooks", cfg.Stores.Enable.Webhooks, "the tools block, and tools.enabled is off", remedy)
+		const remedy = "set tools.enabled: true to use it, or turn the flag off; until then it costs nothing and does nothing"
+		if !consoleMounted {
+			inert("apiKeys", cfg.Stores.Enable.APIKeys,
+				"the tools guard under tools.auth: apiKey and the admin console's key routes, and tools.enabled is off with no console mounted",
+				"set tools.enabled: true with tools.auth: apiKey to verify keys, or admin.enabled: true to mint them; until then it costs nothing and does nothing")
+			inert("webhooks", cfg.Stores.Enable.Webhooks,
+				"the tools block's fan-out and the admin console's subscription routes, and tools.enabled is off with no console mounted",
+				"set tools.enabled: true to deliver to subscriptions, or admin.enabled: true to manage them; until then it costs nothing and does nothing")
+		}
+		inert("telemetry", cfg.Stores.Enable.Telemetry, "the tools block's track, bridge and query, and tools.enabled is off", remedy)
 		return gaps
 	}
-	if cfg.Tools.Auth != config.ToolsAuthAPIKey {
+	if cfg.Tools.Auth != config.ToolsAuthAPIKey && !consoleMounted {
 		inert("apiKeys", cfg.Stores.Enable.APIKeys,
-			fmt.Sprintf("the tools guard under tools.auth: %s, and tools.auth is %q", config.ToolsAuthAPIKey, cfg.Tools.Auth),
-			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or leave it set for the admin console (D8)")
+			fmt.Sprintf("the tools guard under tools.auth: %s and the admin console's key routes, and tools.auth is %q with no console mounted", config.ToolsAuthAPIKey, cfg.Tools.Auth),
+			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or admin.enabled: true to mint keys through the console")
 	}
 	mount := toolsPath(cfg)
 	if cfg.Tools.Stream.Enabled {

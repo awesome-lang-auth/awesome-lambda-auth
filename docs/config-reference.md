@@ -2082,13 +2082,17 @@ listed by `driverStores` for both drivers (§4.1): `telemetry` (what track and
 the bridge write, what the query reads; **required** by `tools.telemetry.enabled`),
 `webhooks` (what every event is matched against for outgoing delivery), and
 `apiKeys` (**required** by `tools.auth: apiKey`). Subscription rows and API
-keys are *data* in those stores, written by the admin API (D8), not
-configuration. A flag switched on while its one consumer is off — any of the
-three with `tools.enabled` off, or `apiKeys` under a posture other than
-`apiKey` — validates and is read by nothing; the unwired-knob report names it
-at cold start (§17.1) rather than refusing it, because that is how a document
-is staged one deploy ahead of the block, and D8 gives all three a second
-consumer.
+keys are *data* in those stores, written through the admin console's
+`<admin>/api/webhooks` and `<admin>/api/api-keys` routes (§16), not
+configuration. The console is therefore the second consumer of `webhooks` and
+`apiKeys`, and a mounted console reads both whatever the tools block says;
+`telemetry` reaches a route through the tools block alone. A flag switched on
+while nothing consumes it — `telemetry` with `tools.enabled` off, or `webhooks`
+and `apiKeys` with the block off and no console mounted, or `apiKeys` under a
+posture other than `apiKey` with no console mounted — validates and is read by
+nothing; the unwired-knob report names it at cold start (§17.1) rather than
+refusing it, because that is how a document is staged one deploy ahead of the
+block that reads it.
 
 The smallest document that loads on this build, and why each line is there:
 
@@ -2135,8 +2139,10 @@ manager reaches no connection on this runtime` is what `tools.sse.enabled:
 true` gets. And the unwired-knob report names `tools.stream.enabled` on every
 tools deployment (and `tools.sse.enabled` when set), with the same remedy:
 leave them, D9c makes them live — and any of `stores.enable.telemetry`,
-`.webhooks` or `.apiKeys` that is on while nothing consumes it (the block off,
-or `apiKeys` under a posture other than `apiKey`).
+`.webhooks` or `.apiKeys` that is on while nothing consumes it (`telemetry` with
+the block off; `webhooks` and `apiKeys` with the block off and no admin console
+mounted; `apiKeys` under a posture other than `apiKey` with no console mounted,
+since the console's routes are the other reader of those two stores).
 
 ### 17.2 The bridge: the core's own events reach the sinks
 

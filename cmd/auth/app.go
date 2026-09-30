@@ -1076,8 +1076,10 @@ func driverStores(driver string) (map[string]bool, bool) {
 		//
 		// The listing is about the driver and cannot see the document, so it
 		// reopens the hole above for one combination: a flag switched on while
-		// its one consumer is off — any of the three with tools.enabled off,
-		// or apiKeys under a posture other than apiKey. That combination is
+		// every consumer it has is off — telemetry with tools.enabled off;
+		// webhooks with tools.enabled off and no admin console mounted; apiKeys
+		// with neither tools.auth: apiKey nor a mounted console, whose
+		// credential tabs are the other reader of those two. That combination is
 		// reported by toolsKnobGaps at every cold start rather than refused
 		// here, for the reason given there, and
 		// TestUnwiredKnobsIsExactlyTheDocumentedList pins the rows.

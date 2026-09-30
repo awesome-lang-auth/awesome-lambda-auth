@@ -846,10 +846,34 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "stores.enable.telemetry"},
 		},
 		{
+			// The same flags beside a mounted console: the console's key and
+			// subscription routes read the API-key and webhook stores
+			// (admin.go, adminOptions), so only telemetry — which reaches a
+			// route through ToolsOptions alone — is still inert.
+			name: "the tools stores with the block off, beside the admin console",
+			env: with(baseEnv(),
+				"AWESOME_AUTH_ADMIN_ENABLED", "true",
+				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
+				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "true",
+				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
+			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.telemetry"},
+		},
+		{
 			// The API-key store under a posture that never opens it.
 			name: "the apiKey store under the session posture",
 			env:  toolsEnv("AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
 			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "tools.stream.enabled"},
+		},
+		{
+			// The same posture beside a mounted console: the console mints and
+			// revokes keys through its routes, so the store has a reader.
+			name: "the apiKey store under the session posture, beside the admin console",
+			env: toolsEnv(
+				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
+				"AWESOME_AUTH_ADMIN_ENABLED", "true",
+				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
 		},
 		{
 			// And under the posture that does: consumed, so not a gap.
