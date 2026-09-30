@@ -61,20 +61,22 @@ A script sees four variables — the reference's four — and nothing of the hos
 | `body` | the request body, parsed by the engine's own `JSON.parse`. An empty body is `{}`; a body that is not a JSON object or array was refused `400` before the runner was called |
 | `actions` | the callable actions (§4). **Empty on this build** |
 | `result` | `null`; the script assigns `{event, data?, userId?, tenantId?}` to it |
-| `console` | `log`, `warn`, `error` — to the runner's log group, prefixed with the provider, and silent when `DeploymentEnvironment` is `production` (the reference's `NODE_ENV` rule) |
+| `console` | `log`, `warn`, `error` — one JSON record per call in the runner's log group, at the matching level, carrying `provider`, `webhookId`, `method` and the space-joined `message`; silent when `DeploymentEnvironment` is `production` (the reference's `NODE_ENV` rule, where it writes `[webhook:<provider>]` lines to stderr instead) |
 
 It is wrapped in the reference's exact wrapper, `(async () => { <script> })()`,
 so `await` works at the top level — and a script that ends in a `//` comment
 swallows the closing `})()` and fails to compile, here as there.
 
-After the run, `result` is read **even if the script threw** — the reference's
-check sits after its catch — and mapped:
+The runner **awaits** the script — every `await`, to the end — and then reads
+`result`, **even if the script threw** (the reference's check sits after its
+catch), and maps it:
 
 | The script… | The runner answers | The route answers | The provider… |
 |---|---|---|---|
 | left `result` with a string `event` | a result | `200 {"ok":true}`, and the event is tracked | is done |
 | left `result` null, not an object, or with no string `event` | no result | `200 {"ok":true}`, nothing tracked | is done |
-| **threw** (a syntax error, a `ReferenceError`, a rejected `await`, recursion past ~10 000 frames) | no result, and the error is logged | `200 {"ok":true}`, nothing tracked | is done |
+| **threw** (a syntax error, a `ReferenceError`, a rejected `await`, recursion past ~10 000 frames) | no result, and the error is logged — unless it assigned a `result` with a string `event` before throwing, which is tracked as in the first row | `200 {"ok":true}` | is done |
+| left a `result` that cannot be read — a getter that throws, a `data` with a cycle or a `BigInt` | **a failed run** | `400 {"error":"Webhook processing failed"}` | **redelivers** |
 | awaits a promise nothing can ever settle | no result, at once | `200 {"ok":true}` | is done |
 | ran past its deadline | **a failed run** | `400 {"error":"Webhook processing failed"}` | **redelivers** |
 | — (the runner was unreachable, throttled, crashed, or not permitted) | — | `400` | **redelivers** |
@@ -85,10 +87,38 @@ does, and a redelivery would only throw again. A run that could not be
 completed is the deployment's problem: refusing it keeps the provider's
 redelivery, and the webhook arrives again once the problem is fixed.
 
+A `result` the runner cannot read is on the "failed run" side, because it is
+in the reference too: there `result` is read and its `data` handed to `track`
+inside the route's outer `try` (`tools.router.ts:253`, `:304-320`), whose
+`catch` answers `400` — not inside the script's own `try`, which has already
+ended. The detail goes to the runner's log; the error the auth function logs
+is fixed text, since a script's exception message can quote the body.
+
 Two type rules come from the core's result type: `data` is kept only when it is
 a JSON object (an array or a string is dropped, not wrapped), and `userId` and
-`tenantId` only when they are strings. A `data` that cannot be encoded — a
-cycle, a `BigInt` — is dropped with a log line and the event is still tracked.
+`tenantId` only when they are strings.
+
+**The await is this product's, not the reference's.** The reference's code
+means to await the script — it keeps the promise, attaches a `.catch` and
+awaits it (`tools.router.ts:289-298`), and its own documented example is
+`await actions['billing.cancelSubscription'](…); result = {…}` — but it tests
+the promise with `instanceof Promise`, and a promise made inside a `node:vm`
+context belongs to that context's realm, so the test is `false`, the await is
+skipped and `result` is read before the script's first `await` has settled.
+(Verified in Node 24; identical in 1.9.0 and 1.10.8.) So a script ported from
+the reference behaves differently here in three cases, all registered as
+`inbound-webhook-scripts-are-awaited`:
+
+- a `result` assigned **after** an `await` is tracked here, and nothing there;
+- a `result` assigned before an `await` that never settles is tracked there,
+  and is no result here;
+- a rejected `await` is a logged, acknowledged throw here, and an unhandled
+  rejection there.
+
+This product awaits because that is what the reference's code says it does
+and the only way a script that calls an action can act on the outcome. The
+reference's fix is one line (`util.types.isPromise(returnValue)`, or a
+thenable check).
 
 Remember what `userId` and `tenantId` mean on the record: a principal named by
 a request **nothing authenticated**. The route has no guard and checks no
@@ -184,9 +214,9 @@ written against the reference:
   `new Intl.NumberFormat(...)` is a `ReferenceError` — `WebAssembly`,
   `SharedArrayBuffer`/`Atomics`. Neither tree has `require`, `fetch`,
   `process`, timers or `Buffer` inside the sandbox.
-- **Different**: the deadline (§3); a promise that can never settle is
-  answered at once rather than hanging the request; `console.info` does not
-  exist, there or here.
+- **Different**: the script is awaited (§2 — the reference means to and does
+  not); the deadline (§3); a promise that can never settle is answered at
+  once; `console.info` does not exist, there or here.
 
 ## 6. Operating it
 

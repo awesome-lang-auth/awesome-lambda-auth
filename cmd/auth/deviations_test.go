@@ -23,6 +23,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",
+		"inbound-webhook-scripts-are-awaited", // D9d
 		"inbound-webhook-scripts-run-on-goja", // D9d
 		"inbound-webhooks-are-refused-without-a-runner",
 		"library-events-are-bridged-into-the-tools-fan-out",

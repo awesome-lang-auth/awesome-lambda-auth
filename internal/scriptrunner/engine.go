@@ -49,26 +49,53 @@
 // last-wins answer to a duplicated key. The script is wrapped in the
 // reference's exact async IIFE, byte for byte (:269), so a script that works
 // there compiles here and one that does not — a trailing line comment that
-// swallows the closing `})()` is the classic — fails here the same way. After
-// the promise settles, `result` is read whether or not the script threw:
-// the reference's `if (sandbox['result'] && typeof …event === 'string')` sits
-// after its catch (:293-301), so a script that assigns result and then throws
-// still tracks, and so does it here.
+// swallows the closing `})()` is the classic — fails here the same way.
+// `result` is read whether or not the script threw: the reference's
+// `if (sandbox['result'] && typeof …event === 'string')` sits after its catch
+// (:302-304), so a script that assigns result and then throws still tracks,
+// and so does it here.
+//
+// # The await, which the reference means and does not do
+//
+// This runner awaits the script's promise — drains the job queue until it
+// settles — and only then reads `result`. The reference's code intends the
+// same: it keeps the promise vm.runInContext returns, attaches its .catch
+// "synchronously before any await", and awaits it (tools.router.ts:289-298),
+// and its own documented pattern is `await actions['…'](…); result = {…}`
+// (webhook-store.interface.ts:63-68). What it actually does is different, and
+// it was verified in Node 24 rather than inferred: the async IIFE is compiled
+// in the vm context, so the promise it returns belongs to that context's realm,
+// and `returnValue instanceof Promise` (:290), tested against the outer realm's
+// Promise, is false. The await is skipped, and `result` is read synchronously,
+// before the script's first await has settled. So in the reference a result
+// assigned after any await is never tracked, an asynchronous rejection escapes
+// its .catch as an unhandled rejection, and a result assigned before an await
+// that never settles is tracked at once. This runner does what the code says
+// it means, because that is the only reading under which an awaiting script —
+// every script that calls an action — does anything at all; the difference is
+// registered (deviation inbound-webhook-scripts-run-on-goja), and the
+// reference's own fix is one line (util.types.isPromise, or a thenable check,
+// in place of instanceof).
 //
 // # The deadline, which is not the reference's
 //
-// vm.runInContext's { timeout: 5_000 } bounds only the synchronous prefix of
-// an async IIFE; the reference then awaits the rest with no bound at all. Here
-// the whole run is bounded — the core's inbound-webhook-script-runs-out-of-process
-// — by the earlier of the invoker's deadline (wire.Request.DeadlineUnixMs) and
-// this invocation's own Lambda deadline less a margin, and a run that reaches
-// it is interrupted and reported as a failure of the run, not of the script:
-// the handler returns an error, Lambda sets FunctionError, and the core answers
-// the provider 400 so it redelivers. That is the core's contract for a timeout
-// (InboundScriptRunner, "(zero, false, err)"), and it is a registered
-// difference of this product: a script that loops is refused and redelivered
-// here, where the reference's synchronous timeout would have been caught,
-// logged and acknowledged (deviation inbound-webhook-scripts-run-on-goja).
+// vm.runInContext's { timeout: 5_000 } bounds only the synchronous part of
+// the run. Here the whole run is bounded — the core's
+// inbound-webhook-script-runs-out-of-process — by the earlier of the invoker's
+// deadline (wire.Request.DeadlineUnixMs) and this invocation's own Lambda
+// deadline less a margin, and a run that reaches it is interrupted and
+// reported as a failure of the run, not of the script: the handler returns an
+// error, Lambda sets FunctionError, and the core answers the provider 400 so it
+// redelivers. That is the core's contract for a timeout (InboundScriptRunner,
+// "(zero, false, err)"), and it is a registered difference of this product: a
+// script that loops is refused and redelivered here, where the reference's
+// synchronous timeout would have been caught, logged and acknowledged.
+//
+// Memory is not bounded by the engine at all: goja has no allocation limit, so
+// a script that grows an array forever is stopped by the function's
+// MemorySize, which Lambda reports as a crash — FunctionError, the same 400
+// and redelivery as a timeout, but without this package's log line naming the
+// webhook, because the process is gone before it can write one.
 package scriptrunner
 
 import (
@@ -100,7 +127,8 @@ const DefaultMargin = 500 * time.Millisecond
 // invocation; V8's default stack holds on the order of ten thousand frames and
 // raises a RangeError, which the reference catches as a script error. This is
 // the same order of magnitude, and a script that exceeds it is reported the
-// same way.
+// same way. It bounds recursion only: allocation is bounded by nothing but the
+// function's MemorySize (see the package comment).
 const maxCallStack = 10_000
 
 // wrapPrefix and wrapSuffix are the reference's wrapper, exactly:
@@ -124,8 +152,11 @@ const (
 // map[string]any and its contract says a runner "should send no data rather
 // than wrap" anything else. userId and tenantId are kept only when they are
 // strings, for the same reason. A data that JSON.stringify cannot encode — a
-// cycle, a BigInt — is dropped and said so, rather than failing the run, since
-// every redelivery would fail it again.
+// cycle, a BigInt — is reported in dataError, and readResult turns it into a
+// failed run: in the reference the read of result and the track of its data
+// sit inside the route's outer try (tools.router.ts:253, :304-320), so a
+// result that cannot be read or stored lands in its catch (:322-323), a 400, and a
+// redelivery. That is the same answer here.
 const resultReader = `(function (isArray, stringify) {
   return function (r) {
     if (!r) { return undefined; }
@@ -270,11 +301,16 @@ func (r *Runner) run(ctx context.Context, req wire.Request, deadline time.Time, 
 		return wire.Response{}, err
 	}
 
-	// The reference's four sandbox variables (:284-289), and nothing else of
+	actions, err := r.actionsObject(vm, runCtx, req.Actions, logger)
+	if err != nil {
+		return wire.Response{}, err
+	}
+
+	// The reference's four sandbox variables (:281-286), and nothing else of
 	// the host's. result starts as null, as it does there.
 	for name, value := range map[string]any{
 		"body":    body,
-		"actions": r.actionsObject(vm, runCtx, req.Actions, logger),
+		"actions": actions,
 		"result":  goja.Null(),
 		"console": r.consoleObject(vm, logger),
 	} {
@@ -307,14 +343,21 @@ func (r *Runner) run(ctx context.Context, req wire.Request, deadline time.Time, 
 		}
 		switch promise.State() {
 		case goja.PromiseStateRejected:
-			// The .catch the reference attaches before awaiting (:293-300).
+			// The .catch the reference means to attach before awaiting
+			// (:290-297) — and, through its cross-realm instanceof, does not
+			// (package comment): there an asynchronous rejection is an
+			// unhandled rejection. Here it is what the code intends, a script
+			// that threw, logged and acknowledged.
 			threw = true
 			logger.Warn("inbound webhook script threw", slog.String("error", describe(promise.Result())))
 		case goja.PromiseStatePending:
 			// RunString has drained the job queue, there are no timers and
 			// every action settles before it returns, so nothing can ever
-			// settle this. The reference would hang the request; a
-			// redelivery would hang the same way. The script's own failure.
+			// settle this. Under the await the reference intends, the request
+			// would hang and a redelivery would hang the same way; so the
+			// script's own failure, answered at once and without reading
+			// result. (The reference as written reads result synchronously
+			// and would track one assigned before this await — registered.)
 			logger.Warn("inbound webhook script never settled: it awaits a promise nothing in the sandbox can resolve")
 			return wire.Response{Outcome: wire.OutcomeNone, Reason: wire.ReasonNeverSettled}, nil
 		}
@@ -369,7 +412,35 @@ func parseBody(vm *goja.Runtime, body json.RawMessage) (goja.Value, error) {
 // actionsObject is the sandbox's `actions`: exactly the manifest entries the
 // resolved list exposes (Manifest.expose), each a function returning a settled
 // promise.
-func (r *Runner) actionsObject(vm *goja.Runtime, ctx context.Context, allowed []string, logger *slog.Logger) *goja.Object {
+//
+// Nothing of Go crosses back into the runtime. goja's ToValue of a struct, a
+// pointer or an error is a reflection-backed object whose exported fields and
+// methods the script can read and call, and NewGoError puts the Go error
+// itself on the rejection's `value` — so the first action that returned an
+// SDK output or an SDK error would hand every script a live host object. An
+// action's value therefore crosses as data only: json.Marshal on the Go side,
+// then the engine's own JSON.parse, captured here before the script exists so
+// the script cannot substitute its own. And a failure crosses as a plain Error
+// built with the engine's own constructor, carrying the Go error's message and
+// nothing else. A value that JSON cannot encode is the action's failure, not
+// the script's data.
+func (r *Runner) actionsObject(vm *goja.Runtime, ctx context.Context, allowed []string, logger *slog.Logger) (*goja.Object, error) {
+	parse, ok := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
+	if !ok {
+		return nil, errors.New("scriptrunner: JSON.parse is not a function")
+	}
+	errorCtor, ok := vm.Get("Error").(*goja.Object)
+	if !ok {
+		return nil, errors.New("scriptrunner: Error is not a constructor")
+	}
+	plainError := func(msg string) goja.Value {
+		e, err := vm.New(errorCtor, vm.ToValue(msg))
+		if err != nil {
+			return vm.ToValue(msg)
+		}
+		return e
+	}
+
 	obj := vm.NewObject()
 	for _, action := range r.manifest.expose(allowed) {
 		action := action
@@ -380,27 +451,55 @@ func (r *Runner) actionsObject(vm *goja.Runtime, ctx context.Context, allowed []
 			}
 			promise, resolve, reject := vm.NewPromise()
 			value, err := action.Fn(ctx, args)
+			var settled goja.Value
+			if err == nil {
+				settled, err = asScriptData(vm, parse, value)
+			}
 			if err != nil {
 				logger.Warn("inbound webhook action failed", slog.String("action", action.ID), slog.String("error", err.Error()))
-				_ = reject(vm.NewGoError(err))
+				_ = reject(plainError(err.Error()))
 			} else {
-				_ = resolve(vm.ToValue(value))
+				_ = resolve(settled)
 			}
 			return vm.ToValue(promise)
 		})
 	}
-	return obj
+	return obj, nil
 }
 
-// consoleObject is the reference's sandboxConsole (:272-282): log, warn and
+// asScriptData turns an action's return value into plain JavaScript data: nil
+// is undefined, as an async function that returns nothing resolves to; every
+// other value is its JSON, parsed by the engine.
+func asScriptData(vm *goja.Runtime, parse goja.Callable, value any) (goja.Value, error) {
+	if value == nil {
+		return goja.Undefined(), nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("the action's result is not JSON-encodable: %w", err)
+	}
+	v, err := parse(goja.Undefined(), vm.ToValue(string(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("the action's result could not be parsed back: %w", err)
+	}
+	return v, nil
+}
+
+// consoleObject is the reference's sandboxConsole (:270-279): log, warn and
 // error, the arguments joined with a space as args.join(' ') joins them, and
 // no-ops when the deployment is production. Only those three, because a script
 // calling console.info throws a TypeError there and should throw one here.
+//
+// The reference writes `[webhook:<provider>] `, `… WARN ` and `… ERR  ` lines
+// to stderr. Here each call is one JSON record in the runner's log group, at
+// slog's Info, Warn or Error level to match, carrying the provider and webhook
+// id as attributes (Run's logger.With) and the method name under `method` —
+// not `level`, which is the record's own key.
 func (r *Runner) consoleObject(vm *goja.Runtime, logger *slog.Logger) *goja.Object {
 	obj := vm.NewObject()
-	for _, level := range []string{"log", "warn", "error"} {
-		level := level
-		_ = obj.Set(level, func(call goja.FunctionCall) goja.Value {
+	for method, level := range map[string]slog.Level{"log": slog.LevelInfo, "warn": slog.LevelWarn, "error": slog.LevelError} {
+		method, level := method, level
+		_ = obj.Set(method, func(call goja.FunctionCall) goja.Value {
 			if !r.console {
 				return goja.Undefined()
 			}
@@ -411,16 +510,26 @@ func (r *Runner) consoleObject(vm *goja.Runtime, logger *slog.Logger) *goja.Obje
 				}
 				parts[i] = a.String()
 			}
-			logger.Info("inbound webhook script console", slog.String("level", level), slog.String("message", strings.Join(parts, " ")))
+			logger.Log(context.Background(), level, "inbound webhook script console", slog.String("method", method), slog.String("message", strings.Join(parts, " ")))
 			return goja.Undefined()
 		})
 	}
 	return obj
 }
 
-// readResult runs the reader over the global `result`. A getter of the
-// script's that throws while being read is the script's failure, and is
-// reported as no result; an interrupt is the run's.
+// readResult runs the reader over the global `result`.
+//
+// A result that cannot be read — a getter of the script's that throws, a data
+// JSON cannot encode, a toJSON that makes the reader's own output unreadable —
+// fails the run (errResultUnreadable), which the core answers 400 and the
+// provider redelivers. That is the reference's answer: its read of result
+// (:304) and its track of result.data (:316) are inside the route's outer try
+// (:253), whose catch answers 400 (:322-323), and not inside the script's own
+// try, which ends at :302. The detail goes to this runner's log; the error
+// that crosses to the auth function is fixed text, because the message of a
+// script's exception is the script's to choose and can quote the body.
+//
+// An interrupt is the run's deadline, as everywhere else.
 func (r *Runner) readResult(vm *goja.Runtime, reader goja.Callable, logger *slog.Logger) (*auth.InboundScriptResult, error) {
 	encoded, err := reader(goja.Undefined(), vm.Get("result"))
 	switch {
@@ -429,7 +538,7 @@ func (r *Runner) readResult(vm *goja.Runtime, reader goja.Callable, logger *slog
 		return nil, fmt.Errorf("scriptrunner: %w", errDeadline)
 	case isScriptError(err):
 		logger.Warn("reading the script's result threw", slog.String("error", err.Error()))
-		return nil, nil
+		return nil, fmt.Errorf("scriptrunner: %w", errResultUnreadable)
 	default:
 		return nil, fmt.Errorf("scriptrunner: reading the result: %w", err)
 	}
@@ -445,15 +554,15 @@ func (r *Runner) readResult(vm *goja.Runtime, reader goja.Callable, logger *slog
 	}
 	if err := json.Unmarshal([]byte(encoded.String()), &read); err != nil {
 		// Only reachable by a script that replaced a prototype's toJSON, which
-		// the reader's own stringify then honours. Its own doing, so its own
-		// failure.
+		// the reader's own stringify then honours.
 		logger.Warn("the script's result could not be read", slog.String("error", err.Error()))
-		return nil, nil
+		return nil, fmt.Errorf("scriptrunner: %w", errResultUnreadable)
+	}
+	if read.DataError != "" {
+		logger.Warn("the script's result.data is not JSON-encodable", slog.String("error", read.DataError))
+		return nil, fmt.Errorf("scriptrunner: %w", errResultUnreadable)
 	}
 	result := &auth.InboundScriptResult{Event: read.Event, UserID: read.UserID, TenantID: read.TenantID}
-	if read.DataError != "" {
-		logger.Warn("the script's result.data is not JSON-encodable and was dropped", slog.String("error", read.DataError))
-	}
 	if read.Data != nil {
 		dec := json.NewDecoder(strings.NewReader(*read.Data))
 		// json.Number keeps the engine's own spelling of every number on the

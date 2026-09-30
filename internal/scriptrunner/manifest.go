@@ -33,7 +33,22 @@ import (
 // Nothing else widens what a script can reach. The engine has no I/O primitive
 // of any kind (no require, no fetch, no process, no timers — goja implements
 // ECMAScript and nothing of Node), so an action is the only door out, and the
-// role is the lock on it.
+// role is the lock on it. What an action hands back is data and nothing more:
+// its value crosses as JSON and its failure as a plain Error with the message
+// alone (engine.go, actionsObject), so no Go object — an SDK output, an SDK
+// error — ever becomes something a script can call a method on.
+//
+// Who can open that door is a separate question, and the answer is not only
+// the auth function. The core's allowlist — the settings' enabledWebhookActions
+// intersected with the row's allowedActions — binds only the calls that come
+// through the auth function, because it is the auth function that resolves it
+// and puts the result in the request. The runner cannot tell who invoked it
+// (Lambda gives a function no verified caller identity) and has no resource
+// policy, so any principal in the account with lambda:InvokeFunction on it —
+// an operator, a CI role with lambda:* on * — can invoke it directly with any
+// script and "actions": [every id in this table]. For that caller the only
+// bound is ScriptRunnerRole. That is the second reason, beside the first, that
+// every action's IAM must be the narrowest grant that works.
 
 // Action is one entry of the runner's manifest: the reference's
 // RegisteredAction (webhook-action.ts:34-58) with the Go function in place of
@@ -60,10 +75,11 @@ type Action struct {
 	// "none".
 	IAM []string
 	// Fn runs the action. args are the script's arguments, exported to Go
-	// values; what it returns is handed back to the script as the fulfilment
-	// value of a promise, and an error rejects that promise — so a script's
-	// `await` sees exactly what an awaited async function would give it in the
-	// reference.
+	// values; what it returns is handed back to the script, as its JSON, as
+	// the fulfilment value of a promise (nil is undefined, and a value JSON
+	// cannot encode is a failure), and an error rejects that promise with a
+	// plain Error carrying the error's message — so a script's `await` sees
+	// what an awaited async function would give it in the reference, as data.
 	//
 	// It runs synchronously on the engine's goroutine and must return before
 	// the script continues. That is a constraint and it is deliberate: the
@@ -144,3 +160,7 @@ func (m Manifest) expose(allowed []string) []Action {
 
 // errDeadline is what the interrupt carries when the run's deadline passes.
 var errDeadline = errors.New("the script ran past its deadline and was interrupted")
+
+// errResultUnreadable is a result the runner could not read or encode: the
+// reference's outer-try 400 (engine.go, readResult).
+var errResultUnreadable = errors.New("the script's result could not be read or encoded")

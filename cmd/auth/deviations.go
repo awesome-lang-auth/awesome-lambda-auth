@@ -501,7 +501,7 @@ func WireDeviations() []WireDeviation {
 				"WebhookAttempt.DeliveryID)",
 		},
 		// ── end D9b ──
-		// D9d: the three entries of the inbound-webhook runner.
+		// D9d: the four entries of the inbound-webhook runner.
 		{
 			ID:      "inbound-webhooks-are-refused-without-a-runner",
 			Surface: "POST <tools>/webhook/{provider}, and the tools.inboundWebhooks.enabled and .scriptRunnerFunction knobs behind it",
@@ -526,33 +526,69 @@ func WireDeviations() []WireDeviation {
 			Spec: "docs/spec/config-schema.md §1.15; docs/config-reference.md §17.5; docs/inbound-webhooks.md; upstream tools_webhook.go",
 		},
 		{
+			ID:      "inbound-webhook-scripts-are-awaited",
+			Surface: "every inbound webhook whose stored WebhookConfig carries a jsScript that awaits anything",
+			Behaviour: "The runner awaits the script: it drains the engine's job queue until the async wrapper's promise settles, and " +
+				"only then reads result. So (a) a result assigned after an await -- including after `await actions[...]` -- is " +
+				"tracked; (b) a script whose await can never settle is answered at once as no result, even when it assigned a " +
+				"result before that await; (c) an asynchronous rejection is caught, logged and acknowledged like a synchronous " +
+				"throw, with a result assigned before it still tracked.",
+			Reference: "The code means to await -- it keeps vm.runInContext's return value, attaches .catch \"synchronously " +
+				"before any await\" and awaits it (tools.router.ts:289-298), and its documented example is `await " +
+				"actions['billing.cancelSubscription'](...); result = {...}` (webhook-store.interface.ts:63-68) -- but it does " +
+				"not: the async IIFE is compiled in the vm context, so the promise it returns belongs to that context's realm, " +
+				"and `returnValue instanceof Promise` (:290), tested against the outer realm's Promise, is false. The await is " +
+				"skipped and result is read synchronously (:304), before the script's first await settles. Verified in Node " +
+				"24.21.0 (vm.runInContext of an async IIFE: instanceof Promise false, result null when read, set one turn of the " +
+				"event loop later), identical at v1.9.0 and v1.10.8. So there (a) tracks nothing, (b) tracks the early result, " +
+				"and (c) is an unhandled rejection the route's catch never sees.",
+			Why: "Awaiting is what the reference's code and documentation say it does, and it is the only reading under which an " +
+				"awaiting script -- every script that calls an action -- does anything: reproducing the realm bug would make " +
+				"actions callable and their outcome unobservable. The core's own reading of the route (upstream tools_webhook.go, " +
+				"DefaultInboundScriptTimeout, \"the route then awaits the rest\") is the intended behaviour, not the actual one, " +
+				"and is reported upstream together with the reference's one-line fix (util.types.isPromise, or a thenable check, " +
+				"in place of instanceof). internal/scriptrunner TestTheLanguageAScriptUsesIsThere and TestActionsAreNeverWidened " +
+				"pin (a), TestAPromiseNothingCanSettleIsTheScriptsOwnFailure (b), TestAScriptThatThrowsIsNoResultNotAnError (c).",
+			Spec: "docs/inbound-webhooks.md §2; upstream tools_webhook.go (DefaultInboundScriptTimeout)",
+		},
+		{
 			ID:      "inbound-webhook-scripts-run-on-goja",
 			Surface: "every inbound webhook whose stored WebhookConfig carries a jsScript",
 			Behaviour: "The script runs in cmd/script-runner, a Lambda of its own invoked synchronously by the auth function, on the goja " +
 				"engine: a fresh runtime per run holding exactly body, actions, result and console, the script wrapped in the " +
-				"reference's own async IIFE. What a client can observe differently: (1) the deadline -- " +
-				"tools.inboundWebhooks.scriptTimeoutMs, 5000 by default -- bounds the WHOLE run, and a script that reaches it is " +
-				"interrupted and the webhook refused 400, so the provider redelivers; (2) a promise nothing in the sandbox can settle " +
-				"is reported at once as no result and acknowledged; (3) goja has no Intl, WebAssembly or SharedArrayBuffer, so a " +
-				"script using them throws and is acknowledged with nothing tracked; (4) result.data is kept only when it is a JSON " +
-				"object, and userId and tenantId only when they are strings; (5) `actions` holds the runner's compiled manifest, " +
-				"which ships empty, intersected with the core's resolved allowlist -- so on this build every action call is a " +
-				"TypeError; (6) an action can reach only what the runner's IAM role grants, which is its own log group and nothing else.",
-			Reference: "node:vm in the API process (tools.router.ts:269-305): the same four variables and the same wrapper, but " +
-				"{ timeout: 5_000 } bounds only the synchronous prefix, so a synchronous loop is caught, logged and acknowledged, " +
-				"while a script awaiting a hanging promise holds the request open for as long as the socket lives; V8's Intl is " +
-				"there; result.data and the identifiers are passed to track as they are; actions are whatever the host decorated " +
-				"with @webhookAction (webhook-action.ts:104-115), running with the API process's own credentials.",
+				"reference's own async IIFE and awaited (inbound-webhook-scripts-are-awaited). What a client can observe " +
+				"differently: (1) the deadline -- tools.inboundWebhooks.scriptTimeoutMs, 5000 by default, cut short to what the " +
+				"auth invocation has left -- bounds the WHOLE run, and a script that reaches it is interrupted and the webhook " +
+				"refused 400, so the provider redelivers; (2) a promise nothing in the sandbox can settle is reported at once as no " +
+				"result and acknowledged; (3) goja has no Intl, WebAssembly or SharedArrayBuffer, so a script using them throws, " +
+				"is logged and is acknowledged -- a result assigned before the throw is still tracked, as in the reference; " +
+				"(4) result.data is kept only when it is a JSON object, and userId and tenantId only when they are strings -- and " +
+				"a result whose members throw when read, or whose data JSON cannot encode, fails the run and is refused 400, which " +
+				"is the reference's answer too; (5) `actions` holds the runner's compiled manifest, which ships empty, intersected " +
+				"with the core's resolved allowlist -- so on this build every action call is a TypeError -- and an action's value " +
+				"reaches the script as JSON data, its failure as a plain Error with the message alone; (6) an action can reach only " +
+				"what the runner's IAM role grants, which is its own log group and nothing else; (7) the sandbox console writes JSON " +
+				"records to the runner's log group, not prefixed lines to stderr.",
+			Reference: "node:vm in the API process (tools.router.ts:269-304): the same four variables and the same wrapper, and " +
+				"{ timeout: 5_000 } bounds the synchronous part of the run, so a synchronous loop is caught, logged and " +
+				"acknowledged (:299-302); the promise is not awaited (inbound-webhook-scripts-are-awaited); V8's Intl is there; " +
+				"result is read, and result.data handed to track, inside the route's outer try (:253, :304-320), whose catch " +
+				"answers 400 (:322-323); actions are whatever the host decorated with @webhookAction (webhook-action.ts:104-115), " +
+				"running with the API process's own credentials and returning whatever they return; console writes " +
+				"`[webhook:<provider>] ...` to stderr outside production (:270-279).",
 			Why: "The owner decided on 2026-09-12 that no JavaScript engine enters the auth function, which holds the signing keys, " +
 				"the session store and the password hashes; the runner is a separate function and its IAM role is the sandbox. goja " +
 				"rather than a Node.js runner because it keeps one language, one pinned build image and byte-reproducible artifacts, " +
 				"and its differences are few and pinned (internal/scriptrunner/engine_test.go); cmd/auth's " +
 				"TestTheAuthBinaryLinksNoJavaScriptEngine fails the day the auth binary links any engine. The whole-run deadline is " +
 				"the core's contract (a timeout is (zero, false, err)), and it trades the reference's acknowledged-and-lost loop " +
-				"for a redelivery an operator can see and fix; a never-settling promise is answered at once because with no timers " +
-				"and synchronous actions nothing could settle it, and a redelivery would hang the same way. The type rules on the " +
-				"result are the core's InboundScriptResult. The manifest ships empty because which effects a webhook may cause is " +
-				"the deployment's decision and each one is paid for in IAM.",
+				"for a redelivery an operator can see and fix; it is cut to the auth invocation's remaining time because the core " +
+				"drops that deadline (context.WithoutCancel) and an auth function killed mid-Invoke would answer the provider a " +
+				"gateway 5xx and orphan the run. A never-settling promise is answered at once because with no timers and " +
+				"synchronous actions nothing could settle it, and a redelivery would hang the same way. The type rules on the " +
+				"result are the core's InboundScriptResult. An action's result crosses as data because goja would otherwise hand " +
+				"the script a reflection-backed Go object whose methods it can call. The manifest ships empty because which effects " +
+				"a webhook may cause is the deployment's decision and each one is paid for in IAM.",
 			Spec: "docs/inbound-webhooks.md; docs/config-reference.md §17.5; upstream tools_webhook.go (InboundScriptRunner)",
 		},
 		{

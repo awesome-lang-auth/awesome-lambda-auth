@@ -157,7 +157,7 @@ func TestAScriptThatThrowsIsNoResultNotAnError(t *testing.T) {
 }
 
 // TestResultIsReadEvenWhenTheScriptThrew: the reference's result check sits
-// after its catch (:293-301), so an assignment that precedes the throw is
+// after its catch (:299-304), so an assignment that precedes the throw is
 // tracked.
 func TestResultIsReadEvenWhenTheScriptThrew(t *testing.T) {
 	t.Parallel()
@@ -213,7 +213,11 @@ func TestAScriptPastItsDeadlineIsKilledAndIsATransportError(t *testing.T) {
 // TestAPromiseNothingCanSettleIsTheScriptsOwnFailure: no timers, no event
 // loop, every action settled before it returns — so a pending promise after
 // the job queue drains is final, and answering at once beats billing to the
-// deadline.
+// deadline. The result assigned before the await is deliberately not read:
+// under the await the reference means, the request would hang and never read
+// it. The reference as written reads result synchronously (its cross-realm
+// instanceof skips the await) and would track this one — a registered
+// difference, item (2) of inbound-webhook-scripts-run-on-goja.
 func TestAPromiseNothingCanSettleIsTheScriptsOwnFailure(t *testing.T) {
 	t.Parallel()
 	r, _ := newRunner(t, Options{})
@@ -290,17 +294,13 @@ func TestTheLanguageAScriptUsesIsThere(t *testing.T) {
 }
 
 // TestResultMembersOfTheWrongTypeAreDropped: the core's contract — data is an
-// object or nothing, userId and tenantId are strings or nothing — and a data
-// the engine cannot encode is dropped rather than failing a run every
-// redelivery would fail again.
+// object or nothing, userId and tenantId are strings or nothing.
 func TestResultMembersOfTheWrongTypeAreDropped(t *testing.T) {
 	t.Parallel()
-	r, logs := newRunner(t, Options{})
+	r, _ := newRunner(t, Options{})
 	for _, script := range []string{
 		"result = {event: 'e', data: [1, 2], userId: 7, tenantId: null}",
 		"result = {event: 'e', data: 'text'}",
-		"const c = {}; c.self = c; result = {event: 'e', data: c}",
-		"result = {event: 'e', data: {n: 10n}}",
 	} {
 		resp, err := run(t, r, pinnedRequest(t, script))
 		if err != nil {
@@ -311,8 +311,43 @@ func TestResultMembersOfTheWrongTypeAreDropped(t *testing.T) {
 			t.Errorf("%q answered %s, want the event alone", script, got)
 		}
 	}
-	if !strings.Contains(logs.String(), "not JSON-encodable") {
-		t.Error("an unencodable data was dropped without a log line")
+}
+
+// TestAResultThatCannotBeReadFailsTheRun: the reference reads result and
+// tracks its data inside the route's outer try (tools.router.ts:253, :304,
+// :316), so a getter that throws there, or a data the store cannot encode,
+// lands in the catch that answers 400 (:322-323). A failed run here is the
+// same 400. The script's exception text stays in the runner's log and never
+// crosses in the error.
+func TestAResultThatCannotBeReadFailsTheRun(t *testing.T) {
+	t.Parallel()
+	r, logs := newRunner(t, Options{})
+	for _, script := range []string{
+		"const c = {}; c.self = c; result = {event: 'e', data: c}",
+		"result = {event: 'e', data: {n: 10n}}",
+		"result = {get event() { throw new Error('secret-from-body') }}",
+		"result = {event: 'e', get data() { throw new Error('secret-from-body') }}",
+		"result = {event: 'e', data: {k: 1}}; throw new Error('first'); ",
+	} {
+		resp, err := run(t, r, pinnedRequest(t, script))
+		if strings.HasSuffix(script, "; ") {
+			// The control: a result that reads cleanly after a throw still
+			// tracks (TestResultIsReadEvenWhenTheScriptThrew).
+			if err != nil || resp.Result == nil {
+				t.Errorf("%q = %+v, %v; want the result", script, resp, err)
+			}
+			continue
+		}
+		if !errors.Is(err, errResultUnreadable) {
+			t.Errorf("%q: Run = %+v, %v; want the unreadable-result failure", script, resp, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret-from-body") {
+			t.Errorf("%q: the script's exception text crossed in the error: %v", script, err)
+		}
+	}
+	if !strings.Contains(logs.String(), "not JSON-encodable") || !strings.Contains(logs.String(), "reading the script's result threw") {
+		t.Errorf("an unreadable result was refused without saying why in the runner's log:\n%s", logs.String())
 	}
 }
 
@@ -394,6 +429,66 @@ func TestActionsAreNeverWidened(t *testing.T) {
 	}
 }
 
+// hostValue is what an SDK call returns: a struct with exported fields and a
+// method, and a typed error with a method of its own.
+type hostValue struct {
+	Name     string
+	internal string
+}
+
+func (hostValue) Secret() string { return "a method the script must never call" }
+
+type hostError struct{ code string }
+
+func (e *hostError) Error() string   { return "downstream refused: " + e.code }
+func (e *hostError) Credentials() string { return "a method the script must never call" }
+
+// TestAnActionHandsBackDataOnly: an action's value crosses as its JSON and its
+// failure as a plain Error with the message alone, so neither a Go struct nor
+// a Go error becomes an object whose methods a script can call.
+func TestAnActionHandsBackDataOnly(t *testing.T) {
+	t.Parallel()
+	r, _ := newRunner(t, Options{Manifest: Manifest{
+		{ID: "test.struct", IAM: []string{"none"}, Fn: func(context.Context, []any) (any, error) {
+			return &hostValue{Name: "n", internal: "i"}, nil
+		}},
+		{ID: "test.error", IAM: []string{"none"}, Fn: func(context.Context, []any) (any, error) {
+			return nil, &hostError{code: "E1"}
+		}},
+		{ID: "test.nothing", IAM: []string{"none"}, Fn: func(context.Context, []any) (any, error) {
+			return nil, nil
+		}},
+		{ID: "test.unencodable", IAM: []string{"none"}, Fn: func(context.Context, []any) (any, error) {
+			return func() {}, nil
+		}},
+	}})
+	req := pinnedRequest(t, strings.Join([]string{
+		"const v = await actions['test.struct']();",
+		"let e; try { await actions['test.error']() } catch (x) { e = x }",
+		"const n = await actions['test.nothing']();",
+		"let u; try { await actions['test.unencodable']() } catch (x) { u = x }",
+		"result = {event: 'probed', data: {",
+		"  keys: Object.keys(v).join(','), name: v.Name, secret: typeof v.Secret, internal: typeof v.internal,",
+		"  isPlain: Object.getPrototypeOf(v) === Object.prototype,",
+		"  errIsError: e instanceof Error, errProto: Object.getPrototypeOf(e) === Error.prototype,",
+		"  errMessage: e.message, errValue: typeof e.value, errMethod: typeof e.Credentials, errKeys: Object.keys(e).join(','),",
+		"  nothing: typeof n, unencodable: u instanceof Error,",
+		"}}",
+	}, " "))
+	req.Actions = []string{"test.struct", "test.error", "test.nothing", "test.unencodable"}
+	resp, err := run(t, r, req)
+	if err != nil || resp.Result == nil {
+		t.Fatalf("Run = %+v, %v", resp, err)
+	}
+	got, _ := json.Marshal(resp.Result.Data)
+	const want = `{"errIsError":true,"errKeys":"","errMessage":"downstream refused: E1","errMethod":"undefined","errProto":true,` +
+		`"errValue":"undefined","internal":"undefined","isPlain":true,"keys":"Name","name":"n","nothing":"undefined",` +
+		`"secret":"undefined","unencodable":true}`
+	if string(got) != want {
+		t.Errorf("what the script saw =\n  %s\nwant\n  %s", got, want)
+	}
+}
+
 // TestTheShippedManifestIsEmpty: which effects a webhook may cause is the
 // deployment's decision and is paid for in IAM; this build ships none.
 func TestTheShippedManifestIsEmpty(t *testing.T) {
@@ -432,7 +527,7 @@ func TestTheConsoleIsTheReferencesOwn(t *testing.T) {
 	if resp, err := run(t, loud, pinnedRequest(t, script)); err != nil || resp.Result == nil {
 		t.Fatalf("Run: %+v, %v", resp, err)
 	}
-	for _, want := range []string{`"message":"one 2 [object Object] "`, `"level":"warn"`, `"level":"error"`, `"provider":"contract"`} {
+	for _, want := range []string{`"message":"one 2 [object Object] "`, `"method":"warn"`, `"level":"WARN"`, `"method":"error"`, `"level":"ERROR"`, `"provider":"contract"`} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the console did not write %s:\n%s", want, logs.String())
 		}
