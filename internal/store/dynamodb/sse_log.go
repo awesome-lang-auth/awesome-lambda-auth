@@ -59,12 +59,18 @@ import (
 // one delivers in SK order, which is ULID order — per topic, and across the
 // topics of one connection because each poll merges them. Duplication:
 // at-least-once is safe only for an immediate redelivery, because the
-// manager's deduplication compares against the previous event alone; so
-// Follow keeps its own set of delivered ULIDs and never hands the same one to
-// the manager twice, and the one event published to several topics is one
-// ULID (below) and is delivered once. Unavailability: a Publish error makes the
-// manager deliver locally, which in the auth function is nobody — so a failed
-// write is logged here, because the core swallows it.
+// manager's deduplication compares against the previous event alone. The one
+// event published to several topics is one ULID (below), and within a poll
+// Follow hands every copy of it to the manager back to back, in the order
+// Track broadcasts them (EventTopics: global, tenant:, user:), so the
+// manager's own deduplication — tools.sse.deduplicate — does exactly what it
+// does in process: the first copy is framed under its own topic and the rest
+// are suppressed, or, with deduplication off, each is framed. Across polls the
+// copies are no longer adjacent, so Follow keeps its own set of what it
+// delivered and hands a late copy over only when deduplication is off.
+// Unavailability: a Publish error makes the manager deliver locally, which in
+// the auth function is nobody — so a failed write is logged here, because the
+// core swallows it, and the event is lost to every stream (docs/sse.md §4).
 
 // Defaults for SseLogOptions. The two the configuration exposes are
 // tools.sse.pollIntervalMs and tools.sse.eventLogRetentionSeconds; the rest are
@@ -100,12 +106,29 @@ const (
 	// keep up is disconnected and resumes from its last id — which is the
 	// failure mode the resume guarantee turns from data loss into a reconnect.
 	DefaultSsePage = 32
+
+	// DefaultSseReplayLimit bounds what one resume replays, in events, before
+	// the stream says the replay was cut and goes live
+	// (tools.sse.replayLimit). A resume at a segment boundary misses the few
+	// seconds of a reconnect; a hundred events is that at thirty events a
+	// second, and it bounds what a cursor anybody can write — the all-zero
+	// ULID, one from another deployment — costs to about four pages of reads
+	// per connection instead of the whole retention (docs/cost-model.md
+	// §3.1).
+	DefaultSseReplayLimit = 100
 )
 
-// MaxSseEventBytes caps one logged event, as itemBytes accounts for it: the
-// same margin under DynamoDB's 400 KB as every other caller-shaped item here.
-// The payload is whatever POST <tools>/track or POST <tools>/notify was handed.
-const MaxSseEventBytes = 300 * 1024
+// MaxSseEventBytes caps one logged event, as itemBytes accounts for it. The
+// payload is whatever POST <tools>/track or POST <tools>/notify was handed —
+// caller-shaped, with no size limit short of API Gateway's — and every copy is
+// a write to a partition every connection polls, SSE#global among them, which
+// holds a thousand write units a second. At DynamoDB's own ceiling one notify
+// would be three hundred of them; at 16 KiB it is sixteen, and an identity
+// event's tracked record is under one. An event over the cap is not logged:
+// Publish refuses it, the refusal is logged, and the core's fallback delivers
+// it locally, which in the auth function reaches nobody — so it reaches no
+// stream (docs/sse.md §4, "What is not promised").
+const MaxSseEventBytes = 16 * 1024
 
 // maxSseTopicLen bounds the partition key's variable segment. A notify target
 // is taken from the request path, so the topic is caller-shaped.
@@ -161,9 +184,13 @@ type SseLogOptions struct {
 	IdleAfter    time.Duration
 	// Settle is the look-back. Defaults to DefaultSseSettle.
 	Settle time.Duration
-	// Page bounds a Query page and a delivery batch. Defaults to
+	// Page bounds a Query page, a delivery batch, and how many events behind
+	// its newest one a topic's look-back re-reads. Defaults to
 	// DefaultSsePage.
 	Page int
+	// ReplayLimit bounds the events one resume replays. Defaults to
+	// DefaultSseReplayLimit.
+	ReplayLimit int
 }
 
 // SseLog is the event log. Build it with Store.SseLog; it is safe for
@@ -207,6 +234,9 @@ func (s *Store) SseLog(opts SseLogOptions) *SseLog {
 	}
 	if opts.Page <= 0 {
 		opts.Page = DefaultSsePage
+	}
+	if opts.ReplayLimit <= 0 {
+		opts.ReplayLimit = DefaultSseReplayLimit
 	}
 	return &SseLog{
 		store: s,
@@ -418,17 +448,41 @@ type SseResume struct {
 	// compare. It is what the stream hands the client back as its first id
 	// (docs/sse.md, "the cursor frame").
 	Floor string
-	// Replay reports that the client sent a cursor this log recognised and
-	// is being handed what came after it.
+	// Replay reports that the client sent a cursor this log can place and is
+	// being handed what came after it, up to the replay limit.
 	Replay bool
+	// LookBelow reports that the cursor is an event's id, so the first read
+	// reaches the look-back below it: an event older than the cursor whose
+	// write was still invisible when the client's last segment ended is
+	// delivered now rather than never. A floor — the id-only frame's value,
+	// minted by ulidAt with an all-zero random half — is not an event and
+	// has nothing owed below it (isFloor).
+	LookBelow bool
 	// Truncated reports a cursor older than the retention: replay starts at
-	// the horizon, and what was before it is gone.
+	// the horizon, and what was before it is gone. The all-zero ULID lands
+	// here, as does any cursor dated before the horizon.
 	Truncated bool
-	// Unrecognised reports a cursor this log did not mint — a UUID from the
-	// connected frame of a client that has never had the cursor frame, a
-	// value from another deployment, garbage — or one from the future. The
-	// connection starts from now, as the reference's always does.
+	// Unrecognised reports a cursor that is not a well-formed ULID — a UUID
+	// from the connected frame of a client that has never had the cursor
+	// frame, garbage — or one more than a minute in the future. The
+	// connection starts from now, as the reference's always does. A
+	// well-formed ULID inside the retention is taken at its word whoever
+	// minted it: nothing in a ULID says which log wrote it, and the replay
+	// limit is what bounds what a foreign one costs.
 	Unrecognised bool
+}
+
+// isFloor reports a ULID with an all-zero random half: what ulidAt returns,
+// and so every floor this log hands a client (the id-only frame, the cut of a
+// replay). The clock never mints one for an event — the chance is 2^-80 a
+// millisecond — so it is how a cursor says "I heard no event; I was here".
+func isFloor(u ulid) bool {
+	for _, b := range u[6:] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // futureCursorSlack is how far ahead of this clock a cursor may be and still be
@@ -454,7 +508,7 @@ func (l *SseLog) Resume(cursor string) SseResume {
 	if u.time().Before(horizon) {
 		return SseResume{Floor: ulidAt(horizon).String(), Replay: true, Truncated: true}
 	}
-	return SseResume{Floor: u.String(), Replay: true}
+	return SseResume{Floor: u.String(), Replay: true, LookBelow: !isFloor(u)}
 }
 
 // SseFollow is one connection's subscription.
@@ -464,11 +518,30 @@ type SseFollow struct {
 	Topics []string
 	// Floor is SseResume.Floor.
 	Floor string
+	// Replay is SseResume.Replay: what Follow delivers until it has caught up
+	// with the log is a replay, bounded by the replay limit.
+	Replay bool
+	// LookBelow is SseResume.LookBelow: the first read reaches the look-back
+	// below the floor, and the floor's own event is not delivered again.
+	LookBelow bool
+	// Deduplicate is the manager's own setting (SseManager.Deduplicate,
+	// tools.sse.deduplicate): whether a copy of an event that has already
+	// been delivered under another topic is handed over again when it turns
+	// up in a later poll. Within one poll every copy is handed over, back to
+	// back, and the manager decides.
+	Deduplicate bool
 	// Ready reports that the connection is registered with the manager. Serve
 	// writes the connected frame before it registers the connection
 	// (sse.go), so a delivery before then would reach nobody while the
 	// cursor moved past it. Nil means ready.
 	Ready func() bool
+	// ReplayCut is called when the replay reaches the replay limit with more
+	// of it still in the log: last is the id of the last event replayed, and
+	// floor is the ULID the stream continues live from, which the caller
+	// writes to the client — after the frame with id last, and with a
+	// comment — so that its cursor moves past what was skipped. Nil means
+	// nobody is told, and the stream continues live all the same.
+	ReplayCut func(last, floor string)
 }
 
 // Follow polls the connection's topics and hands every new event to the
@@ -505,22 +578,67 @@ func (l *SseLog) Follow(ctx context.Context, f SseFollow) error {
 		}
 	}
 
-	// One high-water mark per topic, starting at the floor, and the set of
-	// ULIDs already delivered, which the look-back makes necessary.
-	high := make(map[string]ulid, len(f.Topics))
-	for _, t := range f.Topics {
-		high[t] = floor
+	st := newSseFollowState(f.Topics, floor, f.Deduplicate)
+	if f.LookBelow {
+		// The floor is the last event the client holds, and the one gap the
+		// in-connection look-back cannot cover is an event below it whose
+		// write was still invisible when the last segment ended. So the
+		// first read of each topic starts a look-back below it, and the
+		// floor's own event is not handed over again. What else that window
+		// holds, the client may already have: at-least-once.
+		st.skip, st.hasSkip = floor, true
+		for _, t := range f.Topics {
+			b, err := l.belowFloor(ctx, t, floor)
+			if err != nil {
+				if ctx.Err() != nil || subCtx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			st.base[t] = b
+		}
 	}
-	seen := make(map[ulid]struct{})
-	lastEvent := time.Now()
 
+	replaying, replayed := f.Replay, 0
+	lastEvent := time.Now()
+	more := false
 	for {
-		delivered, more, err := l.pollOnce(ctx, f.Topics, floor, high, seen, fn)
+		limit := l.opts.Page
+		if replaying && l.opts.ReplayLimit-replayed < limit {
+			limit = l.opts.ReplayLimit - replayed
+		}
+		// A poll straight after a full page is catching up, and skips the
+		// look-back: what it would re-read was read a moment ago, and the
+		// next paced poll looks back again.
+		delivered, last, full, err := l.pollOnce(ctx, st, limit, !more, fn)
 		if err != nil {
 			if ctx.Err() != nil || subCtx.Err() != nil {
 				return nil
 			}
 			return err
+		}
+		more = full
+		if replaying {
+			replayed += delivered
+			switch {
+			case !more:
+				replaying = false
+			case replayed >= l.opts.ReplayLimit:
+				// The replay limit, with more of the replay still in the
+				// log: skip the rest and go live from now. The caller tells
+				// the client, after the last event replayed, and moves its
+				// cursor to the jump, so the skip holds across a reconnect.
+				jump := ulidAt(l.store.nowUTC())
+				st.jump(jump)
+				replaying, more = false, false
+				if f.ReplayCut != nil {
+					lastID := ""
+					if last != (ulid{}) {
+						lastID = last.String()
+					}
+					f.ReplayCut(lastID, jump.String())
+				}
+			}
 		}
 
 		var wait time.Duration
@@ -530,7 +648,6 @@ func (l *SseLog) Follow(ctx context.Context, f SseFollow) error {
 			// itself is the pacing, and the batch is sized to the queue.
 			wait = 0
 		case delivered > 0:
-			lastEvent = time.Now()
 			wait = l.opts.PollInterval
 		case time.Since(lastEvent) >= l.opts.IdleAfter:
 			wait = l.opts.IdleInterval
@@ -581,6 +698,92 @@ func waitReady(ctx, subCtx context.Context, ready func() bool) bool {
 	return true
 }
 
+// sseSeenKey is one delivery Follow remembers: the event, and — with the
+// manager's deduplication off — the topic it was delivered under, because
+// then each topic's copy is a delivery of its own.
+type sseSeenKey struct {
+	id    ulid
+	topic string
+}
+
+// sseFollowState is one connection's position in the log.
+type sseFollowState struct {
+	topics []string
+	dedup  bool
+	// base is the lowest bound a topic's read may start from: the floor, or
+	// the look-back below it for a resumed cursor.
+	base map[string]ulid
+	// high is each topic's high-water mark: the newest event read and
+	// accounted for.
+	high map[string]ulid
+	// recent is each topic's last few events at or below its mark, oldest
+	// first, which bounds the look-back by count as well as by time.
+	recent map[string][]ulid
+	// seen is what was delivered and a look-back can still return.
+	seen map[sseSeenKey]struct{}
+	// skip is the resumed cursor's own event, which the client holds.
+	skip    ulid
+	hasSkip bool
+}
+
+// newSseFollowState starts every topic at floor.
+func newSseFollowState(topics []string, floor ulid, dedup bool) *sseFollowState {
+	st := &sseFollowState{
+		topics: topics,
+		dedup:  dedup,
+		base:   make(map[string]ulid, len(topics)),
+		high:   make(map[string]ulid, len(topics)),
+		recent: make(map[string][]ulid, len(topics)),
+		seen:   make(map[sseSeenKey]struct{}),
+	}
+	for _, t := range topics {
+		st.base[t], st.high[t] = floor, floor
+	}
+	return st
+}
+
+func (st *sseFollowState) key(id ulid, topic string) sseSeenKey {
+	if st.dedup {
+		return sseSeenKey{id: id}
+	}
+	return sseSeenKey{id: id, topic: topic}
+}
+
+func (st *sseFollowState) isSeen(id ulid, topic string) bool {
+	if st.hasSkip && id == st.skip {
+		return true
+	}
+	_, ok := st.seen[st.key(id, topic)]
+	return ok
+}
+
+// jump moves every topic to floor and forgets everything behind it: what a
+// cut replay continues from.
+func (st *sseFollowState) jump(floor ulid) {
+	for _, t := range st.topics {
+		st.base[t], st.high[t] = floor, floor
+		delete(st.recent, t)
+	}
+	st.seen = make(map[sseSeenKey]struct{})
+	st.hasSkip = false
+}
+
+// remember records id as read on topic, keeping the newest keep of them.
+func (st *sseFollowState) remember(topic string, id ulid, keep int) {
+	r := st.recent[topic]
+	i := sort.Search(len(r), func(i int) bool { return bytes.Compare(r[i][:], id[:]) >= 0 })
+	if i < len(r) && r[i] == id {
+		return
+	}
+	r = append(r, ulid{})
+	copy(r[i+1:], r[i:])
+	r[i] = id
+	if len(r) > keep {
+		r = r[len(r)-keep:]
+	}
+	st.recent[topic] = r
+}
+
 // sseEntry is one event read in a poll, before delivery.
 type sseEntry struct {
 	id    ulid
@@ -588,76 +791,176 @@ type sseEntry struct {
 	event auth.StreamEvent
 }
 
-// pollOnce reads every topic once and delivers what is new, in ULID order,
-// at most Page of it. more reports that a topic had more than a page or that
-// the batch was cut, so the caller polls again at once.
-func (l *SseLog) pollOnce(ctx context.Context, topics []string, floor ulid, high map[string]ulid, seen map[ulid]struct{}, fn func(string, auth.StreamEvent)) (int, bool, error) {
+// topicRank is the order Track broadcasts one event's topics in — EventTopics
+// (auth_tools.go): global, then tenant:, then user: — which is the order the
+// copies of one event are handed to the manager in, so that the copy the
+// manager frames first, and with deduplication on frames alone, is the copy
+// the core's in-process delivery frames: the one under the earliest topic in
+// that order, whatever order the client listed its topics in.
+func topicRank(topic string) int {
+	switch {
+	case topic == auth.SseTopicGlobal:
+		return 0
+	case strings.HasPrefix(topic, auth.SseTopicTenantPrefix):
+		return 1
+	case strings.HasPrefix(topic, auth.SseTopicUserPrefix):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// pollOnce reads every topic once and delivers what is new, in ULID order, at
+// most limit events of it (an event's copies under several topics count once,
+// and are never split across two polls). It returns how many events it
+// delivered, the id of the last, and whether a topic had more than a page or
+// the batch was cut, so that the caller polls again at once. lookBack is false
+// on a poll that is catching up.
+func (l *SseLog) pollOnce(ctx context.Context, st *sseFollowState, limit int, lookBack bool, fn func(string, auth.StreamEvent)) (int, ulid, bool, error) {
 	now := l.store.nowUTC()
 	horizon := ulidAt(now.Add(-l.opts.Retention))
+	keep := l.opts.Page + 1
 
 	var batch []sseEntry
 	more := false
 	lowest := ulid{}
-	for i, topic := range topics {
-		lower := lookBack(high[topic], floor, l.opts.Settle)
+	for i, topic := range st.topics {
+		lower := st.high[topic]
+		if lookBack {
+			lower = lookBackFrom(st.high[topic], st.base[topic], l.opts.Settle)
+			// And by count: at most a page of events behind the mark is
+			// read again, so a busy topic's look-back is its last Page
+			// events rather than three seconds of them — the re-read no
+			// longer grows with the event rate.
+			if r := st.recent[topic]; len(r) >= keep && bytes.Compare(r[0][:], lower[:]) > 0 {
+				lower = r[0]
+			}
+		}
 		if i == 0 || bytes.Compare(lower[:], lowest[:]) < 0 {
 			lowest = lower
 		}
-		entries, full, err := l.readTopic(ctx, topic, lower, seen, horizon)
+		entries, full, err := l.readTopic(ctx, topic, lower, st.isSeen, horizon)
 		if err != nil {
-			return 0, false, err
+			return 0, ulid{}, false, err
 		}
 		batch = append(batch, entries...)
 		more = more || full
 	}
 
-	// ULID order across topics. The same ULID under two topics — one event
-	// published to both — sorts adjacently and is delivered once, under the
-	// first; the connection holds both topics or it would not be polling them.
+	// ULID order across topics, and within one ULID the broadcast order.
 	sort.SliceStable(batch, func(i, j int) bool {
-		return bytes.Compare(batch[i].id[:], batch[j].id[:]) < 0
+		if c := bytes.Compare(batch[i].id[:], batch[j].id[:]); c != 0 {
+			return c < 0
+		}
+		return topicRank(batch[i].topic) < topicRank(batch[j].topic)
 	})
 	delivered := 0
-	for _, e := range batch {
-		if _, dup := seen[e.id]; !dup {
-			if delivered == l.opts.Page {
-				// The batch is cut here, and nothing past the cut moves a
-				// high-water mark: those events are read again next time.
+	var last ulid
+	for start := 0; start < len(batch); {
+		end := start + 1
+		for end < len(batch) && batch[end].id == batch[start].id {
+			end++
+		}
+		group := batch[start:end]
+		var copies []sseEntry
+		for _, e := range group {
+			if !st.isSeen(e.id, e.topic) {
+				copies = append(copies, e)
+			}
+		}
+		if len(copies) > 0 {
+			if delivered >= limit {
+				// The batch is cut here, at an event's boundary, and nothing
+				// past the cut moves a high-water mark: those events are read
+				// again next time.
 				more = true
 				break
 			}
-			fn(e.topic, e.event)
-			seen[e.id] = struct{}{}
+			// Every copy not yet delivered, back to back — decided before
+			// any is marked, so that marking the first under deduplication
+			// does not hide the rest from the manager: with deduplication
+			// on it frames the first and suppresses the others (its
+			// lastEventID), exactly as for Track's in-process broadcasts,
+			// and with it off it frames each.
+			for _, e := range copies {
+				fn(e.topic, e.event)
+			}
+			for _, e := range copies {
+				st.seen[st.key(e.id, e.topic)] = struct{}{}
+			}
 			delivered++
+			last = group[0].id
 		}
 		// An event already delivered — under this topic in an earlier poll,
-		// or under another topic in this one — still moves this topic's
-		// mark, so a topic whose every event is a copy does not re-read its
-		// partition from the floor for the life of the connection.
-		if mark := high[e.topic]; bytes.Compare(e.id[:], mark[:]) > 0 {
-			high[e.topic] = e.id
+		// or under another topic — still moves this topic's mark, so a topic
+		// whose every event is a copy does not re-read its partition from the
+		// floor for the life of the connection.
+		for _, e := range group {
+			if mark := st.high[e.topic]; bytes.Compare(e.id[:], mark[:]) > 0 {
+				st.high[e.topic] = e.id
+			}
+			st.remember(e.topic, e.id, keep)
 		}
+		start = end
 	}
 
 	// The delivered set only has to remember what a look-back can still
 	// return; anything below the lowest lower bound is behind every cursor.
-	for id := range seen {
-		if bytes.Compare(id[:], lowest[:]) <= 0 {
-			delete(seen, id)
+	for k := range st.seen {
+		if bytes.Compare(k.id[:], lowest[:]) <= 0 {
+			delete(st.seen, k)
 		}
 	}
-	return delivered, more, nil
+	return delivered, last, more, nil
 }
 
-// lookBack is the lower bound of a topic's next Query: Settle behind its
-// high-water mark, and never below the connection's floor — the client's own
-// cursor, before which nothing may be replayed.
-func lookBack(high, floor ulid, settle time.Duration) ulid {
+// lookBackFrom is the lower bound of a topic's next Query: Settle behind its
+// high-water mark, and never below the topic's base — the floor, or for a
+// resumed cursor the look-back below it, before which nothing may be
+// replayed.
+func lookBackFrom(high, base ulid, settle time.Duration) ulid {
 	back := ulidAt(high.time().Add(-settle))
-	if bytes.Compare(back[:], floor[:]) < 0 {
-		return floor
+	if bytes.Compare(back[:], base[:]) < 0 {
+		return base
 	}
 	return back
+}
+
+// belowFloor is the base of a resumed topic: Settle below the cursor, or — if
+// that window holds more than a page of events — the page of them nearest the
+// cursor, so that the look-back below a resume is bounded by count as the one
+// inside a connection is. One Query, newest first, of at most Page+1 keys.
+func (l *SseLog) belowFloor(ctx context.Context, topic string, floor ulid) (ulid, error) {
+	lo := ulidAt(floor.time().Add(-l.opts.Settle))
+	out, err := l.store.api.Query(ctx, &awsddb.QueryInput{
+		TableName:                aws.String(l.store.table),
+		KeyConditionExpression:   aws.String("#PK = :pk AND #SK BETWEEN :lo AND :hi"),
+		ExpressionAttributeNames: exprNames(attrPK, attrSK),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": avS(ssePK(topic)),
+			":lo": avS(sseSK(lo)),
+			":hi": avS(sseSK(floor)),
+		},
+		ProjectionExpression: aws.String("#SK"),
+		ConsistentRead:       aws.Bool(false),
+		ScanIndexForward:     aws.Bool(false),
+		Limit:                aws.Int32(int32(l.opts.Page + 1)),
+	})
+	if err != nil {
+		return ulid{}, wrap("look below an sse cursor", err)
+	}
+	if len(out.Items) <= l.opts.Page {
+		return lo, nil
+	}
+	sk, ok := strings.CutPrefix(getS(out.Items[len(out.Items)-1], attrSK), skSsePrefix)
+	if !ok {
+		return lo, nil
+	}
+	oldest, err := parseULID(sk)
+	if err != nil {
+		return lo, nil
+	}
+	return oldest, nil
 }
 
 // readTopic reads one topic after lower, skipping what is past the retention,
@@ -665,7 +968,7 @@ func lookBack(high, floor ulid, settle time.Duration) ulid {
 // Events already delivered are returned too — the caller moves the topic's
 // high-water mark past them — but do not count towards the page. full reports
 // that it stopped at a page with more behind it.
-func (l *SseLog) readTopic(ctx context.Context, topic string, lower ulid, seen map[ulid]struct{}, horizon ulid) ([]sseEntry, bool, error) {
+func (l *SseLog) readTopic(ctx context.Context, topic string, lower ulid, seen func(ulid, string) bool, horizon ulid) ([]sseEntry, bool, error) {
 	in := &awsddb.QueryInput{
 		TableName:                aws.String(l.store.table),
 		KeyConditionExpression:   aws.String("#PK = :pk AND #SK > :after"),
@@ -697,7 +1000,7 @@ func (l *SseLog) readTopic(ctx context.Context, topic string, lower ulid, seen m
 			if bytes.Compare(id[:], horizon[:]) < 0 {
 				continue
 			}
-			if _, dup := seen[id]; !dup {
+			if !seen(id, topic) {
 				fresh++
 			}
 			out = append(out, sseEntry{id: id, topic: topic, event: ev})

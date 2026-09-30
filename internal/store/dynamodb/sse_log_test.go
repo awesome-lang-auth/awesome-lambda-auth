@@ -3,12 +3,15 @@ package dynamodb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	auth "github.com/nik2208/awesome-go-auth"
 )
 
@@ -114,7 +117,7 @@ func storedULIDs(t *testing.T, store *Store, topic string) []string {
 		t.Fatal(err)
 	}
 	var out []string
-	entries, _, err := l.readTopic(context.Background(), topic, ulid{}, map[ulid]struct{}{}, ulid{})
+	entries, _, err := l.readTopic(context.Background(), topic, ulid{}, func(ulid, string) bool { return false }, ulid{})
 	if err != nil {
 		t.Fatalf("read %s: %v", topic, err)
 	}
@@ -250,52 +253,266 @@ func TestSsePublishWritesOneItemPerSubscribableTopic(t *testing.T) {
 	}
 }
 
+// deliveries renders what the collector received as type@topic, in order.
+func (c *collector) deliveries() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.events))
+	for i, ev := range c.events {
+		out[i] = ev.Type + "@" + c.topics[i]
+	}
+	return strings.Join(out, ",")
+}
+
 // TestSseFollowReplaysInOrderAfterTheCursor is the resume guarantee: events
-// after the cursor, oldest first, across topics, each once; nothing at or
-// before it.
+// after the cursor, oldest first, across topics, and nothing at the cursor.
+// The one event on two topics is handed over once per topic, back to back and
+// in Track's broadcast order — global before user: — whatever order the
+// connection lists its topics in, so that the manager's deduplication decides
+// what reaches the wire, as it does in process.
 func TestSseFollowReplaysInOrderAfterTheCursor(t *testing.T) {
 	t.Parallel()
-	l, store := fastSseLog(t)
+	for _, dedup := range []bool{true, false} {
+		t.Run("deduplicate_"+strconv.FormatBool(dedup), func(t *testing.T) {
+			t.Parallel()
+			l, store := fastSseLog(t)
+			c := newCollector()
+			if err := l.Subscribe(context.Background(), c.fn); err != nil {
+				t.Fatal(err)
+			}
+
+			publish(t, l, "global", auth.StreamEvent{ID: "e1", Type: "one", Data: 1})
+			publish(t, l, "user:u1", auth.StreamEvent{ID: "e2", Type: "two", Data: 2})
+			// e3 goes to both topics, as Track sends one event to several.
+			publish(t, l, "global", auth.StreamEvent{ID: "e3", Type: "three", Data: 3})
+			publish(t, l, "user:u1", auth.StreamEvent{ID: "e3", Type: "three", Data: 3})
+			publish(t, l, "global", auth.StreamEvent{ID: "e4", Type: "four", Data: 4})
+
+			first := storedULIDs(t, store, "global")[0]
+			resume := l.Resume(first)
+			if !resume.Replay || !resume.LookBelow || resume.Truncated || resume.Unrecognised || resume.Floor != first {
+				t.Fatalf("Resume(%s) = %+v, want a replay from it that looks below it", first, resume)
+			}
+			// The topics in the order ?topics=user:u1,global asks for them.
+			stop := follow(t, l, SseFollow{Topics: []string{"user:u1", "global"}, Floor: resume.Floor, Replay: true, LookBelow: true, Deduplicate: dedup})
+
+			c.await(t, 4)
+			if got, want := c.deliveries(), "two@user:u1,three@global,three@user:u1,four@global"; got != want {
+				t.Fatalf("replayed %s, want %s: after the cursor, oldest first, the two-topic event's copies adjacent and global first", got, want)
+			}
+			// Let a few more polls run over the same events: the look-back
+			// re-reads them, and the delivered set must keep them from
+			// arriving twice.
+			time.Sleep(50 * time.Millisecond)
+			if n := c.count(); n != 4 {
+				t.Errorf("%d deliveries after further polls, want 4: the look-back re-delivered", n)
+			}
+			if err := stop(); err != nil {
+				t.Errorf("Follow returned %v on an ordinary end", err)
+			}
+		})
+	}
+}
+
+// TestSseFollowDeliversALateCopyOnlyWithoutDeduplication: when one event's
+// second topic becomes visible a poll after its first — they are no longer
+// adjacent, so the manager's deduplication cannot see them together — the
+// copy is handed over only when deduplication is off, which is what the core
+// in process would frame; with it on, a second frame would be a duplicate the
+// core never sends.
+func TestSseFollowDeliversALateCopyOnlyWithoutDeduplication(t *testing.T) {
+	t.Parallel()
+	for _, dedup := range []bool{true, false} {
+		t.Run("deduplicate_"+strconv.FormatBool(dedup), func(t *testing.T) {
+			t.Parallel()
+			l, _ := fastSseLog(t)
+			c := newCollector()
+			if err := l.Subscribe(context.Background(), c.fn); err != nil {
+				t.Fatal(err)
+			}
+			stop := follow(t, l, SseFollow{Topics: []string{"global", "user:u1"}, Floor: l.Resume("").Floor, Deduplicate: dedup})
+			time.Sleep(2 * time.Millisecond)
+			publish(t, l, "user:u1", auth.StreamEvent{ID: "x", Type: "x"})
+			c.await(t, 1)
+			publish(t, l, "global", auth.StreamEvent{ID: "x", Type: "x"})
+			publish(t, l, "global", auth.StreamEvent{ID: "y", Type: "y"})
+			want := "x@user:u1,y@global"
+			if !dedup {
+				want = "x@user:u1,x@global,y@global"
+			}
+			c.await(t, strings.Count(want, ",")+1)
+			time.Sleep(30 * time.Millisecond)
+			if got := c.deliveries(); got != want {
+				t.Errorf("delivered %s, want %s", got, want)
+			}
+			_ = stop()
+		})
+	}
+}
+
+// TestSseResumeDeliversAnEventThatBecameVisibleBelowTheCursor is the gap a
+// reconnect used to leave: an event whose ULID is older than the client's
+// cursor, written after the client had moved past it — a slower PutItem from
+// another execution environment — is delivered on the resume, because the
+// first read looks below the cursor; the cursor's own event is not.
+func TestSseResumeDeliversAnEventThatBecameVisibleBelowTheCursor(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	now := time.Now().UTC()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	store, _ := newStore(t, func(o *Options) { o.Now = clock })
+	l := store.SseLog(SseLogOptions{PollInterval: 5 * time.Millisecond, IdleInterval: 5 * time.Millisecond})
 	c := newCollector()
 	if err := l.Subscribe(context.Background(), c.fn); err != nil {
 		t.Fatal(err)
 	}
 
-	publish(t, l, "global", auth.StreamEvent{ID: "e1", Type: "one", Data: 1})
-	publish(t, l, "user:u1", auth.StreamEvent{ID: "e2", Type: "two", Data: 2})
-	// e3 goes to both topics, as Track sends one event to several.
-	publish(t, l, "global", auth.StreamEvent{ID: "e3", Type: "three", Data: 3})
-	publish(t, l, "user:u1", auth.StreamEvent{ID: "e3", Type: "three", Data: 3})
-	publish(t, l, "global", auth.StreamEvent{ID: "e4", Type: "four", Data: 4})
+	// "late" is minted first — its ULID is fixed on first publication, here
+	// to a topic the connection does not hold — and reaches global only after
+	// "cursor", a second later, has been written and delivered.
+	publish(t, l, "user:other", auth.StreamEvent{ID: "late", Type: "late"})
+	mu.Lock()
+	now = now.Add(time.Second)
+	mu.Unlock()
+	publish(t, l, "global", auth.StreamEvent{ID: "cursor", Type: "cursor"})
+	cursor := storedULIDs(t, store, "global")[0]
+	publish(t, l, "global", auth.StreamEvent{ID: "late", Type: "late"})
+	if ids := storedULIDs(t, store, "global"); len(ids) != 2 || ids[0] >= cursor {
+		t.Fatalf("global holds %v; the test needs the late event's ULID below the cursor %s", ids, cursor)
+	}
 
-	first := storedULIDs(t, store, "global")[0]
-	resume := l.Resume(first)
-	if !resume.Replay || resume.Truncated || resume.Unrecognised || resume.Floor != first {
-		t.Fatalf("Resume(%s) = %+v, want a replay from it", first, resume)
+	resume := l.Resume(cursor)
+	stop := follow(t, l, SseFollow{Topics: []string{"global"}, Floor: resume.Floor, Replay: resume.Replay, LookBelow: resume.LookBelow, Deduplicate: true})
+	c.await(t, 1)
+	time.Sleep(30 * time.Millisecond)
+	_ = stop()
+	if got := c.deliveries(); got != "late@global" {
+		t.Errorf("the resume delivered %s, want late@global and not the cursor's own event", got)
 	}
-	stop := follow(t, l, SseFollow{Topics: []string{"global", "user:u1"}, Floor: resume.Floor})
 
-	got := c.await(t, 3)
-	var types []string
-	for _, ev := range got {
-		types = append(types, ev.Type)
+	// A floor — the id-only frame's value — is not an event: nothing is owed
+	// below it.
+	if r := l.Resume(ulidAt(clock()).String()); !r.Replay || r.LookBelow {
+		t.Errorf("Resume(a floor) = %+v, want a replay that does not look below it", r)
 	}
-	if strings.Join(types, ",") != "two,three,four" {
-		t.Fatalf("replayed %v, want two,three,four: after the cursor, oldest first, the two-topic event once", types)
+}
+
+// TestSseReplayIsCutAtTheLimit: a replay longer than tools.sse.replayLimit
+// delivers the limit, reports the cut with the last id replayed and the floor
+// it jumps to, and continues live — the rest of the backlog is never read.
+func TestSseReplayIsCutAtTheLimit(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	l := store.SseLog(SseLogOptions{PollInterval: 5 * time.Millisecond, IdleInterval: 5 * time.Millisecond, Page: 2, ReplayLimit: 5})
+	c := newCollector()
+	if err := l.Subscribe(context.Background(), c.fn); err != nil {
+		t.Fatal(err)
 	}
-	for i := 1; i < len(got); i++ {
-		if got[i].ID <= got[i-1].ID {
-			t.Errorf("delivery %d id %s does not sort after %s", i, got[i].ID, got[i-1].ID)
+	floor := l.Resume("").Floor
+	time.Sleep(2 * time.Millisecond)
+	for i := 0; i < 12; i++ {
+		publish(t, l, "global", auth.StreamEvent{ID: "b" + strconv.Itoa(i), Type: strconv.Itoa(i)})
+	}
+	resume := l.Resume(floor)
+	if !resume.Replay || resume.LookBelow {
+		t.Fatalf("Resume(a floor) = %+v", resume)
+	}
+	var cutMu sync.Mutex
+	var cutLast, cutFloor string
+	stop := follow(t, l, SseFollow{Topics: []string{"global"}, Floor: resume.Floor, Replay: true, Deduplicate: true,
+		ReplayCut: func(last, floor string) { cutMu.Lock(); cutLast, cutFloor = last, floor; cutMu.Unlock() }})
+	got := c.await(t, 5)
+	time.Sleep(30 * time.Millisecond)
+	if n := c.count(); n != 5 {
+		t.Fatalf("%d deliveries, want the limit of 5", n)
+	}
+	cutMu.Lock()
+	last, jump := cutLast, cutFloor
+	cutMu.Unlock()
+	if last != got[4].ID {
+		t.Errorf("the cut reported last %q, want the fifth event's id %q", last, got[4].ID)
+	}
+	if u, err := parseULID(jump); err != nil || !isFloor(u) || jump <= last {
+		t.Errorf("the cut reported floor %q, want a floor after %s", jump, last)
+	}
+	// Live after the cut.
+	publish(t, l, "global", auth.StreamEvent{ID: "live", Type: "live"})
+	if all := c.await(t, 6); all[5].Type != "live" {
+		t.Errorf("after the cut the stream delivered %q, want the live event", all[5].Type)
+	}
+	_ = stop()
+}
+
+// sseReadCounter counts the SSE items Queries return.
+type sseReadCounter struct {
+	API
+	mu    sync.Mutex
+	items int
+}
+
+func (c *sseReadCounter) Query(ctx context.Context, in *awsddb.QueryInput, optFns ...func(*awsddb.Options)) (*awsddb.QueryOutput, error) {
+	out, err := c.API.Query(ctx, in, optFns...)
+	if err == nil {
+		if pk, ok := in.ExpressionAttributeValues[":pk"].(*types.AttributeValueMemberS); ok && strings.HasPrefix(pk.Value, pkSsePrefix) {
+			c.mu.Lock()
+			c.items += len(out.Items)
+			c.mu.Unlock()
 		}
 	}
-	// Let a few more polls run over the same events: the look-back re-reads
-	// them, and the delivered set must keep them from arriving twice.
-	time.Sleep(50 * time.Millisecond)
-	if n := c.count(); n != 3 {
-		t.Errorf("%d deliveries after further polls, want 3: the look-back re-delivered", n)
+	return out, err
+}
+
+func (c *sseReadCounter) reset() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.items
+	c.items = 0
+	return n
+}
+
+// TestSseLookBackIsBoundedByCount: a busy topic's look-back re-reads at most a
+// page of events behind its mark, not every event of the last three seconds —
+// the poll's read no longer grows with the event rate.
+func TestSseLookBackIsBoundedByCount(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	counter := &sseReadCounter{API: store.api}
+	store.api = counter
+	const page = 4
+	l := store.SseLog(SseLogOptions{Page: page})
+	floor := ulidAt(store.nowUTC())
+	time.Sleep(2 * time.Millisecond)
+	for i := 0; i < 40; i++ {
+		publish(t, l, "global", auth.StreamEvent{ID: "q" + strconv.Itoa(i), Type: strconv.Itoa(i)})
 	}
-	if err := stop(); err != nil {
-		t.Errorf("Follow returned %v on an ordinary end", err)
+	st := newSseFollowState([]string{"global"}, floor, true)
+	fn := func(string, auth.StreamEvent) {}
+	for more, lookBack := true, true; more; lookBack = !more {
+		var err error
+		if _, _, more, err = l.pollOnce(context.Background(), st, page, lookBack, fn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counter.reset()
+	if _, _, _, err := l.pollOnce(context.Background(), st, page, true, fn); err != nil {
+		t.Fatal(err)
+	}
+	if n := counter.reset(); n > page {
+		t.Errorf("a paced poll over a caught-up topic read %d items back; the look-back is bounded at %d", n, page)
+	}
+}
+
+// TestSsePublishRefusesAnEventOverTheCap: an event over MaxSseEventBytes is not
+// logged — the core's fallback then delivers it locally, to nobody.
+func TestSsePublishRefusesAnEventOverTheCap(t *testing.T) {
+	t.Parallel()
+	l, store := fastSseLog(t)
+	err := l.Publish(context.Background(), "global", auth.StreamEvent{ID: "big", Type: "big", Data: strings.Repeat("x", MaxSseEventBytes)})
+	if !errors.Is(err, ErrSseEventTooLarge) {
+		t.Fatalf("Publish of an event over the cap = %v, want ErrSseEventTooLarge", err)
+	}
+	if got := storedULIDs(t, store, "global"); len(got) != 0 {
+		t.Errorf("an event over the cap was written: %v", got)
 	}
 }
 
@@ -432,6 +649,13 @@ func TestSseRetentionBoundsTheReplay(t *testing.T) {
 		if r := l.Resume(bad); !r.Unrecognised || r.Replay {
 			t.Errorf("Resume(%q) = %+v, want unrecognised and a start from now", bad, r)
 		}
+	}
+	// The all-zero ULID is well-formed and dated 1970: truncated to the
+	// horizon, never a replay of more than the retention, and the replay
+	// limit bounds even that.
+	zero := strings.Repeat("0", ulidLen)
+	if r := l.Resume(zero); !r.Truncated || !r.Replay || r.LookBelow || r.Floor != ulidAt(clock().Add(-time.Hour)).String() {
+		t.Errorf("Resume(%s) = %+v, want a truncated replay from the horizon", zero, r)
 	}
 }
 
