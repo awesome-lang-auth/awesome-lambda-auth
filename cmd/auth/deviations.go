@@ -188,7 +188,9 @@ func WireDeviations() []WireDeviation {
 			Surface: "every route named in rateLimit.scope -- by default POST <prefix>/login, POST <prefix>/forgot-password, " +
 				"POST <prefix>/magic-link/send, POST <prefix>/magic-link/verify, POST <prefix>/sms/send, " +
 				"POST <prefix>/sms/verify and POST <prefix>/2fa/verify -- and, with the admin console mounted, " +
-				"POST <admin>/users/{id}/promote, the one route the console's own limiter slot covers",
+				"POST <admin>/users/{id}/promote, the one route the console's own limiter slot covers -- " +
+				// D9d
+				"and, with the inbound-webhook route mounted, POST <tools>/webhook/{provider}",
 			Behaviour: "A deployment that configures nothing is rate limited. Over budget, the route answers, byte for byte, " +
 				"429 Too Many Requests with Retry-After: <integer seconds, at least 1>, Content-Type: application/json, " +
 				"Cache-Control: no-store and the body {\"error\":\"Too many requests\",\"code\":\"RATE_LIMITED\"} -- and no " +
@@ -199,7 +201,12 @@ func WireDeviations() []WireDeviation {
 				"tempToken and then to the client address the event reported. The promote route shares the budget, the window " +
 				"and the switch, runs its limiter ahead of the admin guard, and is keyed by the client address under either " +
 				"keyBy: its body names how to promote and its path names the person being promoted, and neither is a subject " +
-				"a caller should be able to mint budgets with. The admin login is deliberately not limited, on either line.",
+				"a caller should be able to mint budgets with. The admin login is deliberately not limited, on either line. " +
+				// D9d
+				"The inbound-webhook route shares the budget, the window and the switch, runs its limiter before the core looks the " +
+				"provider up, and is keyed by the client address and a hash of the provider under either keyBy, because every request " +
+				"naming a provider with a stored script invokes the script runner and nothing about the caller is verified; a provider " +
+				"sending more than the budget from one address is answered this 429 and redelivers.",
 			Reference: "There is no rate limiting anywhere. RouterOptions.rateLimiter (src/router/auth.router.ts:46) is an " +
 				"empty slot for a host-supplied Express handler; absent, the router collapses it to an empty middleware list " +
 				"(rl = [], :468) and the package ships no algorithm, no default, no status and no body. Every one of these " +

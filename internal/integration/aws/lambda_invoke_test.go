@@ -232,6 +232,86 @@ func TestTheInvokerNeverRunsUnbounded(t *testing.T) {
 	}
 }
 
+// TestTheInvokerFitsInsideTheAuthInvocation: the fourth clock. The core hands
+// the invoker a context from context.WithoutCancel, which has the core's
+// script deadline and not the auth invocation's; the invocation's deadline
+// arrives as a value (WithInvocationDeadline, set in App.Handle), and when it
+// is the earlier of the two, less the invocation margin, it is what Invoke
+// and the runner are held to.
+func TestTheInvokerFitsInsideTheAuthInvocation(t *testing.T) {
+	t.Parallel()
+	payload := runnerFixture(t, "response-none.json")
+	sentDeadline := func(fake *fakeLambda) time.Time {
+		t.Helper()
+		var sent wire.Request
+		if len(fake.inputs) != 1 || json.Unmarshal(fake.inputs[0].Payload, &sent) != nil {
+			t.Fatalf("Invoke inputs = %v", fake.inputs)
+		}
+		return time.UnixMilli(sent.DeadlineUnixMs)
+	}
+	// The core's shape: a Lambda context with its own deadline, recorded,
+	// then WithoutCancel, then the core's script timeout on top.
+	coreContext := func(invocation, script time.Duration) (context.Context, time.Time, time.Time, context.CancelFunc) {
+		lambdaCtx, cancelLambda := context.WithTimeout(context.Background(), invocation)
+		recorded := WithInvocationDeadline(lambdaCtx)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(recorded), script)
+		invocationDeadline, _ := lambdaCtx.Deadline()
+		scriptDeadline, _ := ctx.Deadline()
+		return ctx, invocationDeadline, scriptDeadline, func() { cancel(); cancelLambda() }
+	}
+
+	// A script deadline past the invocation's: cut to the invocation less
+	// the margin, on both the Invoke and the runner's deadline.
+	fake := &fakeLambda{out: &lambda.InvokeOutput{StatusCode: 200, Payload: payload}}
+	r := newTestInvoker(t, fake)
+	ctx, invocation, _, cancel := coreContext(3*time.Second, 15*time.Second)
+	if _, _, err := r.RunInboundScript(ctx, sampleScriptRequest()); err != nil {
+		t.Fatalf("RunInboundScript: %v", err)
+	}
+	cancel()
+	if want := invocation.Add(-DefaultInvocationMargin); !fake.deadline[0].Equal(want) {
+		t.Errorf("Invoke's deadline = %v, want the invocation's less the margin, %v", fake.deadline[0], want)
+	}
+	if want := invocation.Add(-DefaultInvocationMargin - DefaultResponseMargin); sentDeadline(fake).UnixMilli() != want.UnixMilli() {
+		t.Errorf("the runner was told %v, want %v", sentDeadline(fake), want)
+	}
+
+	// A script deadline well inside the invocation: untouched.
+	fake = &fakeLambda{out: &lambda.InvokeOutput{StatusCode: 200, Payload: payload}}
+	r = newTestInvoker(t, fake)
+	ctx, _, script, cancel := coreContext(30*time.Second, 2*time.Second)
+	if _, _, err := r.RunInboundScript(ctx, sampleScriptRequest()); err != nil {
+		t.Fatalf("RunInboundScript: %v", err)
+	}
+	cancel()
+	if !fake.deadline[0].Equal(script) {
+		t.Errorf("Invoke's deadline = %v, want the core's own %v", fake.deadline[0], script)
+	}
+
+	// An invocation with no time left for the script: refused, not invoked.
+	fake = &fakeLambda{out: &lambda.InvokeOutput{StatusCode: 200, Payload: payload}}
+	r = newTestInvoker(t, fake)
+	ctx, _, _, cancel = coreContext(DefaultInvocationMargin+DefaultResponseMargin/2, 5*time.Second)
+	defer cancel()
+	if _, _, err := r.RunInboundScript(ctx, sampleScriptRequest()); err == nil || len(fake.inputs) != 0 {
+		t.Errorf("an invocation with no time left was invoked: err %v, %d calls", err, len(fake.inputs))
+	}
+
+	// And the value is what survives WithoutCancel, which a deadline does not.
+	lambdaCtx, cancelLambda := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelLambda()
+	detached := context.WithoutCancel(WithInvocationDeadline(lambdaCtx))
+	if _, ok := detached.Deadline(); ok {
+		t.Error("WithoutCancel kept a deadline; the premise of this test changed")
+	}
+	if _, ok := InvocationDeadline(detached); !ok {
+		t.Error("the recorded invocation deadline did not survive WithoutCancel")
+	}
+	if _, ok := InvocationDeadline(WithInvocationDeadline(context.Background())); ok {
+		t.Error("a context with no deadline recorded one")
+	}
+}
+
 func TestTheInvokerNeedsAFunction(t *testing.T) {
 	t.Parallel()
 	if _, err := NewLambdaScriptRunner(LambdaScriptRunnerOptions{FunctionName: "  "}); err == nil {

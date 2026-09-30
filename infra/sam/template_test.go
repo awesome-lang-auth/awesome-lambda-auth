@@ -22,6 +22,7 @@ package sam
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -320,7 +321,8 @@ const freeAlarmMetrics = 10
 // of the count and priced in docs/cost-model.md §3.3 instead. An undeclared
 // gate is counted, so a gate nobody declared can make the count too high but
 // never too low. The all-on total — every optional function switched on — is
-// logged, with what it costs past the free ten.
+// asserted against the number docs/cost-model.md §3.3 states, so an optional
+// alarm cannot leave the count without its price being written down.
 func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	t.Parallel()
 	tpl := load(t)
@@ -347,13 +349,41 @@ func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	for param, names := range optional {
 		t.Logf("%s adds %d alarm(s) when on: %v (docs/cost-model.md §3.3)", param, len(names), names)
 	}
+	// The all-on total is asserted, not logged: it must be the number
+	// docs/cost-model.md §3.3 states, so that declaring a gate above is a
+	// priced decision somebody wrote down rather than an alarm that
+	// disappeared from the count. A block that adds an optional alarm changes
+	// the template and that sentence in the same commit, or this fails.
 	allOn := len(alarms)
-	extra := 0.0
-	if allOn > freeAlarmMetrics {
-		extra = float64(allOn-freeAlarmMetrics) * 0.10
+	stated := statedAllOnAlarms(t)
+	if allOn != stated {
+		extra := 0.0
+		if allOn > freeAlarmMetrics {
+			extra = float64(allOn-freeAlarmMetrics) * 0.10
+		}
+		t.Errorf("with every optional function switched on the template declares %d alarm metrics (%d by default), "+
+			"and docs/cost-model.md §3.3 states %d. Update its \"All-on total\" line — %d is USD %.2f a month past the "+
+			"free %d in an account with no other alarms — or the gate that changed the count.",
+			allOn, byDefault, stated, allOn, extra, freeAlarmMetrics)
 	}
-	t.Logf("all-on total: %d alarm metrics with every optional function switched on, %d by default; "+
-		"USD %.2f a month past the free %d in an account with no other alarms", allOn, byDefault, extra, freeAlarmMetrics)
+}
+
+// allOnAlarmsLine is the sentence in docs/cost-model.md §3.3 that states the
+// all-on alarm total.
+var allOnAlarmsLine = regexp.MustCompile(`\*\*All-on total: (\d+) alarm metrics\*\*`)
+
+func statedAllOnAlarms(t *testing.T) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "cost-model.md"))
+	if err != nil {
+		t.Fatalf("read docs/cost-model.md: %v", err)
+	}
+	m := allOnAlarmsLine.FindAllStringSubmatch(string(raw), -1)
+	if len(m) != 1 {
+		t.Fatalf("docs/cost-model.md states the all-on alarm total %d times, want once as **All-on total: N alarm metrics**", len(m))
+	}
+	n, _ := strconv.Atoi(m[0][1])
+	return n
 }
 
 // offByDefaultAlarmGates maps each alarm condition other than AlarmsEnabled to
@@ -379,8 +409,9 @@ func TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled(t *testing.T) 
 		if !strings.HasPrefix(expr, "!And") || !strings.Contains(expr, "!Condition AlarmsEnabled") {
 			t.Errorf("%s = %s; want an !And that includes !Condition AlarmsEnabled", gate, expr)
 		}
-		if !conditionReaches(tpl, gate, "!Ref "+param, 0) {
-			t.Errorf("%s does not depend on %s, so the parameter does not switch the alarm", gate, param)
+		// On only when the switch says "true", not merely mentioning it.
+		if !conditionReaches(tpl, gate, "!Equals [!Ref "+param+", 'true']", 0) {
+			t.Errorf("%s does not reach !Equals [!Ref %s, 'true'], so the parameter does not switch the alarm on and only on", gate, param)
 		}
 		if d := literal(tpl.parameters[param].fields["Default"]); d != "false" {
 			t.Errorf("%s defaults to %q; an alarm gate that is on by default must be counted, not declared here", param, d)

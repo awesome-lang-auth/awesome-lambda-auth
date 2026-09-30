@@ -404,7 +404,11 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// and a header this binary adds -- or must not add -- is seen where it is
 	// asserted. The console's login limiter is built here for the reason the
 	// other two are: it counts with the shared counter.
-	handler := assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log))
+	// D9d: the inbound-webhook limiter rides in the same slot, inside the
+	// login's; each matches its own route and passes everything else through
+	// (scriptrunner.go, newInboundWebhookLimiter).
+	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, log), newInboundWebhookLimiter(cfg, counter, log)
+	handler := assembleHandler(cfg, log, mux, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
 
 	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools}
 	if tools != nil {
@@ -608,6 +612,13 @@ func (a *App) Handle(ctx context.Context, payload json.RawMessage) (json.RawMess
 	if lc, ok := lambdacontext.FromContext(ctx); ok && lc.AwsRequestID != "" {
 		log = log.With(slog.String("requestId", lc.AwsRequestID))
 	}
+	// D9d: the invocation's deadline as a value, because the core runs the
+	// inbound-webhook script under context.WithoutCancel, which drops the
+	// deadline and keeps values; the script-runner invoker reads it back so
+	// that a script deadline longer than this function's Timeout ends in the
+	// core's 400 rather than in Lambda killing this invocation mid-Invoke
+	// (internal/integration/aws, WithInvocationDeadline).
+	ctx = awsintegration.WithInvocationDeadline(ctx)
 	resp, err := a.adapter.Handle(withLogger(ctx, log), payload)
 	// D9b: the enqueues this request started finish before the runtime gets the
 	// response and freezes the environment (webhook_queue.go). A no-op without

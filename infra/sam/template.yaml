@@ -102,7 +102,7 @@ Metadata:
         Parameters: [BudgetLimitUsd, BudgetTimeUnit, EnableCostAnomalyDetection]
       # D9d
       - Label: {default: Inbound webhooks (script runner)}
-        Parameters: [EnableInboundWebhooks, InboundScriptTimeoutMs, ScriptRunnerTimeout, ScriptRunnerDurationAlarmThresholdMs]
+        Parameters: [EnableInboundWebhooks, InboundScriptTimeoutMs, ScriptRunnerTimeout, ScriptRunnerReservedConcurrency, ScriptRunnerDurationAlarmThresholdMs]
 
 Parameters:
 
@@ -831,31 +831,61 @@ Parameters:
       "true" mounts POST <ToolsBasePath>/webhook/{provider} and creates the
       script-runner function its mapping scripts run in, invoked synchronously
       by the auth function. Requires EnableTools. The route has no guard and
-      verifies no provider signature, exactly as the reference's does not: a
-      caller that names a provider runs that provider's stored script. Scripts
-      can call no action on this build — the runner's manifest ships empty —
-      and an action added to it needs its IAM granted to ScriptRunnerRole.
+      verifies no provider signature, exactly as the reference's does not: ANY
+      caller that names a provider with a stored script runs that script, at a
+      rate the caller chooses. What caps that is ScriptRunnerReservedConcurrency
+      (and the rateLimit block, per address and provider); see
+      docs/cost-model.md §3.3. Scripts can call no action on this build — the
+      runner's manifest ships empty — and an action added to it needs its IAM
+      granted to ScriptRunnerRole.
+  # 28000, not the configuration's 30000: the auth function waits on the
+  # runner, its Timeout tops out at 29 s (the HTTP API's integration limit),
+  # and it needs a second after the Invoke to track and answer. The auth
+  # function also cuts the deadline to its own remaining time at run time
+  # (internal/integration/aws, WithInvocationDeadline), so a value above
+  # Timeout degrades to a 400 rather than a killed invocation.
   InboundScriptTimeoutMs:
     Type: Number
     Default: 5000
     MinValue: 100
-    MaxValue: 30000
+    MaxValue: 28000
     Description: >-
       AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS — the deadline on
       one whole script run, the reference's own 5000 by default. A run that
       reaches it is refused 400 and the provider redelivers. **Raise
-      ScriptRunnerTimeout with it**: that is this in seconds, plus one.
+      ScriptRunnerTimeout with it** (this in seconds, plus one), **and keep
+      it at least a second below Timeout × 1000**: the auth function waits on
+      the run, and past its own remaining time the run is cut short and
+      refused 400 anyway.
   ScriptRunnerTimeout:
     Type: Number
     Default: 6
     MinValue: 1
-    MaxValue: 31
+    MaxValue: 29
     Description: >-
       The runner function's Timeout, in seconds: InboundScriptTimeoutMs / 1000
       + 1, so the function outlives the deadline it enforces and a looping
       script ends with the runner's own error rather than Lambda's kill.
       CloudFormation cannot do the arithmetic; infra/sam/template_test.go
-      asserts the defaults stay related.
+      asserts the defaults and the maxima stay related.
+  ScriptRunnerReservedConcurrency:
+    Type: String
+    Default: '5'
+    AllowedPattern: '^$|^[0-9]{1,5}$'
+    ConstraintDescription: >-
+      ScriptRunnerReservedConcurrency must be a whole number of execution
+      environments, or empty for no reservation. 0 is a real value and means
+      "throttle every run", which refuses every webhook with a script.
+    Description: >-
+      The most script runs in flight at once, account-wide. Free — a
+      reservation only carves this many environments out of the account's
+      unreserved pool — and the one hard cap on what a stranger calling the
+      unauthenticated inbound route can spend: each in-flight run holds this
+      function and an auth environment waiting on it. A run over the cap is
+      throttled, refused 400, and redelivered by the provider. Empty reserves
+      nothing and leaves the runner drawing on the account pool uncapped. An
+      account still on the new-account concurrency quota of 10 cannot reserve
+      any; set it empty there.
   ScriptRunnerDurationAlarmThresholdMs:
     Type: Number
     Default: 4000
@@ -928,9 +958,13 @@ Parameters:
     Default: 10
     MinValue: 1
     MaxValue: 29
+    # D9d: the auth function waits on the inbound-webhook script runner, so
+    # this is also the ceiling on InboundScriptTimeoutMs.
     Description: >-
       Seconds. Not the 15-minute default: nothing in the auth router should
       take longer than an API Gateway integration is willing to wait (29s).
+      With EnableInboundWebhooks, keep it above InboundScriptTimeoutMs / 1000
+      plus a second: the auth function waits on every script run.
 
   # Concurrency. This is the only HARD stop in the stack, and it is off by
   # default — see the AlarmEmail note below for why nothing else here is one.
@@ -1408,6 +1442,7 @@ Conditions:
   # gated on the same switch, so a stack without the runner pays for no alarm.
   InboundWebhooksEnabled: !And [!Condition ToolsEnabled, !Equals [!Ref EnableInboundWebhooks, 'true']]
   ScriptRunnerAlarmsEnabled: !And [!Condition AlarmsEnabled, !Condition InboundWebhooksEnabled]
+  HasScriptRunnerReservation: !Not [!Equals [!Ref ScriptRunnerReservedConcurrency, '']]
 
   IdpEnabled: !Equals [!Ref EnableIdp, 'true']
   HasIdpIssuer: !Not [!Equals [!Ref IdpIssuer, '']]
@@ -3008,9 +3043,16 @@ Resources:
   #
   # 256 MB: a mapping script is small and short, goja's working set is a few
   # MB, and memory buys CPU on Lambda, which a script that loops would only
-  # spend faster. No Events, no Function URL, no reserved concurrency: the
-  # only caller is the auth function, which bounds the rate at its own
-  # inbound traffic, and the only cost exposure is duration — alarmed below.
+  # spend faster. No Events and no Function URL: the only caller is the auth
+  # function. That does NOT bound the rate: the inbound route is
+  # unauthenticated, so anyone who names a provider with a stored script
+  # decides how many runs happen, and each in-flight run holds this function
+  # and an auth environment waiting on it, both from the account's pool. The
+  # hard cap is ScriptRunnerReservedConcurrency (5 by default, free); the
+  # rateLimit block adds a per-address, per-provider budget in front of the
+  # route (cmd/auth ratelimit.go, newInboundWebhookLimiter). The cost is
+  # duration — alarmed below — times a rate the caller chooses, up to the cap
+  # (docs/cost-model.md §3.3).
   # ---------------------------------------------------------------------
 
   ScriptRunnerLogGroup:
@@ -3025,6 +3067,13 @@ Resources:
     Condition: InboundWebhooksEnabled
     Properties:
       Description: The script runner's sandbox. Writes its own log group and nothing else.
+      # No aws:SourceAccount / aws:SourceArn condition, like the auth
+      # function's role: Lambda's documentation for execution roles names no
+      # such key on the service's AssumeRole, and a condition on a key the
+      # request does not carry fails closed — every run AccessDenied, every
+      # webhook a 400 — which no test here can see and no deploy of this
+      # block has checked. The role is assumable only by a function this
+      # stack attaches it to, which requires iam:PassRole on it.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -3062,6 +3111,7 @@ Resources:
       Architectures: [arm64]
       MemorySize: 256
       Timeout: !Ref ScriptRunnerTimeout
+      ReservedConcurrentExecutions: !If [HasScriptRunnerReservation, !Ref ScriptRunnerReservedConcurrency, !Ref 'AWS::NoValue']
       Role: !GetAtt ScriptRunnerRole.Arn
       Environment:
         Variables:
@@ -3596,8 +3646,10 @@ Resources:
   # and the core refuses the run so the provider redelivers and bills it
   # again. Errors would fire on the same incident a period later and on
   # nothing else worth waking for — a script that throws is not an error by
-  # contract. Throttles and concurrency are bounded by the auth function's
-  # own, which are alarmed above.
+  # contract. Concurrency is capped by ScriptRunnerReservedConcurrency, not
+  # alarmed: a run over the cap is throttled, refused 400 and redelivered,
+  # and the auth function's own concurrency and duration alarms see the
+  # flood, since every run holds an auth environment waiting on it.
   #
   # One period, not two: a provider redelivers on its own schedule, minutes
   # to hours apart, so a looping script is one slow datapoint per window and

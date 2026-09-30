@@ -440,7 +440,7 @@ func (hostValue) Secret() string { return "a method the script must never call" 
 
 type hostError struct{ code string }
 
-func (e *hostError) Error() string   { return "downstream refused: " + e.code }
+func (e *hostError) Error() string       { return "downstream refused: " + e.code }
 func (e *hostError) Credentials() string { return "a method the script must never call" }
 
 // TestAnActionHandsBackDataOnly: an action's value crosses as its JSON and its

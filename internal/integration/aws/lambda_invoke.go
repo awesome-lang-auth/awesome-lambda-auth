@@ -86,6 +86,12 @@ type LambdaScriptRunnerOptions struct {
 	// runner's answer to travel home: the runner is told to stop that much
 	// earlier than the invoker stops waiting. Zero is DefaultResponseMargin.
 	ResponseMargin time.Duration
+
+	// InvocationMargin is how much of the auth function's own invocation is
+	// kept back, after the Invoke returns, for the route to finish: track the
+	// event, answer the provider. Zero is DefaultInvocationMargin. See
+	// WithInvocationDeadline.
+	InvocationMargin time.Duration
 }
 
 // DefaultResponseMargin is ResponseMargin's default. A synchronous Invoke's
@@ -94,12 +100,60 @@ type LambdaScriptRunnerOptions struct {
 // five seconds the reference's number gives it.
 const DefaultResponseMargin = 250 * time.Millisecond
 
+// DefaultInvocationMargin is InvocationMargin's default: one second, which is
+// a telemetry write, the fan-out's enqueue and the response, with room for a
+// slow DynamoDB call among them.
+const DefaultInvocationMargin = time.Second
+
+// # The fourth clock: the auth function's own Timeout
+//
+// The script deadline is enforced by the invoker, the runner and the runner's
+// Timeout — and all three sit inside a fourth, the auth function's own Lambda
+// deadline, which fires first whenever scriptTimeoutMs is raised past it.
+// The core cannot see that one: it builds the runner's context from
+// context.WithoutCancel(r.Context()) (tools_webhook.go), deliberately, so a
+// provider hanging up does not abandon a script half-way through its actions —
+// and WithoutCancel drops the deadline along with the cancellation. Left
+// alone, a script deadline of 15 s on a 10 s auth function would have Lambda
+// kill the auth function mid-Invoke: the provider gets API Gateway's 5xx
+// instead of the core's 400, the runner runs on, orphaned, to its own
+// deadline, and the next request pays a cold start.
+//
+// WithoutCancel keeps values, though, and that is the way through. App.Handle
+// records the invocation's deadline as a value on the context
+// (WithInvocationDeadline); the request context the adapter builds descends
+// from it, and so does the core's WithoutCancel copy; RunInboundScript reads
+// it back and cuts its own deadline to that instant less InvocationMargin. A
+// script deadline that does not fit the auth function's Timeout therefore
+// degrades to the core's 400 and a redelivery — the answer a timeout is
+// supposed to give — rather than to a killed process.
+
+type invocationDeadlineKey struct{}
+
+// WithInvocationDeadline records ctx's own deadline — the Lambda invocation's,
+// when ctx is the one lambda.Start hands the handler — as a value that
+// survives context.WithoutCancel. With no deadline on ctx it returns ctx.
+func WithInvocationDeadline(ctx context.Context) context.Context {
+	d, ok := ctx.Deadline()
+	if !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, invocationDeadlineKey{}, d)
+}
+
+// InvocationDeadline reads what WithInvocationDeadline recorded.
+func InvocationDeadline(ctx context.Context) (time.Time, bool) {
+	d, ok := ctx.Value(invocationDeadlineKey{}).(time.Time)
+	return d, ok
+}
+
 // LambdaScriptRunner implements auth.InboundScriptRunner by invoking a
 // function.
 type LambdaScriptRunner struct {
-	function string
-	margin   time.Duration
-	client   *lazyClient[LambdaAPI]
+	function         string
+	margin           time.Duration
+	invocationMargin time.Duration
+	client           *lazyClient[LambdaAPI]
 }
 
 var _ auth.InboundScriptRunner = (*LambdaScriptRunner)(nil)
@@ -117,7 +171,11 @@ func NewLambdaScriptRunner(opts LambdaScriptRunnerOptions) (*LambdaScriptRunner,
 	if margin <= 0 {
 		margin = DefaultResponseMargin
 	}
-	r := &LambdaScriptRunner{function: function, margin: margin}
+	invocationMargin := opts.InvocationMargin
+	if invocationMargin <= 0 {
+		invocationMargin = DefaultInvocationMargin
+	}
+	r := &LambdaScriptRunner{function: function, margin: margin, invocationMargin: invocationMargin}
 	if opts.Client != nil {
 		client := opts.Client
 		r.client = &lazyClient[LambdaAPI]{build: func(context.Context) (LambdaAPI, error) { return client, nil }}
@@ -144,10 +202,18 @@ func (r *LambdaScriptRunner) FunctionName() string { return r.function }
 // margin travels to the runner as the point at which it must stop the script.
 // With no deadline on ctx — never the case from the core's route — the core's
 // own default is applied here, so no call to another function is unbounded.
+// Either is then cut to the auth invocation's own deadline less
+// InvocationMargin, when App.Handle recorded one (the fourth clock, above).
 func (r *LambdaScriptRunner) RunInboundScript(ctx context.Context, req auth.InboundScriptRequest) (auth.InboundScriptResult, bool, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, auth.DefaultInboundScriptTimeout)
+		defer cancel()
+	}
+	if invocation, ok := InvocationDeadline(ctx); ok {
+		// WithDeadline keeps the earlier of the two, so this only ever cuts.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, invocation.Add(-r.invocationMargin))
 		defer cancel()
 	}
 	deadline, _ := ctx.Deadline()

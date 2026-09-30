@@ -379,7 +379,7 @@ here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`).
 | | shape of its cost |
 |---|---|
 | webhook worker | **Landed (D9b)**, below |
-| script runner | **Landed (D9d)**, below |
+| script runner | **Landed (D9d)**, below. Per run, and the run is **caller-initiated** — the inbound route is unauthenticated — so the exposure is a stranger's rate times a script that loops, capped by a reservation |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
 
 #### The webhook queue and its worker (D9b)
@@ -482,19 +482,21 @@ unalarmed on purpose; the Lambda console shows them for free.
 
 #### The script runner (D9d), `EnableInboundWebhooks=true`
 
-**At rest: USD 0.00.** A Lambda function, an IAM role and an empty log group
-cost nothing until invoked. Its one alarm, `ScriptRunnerDurationAlarm`, is the
-tenth alarm metric of a stack that enables it — inside the free ten on its own,
-**USD 0.10 a month** in an account that has already spent the allowance. With
-the switch off none of it exists.
+**At rest: USD 0.00.** A Lambda function, an IAM role, an empty log group and a
+reserved-concurrency setting cost nothing until invoked — a reservation only
+carves environments out of the account's unreserved pool. Its one alarm,
+`ScriptRunnerDurationAlarm`, is the tenth alarm metric of a stack that enables
+it — inside the free ten on its own, **USD 0.10 a month** in an account that
+has already spent the allowance. With the switch off none of it exists.
 
 **The all-on count.** Nine alarms by default. This block adds one, gated on
 `EnableInboundWebhooks`; D9b's webhook queue adds one more, gated on its own
-switch (`WebhookDeadLetterAlarm`). With both on the stack has **eleven** alarm
-metrics, one past the free ten: **USD 0.10 a month** in an account with no other
-alarms, USD 1.10 in one whose allowance is already spent.
-`TestTheAlarmSetStaysInsideTheFreeAllowance` logs the all-on total of the tree
-it runs on and fails only on the default count.
+switch (`WebhookDeadLetterAlarm`). **All-on total: 11 alarm metrics** — every
+optional function switched on — one past the free ten: **USD 0.10 a month** in
+an account with no other alarms, USD 1.10 in one whose allowance is already
+spent. `TestTheAlarmSetStaysInsideTheFreeAllowance` asserts that sentence
+against the template: it counts the alarms enabled by default against the free
+ten, and fails unless the all-on total is the number written here.
 
 **Per inbound webhook whose row has a script**, on top of the webhook request's
 own platform floor (§2.1), at arm64 prices (USD 0.0000133334 per GB-second,
@@ -516,6 +518,43 @@ millisecond of a script is billed twice: once at 256 MB in the runner and once
 at 512 MB in the auth function holding the call. A row with no script costs
 nothing here: the runner is not invoked.
 
+**Who decides how many runs there are: anyone.** The run is
+**caller-initiated**, not operator-initiated. `POST <tools>/webhook/{provider}`
+has no guard and checks no provider signature, in the reference and here, so
+whoever can reach it and names a provider whose row has a script — and provider
+names are guessable: `stripe`, `github` — runs that script, with a body they
+wrote, at a rate they choose. Each in-flight run holds two execution
+environments, the runner's and the auth function's waiting on it, both from the
+account's unreserved pool unless something reserves them. What bounds it:
+
+- **`ScriptRunnerReservedConcurrency`, 5 by default — the hard cap.** At most
+  that many runs are in flight account-wide; a run over it is throttled, the
+  auth function answers `400` at once and the provider redelivers later. It is
+  the only bound on the spend, and it bounds the auth environments held on the
+  runner too, since each waits only as long as its run. An empty value reserves
+  nothing and leaves the runner drawing on the account's pool, uncapped.
+- **The `rateLimit` block, per address and provider.** With `rateLimit.enabled`
+  (the default) the route shares `rateLimit.max` per `rateLimit.windowSeconds` —
+  ten a minute — per client address and provider, and answers the registered
+  `429` beyond it before the runner is invoked (`rate-limited-routes-answer-429`).
+  It stops one address from keeping the cap full; it does not stop many. A
+  legitimate provider sending more than that from one address in one window is
+  refused and redelivers — late, not lost.
+- **In front of both**, the levers this template does not pull: API Gateway
+  route throttling, or a WAF rule on the path.
+
+The ceiling at the default reservation, sustained for a day, is therefore:
+
+```
+a script the body drives to the 5 s deadline   5 runs in flight × (5 s at 256 MB + 5 s at 512 MB)
+                                                ≈ 0.00005 USD per run, 1 run/s  ≈ USD 4.50 / day
+a fast script, ~20 ms                           5 in flight ÷ 20 ms ≈ 250 runs/s × 0.60 / million
+                                                ≈ USD 13 / day, plus each request's API Gateway floor (§2.1)
+```
+
+— a bound someone chose and wrote down, rather than the account's whole
+concurrency pool times the same arithmetic.
+
 **The exposure is a script that loops**, or awaits something slow. It runs to
 the deadline (`scriptTimeoutMs`, 5000 ms), is interrupted, and the webhook is
 refused `400` — so the provider redelivers it and the same deadline is billed
@@ -531,12 +570,23 @@ auth function, 5 s at 512 MB    0.0000333  per delivery
 A provider sending 10 000 events a day into a looping script is about
 **USD 0.50 a day** before its redeliveries, and every redelivery multiplies it
 — which is the incident `ScriptRunnerDurationAlarm` exists for: it fires at
-80 % of the deadline, on one five-minute period, because redeliveries arrive
-minutes to hours apart and "twice running" would rarely be true of them. The
-concurrency it can take is bounded by the auth function's own, whose alarms
-already cover it. A deadline raised to the 30 000 ms maximum makes the looping
-case six times worse; that is the price of the knob, and the reason the
-template ties `ScriptRunnerTimeout` and the alarm threshold to it.
+80 % of the deadline, on one five-minute period, because a provider's own
+redeliveries arrive minutes to hours apart and "twice running" would rarely be
+true of them. A stranger's requests are not so spaced, and they are the
+reservation's to cap.
+
+**A raised deadline.** Every second added to `InboundScriptTimeoutMs` adds a
+second to the looping case, on both functions: 28 000 ms, the template's
+maximum, makes it five to six times worse. The maximum is 28 000 and not the
+configuration's 30 000 because the auth function waits on the run: its own
+`Timeout` tops out at 29 s, and it keeps a second after the Invoke to track and
+answer. Past the auth function's remaining time the invoker cuts the run short
+(`internal/integration/aws`, `WithInvocationDeadline`), so a deadline longer
+than `Timeout` bills `Timeout` less a second on both functions and answers the
+core's `400`, never Lambda killing the auth function mid-Invoke.
+`infra/sam/script_runner_test.go` relates `Timeout`, `ScriptRunnerTimeout` and
+the alarm threshold to the deadline at the defaults and at the maxima;
+CloudFormation cannot relate the values a deployment picks.
 
 ---
 

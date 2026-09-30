@@ -1,7 +1,11 @@
 package sam
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -145,6 +149,27 @@ func TestTheScriptRunnerOutlivesItsDeadline(t *testing.T) {
 			"a looping script is interrupted at the deadline and would never reach the alarm", threshold, deadlineMs, limit)
 	}
 
+	// The fourth clock: the auth function waits on the run, so its Timeout
+	// must outlive the script deadline plus the second the invoker keeps back
+	// for the route (internal/integration/aws, DefaultInvocationMargin) — at
+	// the defaults, and at the largest values the parameters allow. Past it
+	// the invoker cuts the run short (a 400) rather than letting Lambda kill
+	// the auth function mid-Invoke, but a default that did that would be a
+	// default that never runs a script to its deadline.
+	const invocationMarginMs = 1000
+	authTimeoutS := numericDefault(t, tpl, "Timeout")
+	if authTimeoutS*1000 < deadlineMs+invocationMarginMs {
+		t.Errorf("Timeout defaults to %.0f s, which does not outlive the %.0f ms script deadline plus %d ms", authTimeoutS, deadlineMs, invocationMarginMs)
+	}
+	deadlineMax := numericField(t, tpl, "InboundScriptTimeoutMs", "MaxValue")
+	authTimeoutMax := numericField(t, tpl, "Timeout", "MaxValue")
+	if authTimeoutMax*1000 < deadlineMax+invocationMarginMs {
+		t.Errorf("InboundScriptTimeoutMs allows %.0f ms, which no Timeout up to its %.0f s maximum can outlive by %d ms", deadlineMax, authTimeoutMax, invocationMarginMs)
+	}
+	if want := float64(int(deadlineMax)/1000 + 1); numericField(t, tpl, "ScriptRunnerTimeout", "MaxValue") < want {
+		t.Errorf("ScriptRunnerTimeout's MaxValue is below InboundScriptTimeoutMs's maximum in seconds plus one (%.0f)", want)
+	}
+
 	alarm, ok := tpl.resources["ScriptRunnerDurationAlarm"]
 	if !ok {
 		t.Fatal("ScriptRunnerDurationAlarm is gone; a looping script is this function's whole exposure")
@@ -160,5 +185,117 @@ func TestTheScriptRunnerOutlivesItsDeadline(t *testing.T) {
 	}
 	if !strings.Contains(alarm.body, "Value: !Ref ScriptRunnerFunction") {
 		t.Error("ScriptRunnerDurationAlarm does not watch ScriptRunnerFunction")
+	}
+}
+
+// numericField reads a numeric field of a parameter, MaxValue or MinValue.
+func numericField(t *testing.T, tpl *template, name, field string) float64 {
+	t.Helper()
+	param, ok := tpl.parameters[name]
+	if !ok {
+		t.Fatalf("parameter %s is gone", name)
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(param.fields[field]), 64)
+	if err != nil {
+		t.Fatalf("parameter %s has a non-numeric %s %q: %v", name, field, param.fields[field], err)
+	}
+	return v
+}
+
+// TestTheScriptRunnerHasAConcurrencyCap: the inbound route is unauthenticated,
+// so the caller chooses the rate, and the one hard cap on what that costs is a
+// reservation on the runner. It is on by default and small, because a
+// reservation is free, and it is a parameter because an account still on the
+// new-account concurrency quota cannot reserve any.
+func TestTheScriptRunnerHasAConcurrencyCap(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	param, ok := tpl.parameters["ScriptRunnerReservedConcurrency"]
+	if !ok {
+		t.Fatal("ScriptRunnerReservedConcurrency is gone: nothing caps what a stranger can make the runner spend")
+	}
+	d := literal(param.fields["Default"])
+	n, err := strconv.Atoi(d)
+	if err != nil || n < 1 || n > 20 {
+		t.Errorf("ScriptRunnerReservedConcurrency defaults to %q, want a small positive reservation", d)
+	}
+	if got := tpl.conditions["HasScriptRunnerReservation"]; got != "!Not [!Equals [!Ref ScriptRunnerReservedConcurrency, '']]" {
+		t.Errorf("HasScriptRunnerReservation = %q", got)
+	}
+	if got := tpl.resources["ScriptRunnerFunction"].props["ReservedConcurrentExecutions"]; got != "!If [HasScriptRunnerReservation, !Ref ScriptRunnerReservedConcurrency, !Ref 'AWS::NoValue']" {
+		t.Errorf("ScriptRunnerFunction ReservedConcurrentExecutions = %q", got)
+	}
+}
+
+// TestInboundWebhooksNeedTheToolsBlockIsARule: without it, EnableInboundWebhooks
+// on a stack with EnableTools off deploys and silently creates nothing, because
+// InboundWebhooksEnabled needs ToolsEnabled.
+func TestInboundWebhooksNeedTheToolsBlockIsARule(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	i := strings.Index(body, "\n  InboundWebhooksNeedTheToolsBlock:\n")
+	if i < 0 {
+		t.Fatal("the Rule InboundWebhooksNeedTheToolsBlock is gone")
+	}
+	rule := body[i+1:]
+	if j := strings.Index(rule, "\n\n"); j > 0 {
+		rule = rule[:j]
+	}
+	for _, want := range []string{
+		"RuleCondition: !Equals [!Ref EnableInboundWebhooks, 'true']",
+		"- Assert: !Equals [!Ref EnableTools, 'true']",
+	} {
+		if !strings.Contains(rule, want) {
+			t.Errorf("InboundWebhooksNeedTheToolsBlock lacks %q:\n%s", want, rule)
+		}
+	}
+}
+
+// TestCIBuildsEveryFunctionTheTemplateDeploys: scripts/deploy.sh reads its
+// artifact list from the template's CodeUri lines, and CI builds and
+// size-checks the functions named in go.yml's LAMBDAS. A function added to one
+// and not the other is either never built in CI or built for nothing; this
+// holds the two together. (A merge of two blocks that each add a function
+// meets it too, which is the point.)
+func TestCIBuildsEveryFunctionTheTemplateDeploys(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	codeURI := regexp.MustCompile(`(?m)^\s*CodeUri:\s*\.\./\.\./dist/([A-Za-z0-9._-]+)-lambda\.zip\s*$`)
+	var deployed []string
+	for _, m := range codeURI.FindAllStringSubmatch(strings.ReplaceAll(string(raw), "\r\n", "\n"), -1) {
+		deployed = append(deployed, m[1])
+	}
+
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "go.yml"))
+	if err != nil {
+		t.Fatalf("read go.yml: %v", err)
+	}
+	var built []string
+	in, indent := false, 0
+	for _, line := range strings.Split(strings.ReplaceAll(string(workflow), "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		lead := len(line) - len(strings.TrimLeft(line, " "))
+		if !in {
+			if trimmed == "LAMBDAS: >-" {
+				in, indent = true, lead
+			}
+			continue
+		}
+		if trimmed == "" || lead <= indent {
+			break
+		}
+		built = append(built, strings.Fields(trimmed)...)
+	}
+	sort.Strings(deployed)
+	sort.Strings(built)
+	if len(deployed) == 0 || strings.Join(deployed, " ") != strings.Join(built, " ") {
+		t.Errorf("the template deploys %v and CI's LAMBDAS builds %v; they must name the same functions", deployed, built)
 	}
 }

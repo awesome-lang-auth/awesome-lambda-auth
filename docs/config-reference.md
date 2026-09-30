@@ -2025,7 +2025,7 @@ core publish its `identity.*` events at all.
 | `tools.sse.heartbeatIntervalMs` / `.deduplicate` | int / boolean | `30000` / `true` — passed to the manager | `AWESOME_AUTH_TOOLS_SSE_HEARTBEAT_INTERVAL_MS`, `…_DEDUPLICATE` |
 | `tools.sse.distributor.*` | block | `type: none` — **anything else is refused (RS-14)**, §17.3 | — (file-only) |
 | `tools.inboundWebhooks.enabled` | boolean | `true` — **refused (RS-15) unless `scriptRunnerFunction` is set; otherwise write `false`**, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS` |
-| `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — the core's `ScriptTimeout`: the deadline on one **whole** script run, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
+| `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — the core's `ScriptTimeout`: the deadline on one **whole** script run, cut to what the auth invocation has left; read only with the route mounted (reported as inert otherwise when changed), §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
 | `tools.inboundWebhooks.scriptRunnerFunction` | Lambda name or ARN | empty — the script-runner function (D9d); the SAM template sets its own `ScriptRunnerFunction` under `EnableInboundWebhooks`, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION` |
 | `tools.outboundWebhooks.payloadVersion` | string | `"1"` — the `version` member of every delivered envelope | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION` |
 | `tools.outboundWebhooks.defaults.maxRetries` / `.retryDelayMs` | int | `3` / `1000` — applied to every subscription row that carries no value of its own, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES`, `…_RETRY_DELAY_MS` |
@@ -2385,7 +2385,7 @@ to it; a deployment that runs the function elsewhere names that one here.
 | Knob | Effect |
 |---|---|
 | `scriptRunnerFunction` | the function invoked; empty with the route on is RS-15. Named with the route off, it is reported as an inert knob |
-| `scriptTimeoutMs` | the core's `ScriptTimeout`: the deadline on the **whole** run, not the reference's synchronous prefix. A run that reaches it is refused `400` and redelivered. The SAM template's `ScriptRunnerTimeout` must stay at this in seconds plus one |
+| `scriptTimeoutMs` | the core's `ScriptTimeout`: the deadline on the **whole** run, not the reference's synchronous part. A run that reaches it is refused `400` and redelivered. The auth function waits on the run, so the invoker cuts it to the auth invocation's remaining time less a second (the core drops that deadline; `App.Handle` records it); keep the function's `Timeout` above it, and the SAM template's `ScriptRunnerTimeout` at this in seconds plus one — the template caps it at 28 000. Read only with the route mounted; changed with the route off, it is reported as an inert knob |
 | `runtimeSettings.enabledWebhookActions` (§11) | the global half of the action allowlist, intersected with each row's `allowedActions`; read only with the route mounted |
 
 What a script sees and what each outcome does — a result is tracked, a script
@@ -2399,8 +2399,22 @@ manifest ships **empty**, so no action is callable on this build, and
 acknowledged and tracks nothing — the reference with no `onWebhook`, which is a
 host callback this product has no configuration path into. The engine's
 differences from V8 are the registered deviation
-`inbound-webhook-scripts-run-on-goja`. Costs are
+`inbound-webhook-scripts-run-on-goja`, and the one behaviour that differs from what the
+reference's code *means* rather than what it does — this runner awaits the
+script, the reference's cross-realm `instanceof` skips the await — is
+`inbound-webhook-scripts-are-awaited`. Costs are
 [cost-model.md](cost-model.md) §3.3.
+
+**Who can make it run.** The route has no guard and checks no signature, as
+the reference's does not, so a caller that names a provider with a stored
+script runs it, at the caller's rate. The SAM template caps the runs in flight
+with `ScriptRunnerReservedConcurrency` (5 by default, free), and with
+`rateLimit.enabled` the route shares the `rateLimit` budget (§14) per client
+address and provider, answering the registered `429` before the runner is
+invoked (`rate-limited-routes-answer-429`) — it has no name in
+`rateLimit.scope`, like the console's two limited routes, and follows
+`rateLimit.enabled` alone. A provider that sends more than `rateLimit.max` per
+window from one address is refused and redelivers.
 
 ### 17.6 The four postures, priced
 

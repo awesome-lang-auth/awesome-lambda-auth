@@ -1103,6 +1103,14 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION", "stack-script-runner"),
 			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
 		},
+		{
+			// D9d: a script deadline changed with the route off is read by
+			// nothing either; at its default it is not reported, as
+			// lazyEmailVerificationGracePeriodDays is not.
+			name: "a script deadline changed with the inbound route off",
+			env:  toolsEnv("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS", "8000"),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.inboundWebhooks.scriptTimeoutMs", "tools.stream.enabled"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

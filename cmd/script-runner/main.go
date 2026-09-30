@@ -20,8 +20,11 @@
 //
 // One variable: AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT, for the reference's rule
 // that the sandbox's console writes outside production and is silent in it
-// (tools.router.ts:272-282, NODE_ENV). Unset is production, which is the
-// product's own default (deviation production-by-default) and the quiet side.
+// (tools.router.ts:270-279, NODE_ENV). Unset is production, which is the
+// product's own default (deviation production-by-default) and the quiet side —
+// but the SAM template always sets it from DeploymentEnvironment, whose default
+// is development, so a default stack logs whatever a script prints, provider
+// payloads included (docs/inbound-webhooks.md §6).
 // It reads no configuration document and no secret: there is none it needs,
 // and a runner that could read one would widen what a compromised script
 // could reach through a bug in this binary.

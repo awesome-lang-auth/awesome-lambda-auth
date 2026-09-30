@@ -15,6 +15,7 @@ different here is **where the script runs**, and this page is about that.
 | Where scripts run | `cmd/script-runner`, a Lambda of its own |
 | What a script can reach | what that Lambda's role grants: **its own log group, nothing else** |
 | Register entries | `inbound-webhooks-are-refused-without-a-runner`, `inbound-webhook-scripts-run-on-goja`, `admin-actions-list-omits-the-runner-manifest` ([deviations.md](deviations.md)); upstream `inbound-webhook-script-runs-out-of-process` |
+| Concurrency cap | SAM `ScriptRunnerReservedConcurrency`, 5 runs in flight; the `rateLimit` block per address and provider |
 | Cost | [cost-model.md](cost-model.md) §3.3 |
 
 ## 1. The sandbox is the role
@@ -124,26 +125,57 @@ Remember what `userId` and `tenantId` mean on the record: a principal named by
 a request **nothing authenticated**. The route has no guard and checks no
 provider signature, in the reference and here; whoever can reach
 `POST <tools>/webhook/{provider}` can run the stored script for any provider
-name they guess.
+name they guess. They also choose how often: each such request is a runner
+invocation, billed on two functions (§3, and
+[cost-model.md](cost-model.md) §3.3). Two things bound it here. The runner's
+**reserved concurrency** (`ScriptRunnerReservedConcurrency`, 5 by default,
+free) caps the runs in flight account-wide — one over it is refused `400` and
+redelivered. The **`rateLimit` block**, when on (the default), gives each
+client address `rateLimit.max` deliveries per window per provider and answers
+the registered `429` beyond that, before the runner is invoked; a busy
+provider sending from one address can hit it, and redelivers. Neither checks
+*who* is calling: a provider's signature is still verified by nothing.
 
 ## 3. The deadline
 
 `tools.inboundWebhooks.scriptTimeoutMs` (default 5000, the reference's number)
 bounds the **whole** run — parsing, the script, every `await`, reading the
-result. The reference's `{ timeout: 5_000 }` bounds only the part before the
-first `await`; the rest there has no bound at all.
+result. The reference's `{ timeout: 5_000 }` bounds only the synchronous part;
+it does not await the rest at all (§2).
 
-It is enforced three times, on purpose: the auth function stops waiting at the
-deadline; it tells the runner the same instant less 250 ms so the runner stops
-the script first and says why; and the runner's own `Timeout`
-(`ScriptRunnerTimeout`, the deadline in seconds plus one) is the backstop.
-**Raise `ScriptRunnerTimeout` with `InboundScriptTimeoutMs`**; the template
-test pins the defaults together.
+Four clocks run, and the first to fire decides:
+
+1. **The auth function's own `Timeout`** (SAM `Timeout`, 10 s by default). It
+   waits on the run, synchronously. The core runs the script under
+   `context.WithoutCancel`, which drops this deadline, so `App.Handle` records
+   it as a context value and the invoker cuts the script deadline to it less
+   one second — room to track the event and answer. A `scriptTimeoutMs` longer
+   than `Timeout` therefore ends in the core's `400` and a redelivery, not in
+   Lambda killing the auth function mid-call (which would have answered the
+   provider a gateway `5xx` and left the runner running, orphaned).
+2. **The script deadline** itself, at which the auth function stops waiting.
+3. **The runner's stop**, the same instant less 250 ms, so the runner
+   interrupts the script first and logs which webhook it was.
+4. **The runner's own `Timeout`** (`ScriptRunnerTimeout`, the deadline in
+   seconds plus one), the backstop.
+
+**Raise `ScriptRunnerTimeout` with `InboundScriptTimeoutMs`, and keep `Timeout`
+at least a second above it.** The template caps `InboundScriptTimeoutMs` at
+28 000 ms (the configuration allows 30 000) because the auth function cannot
+wait longer than 29 s behind the HTTP API; `infra/sam/script_runner_test.go`
+relates the three at the defaults and at the maxima.
 
 A run that reaches the deadline is refused and redelivered, where the
 reference's synchronous timeout would have been caught and acknowledged. So a
 script that loops costs a full deadline on **every** delivery and every
 redelivery, which is why `ScriptRunnerDurationAlarm` exists.
+
+Memory has no bound of its own: the engine limits recursion (about 10 000
+frames) but not allocation, so a script that grows an array forever is stopped
+by the runner's `MemorySize` (256 MB). Lambda reports that as a crash — the
+same `400` and redelivery as a timeout — but the runner never gets to write
+the log line naming the webhook; the `REPORT` line in its log group shows
+`Max Memory Used` at the limit.
 
 ## 4. Actions
 
@@ -183,6 +215,16 @@ Two edits, in one change, and both are the point:
 
 An action added without step 2 fails with `AccessDenied` the first time a
 script calls it. That is the sandbox working.
+
+**The allowlist binds the auth function, not the runner.** Rules (1) and (2)
+are resolved by the core and travel in the request; the runner cannot tell who
+invoked it and has no resource policy, so any principal in the account with
+`lambda:InvokeFunction` on it — an operator, a CI role with `lambda:*` —
+can invoke it directly with any script and every manifest id in `actions`.
+For that caller the only bound is `ScriptRunnerRole`, which is one more reason
+every action's grant must be the narrowest that works. What an action returns
+reaches the script as JSON data, and its error as a plain `Error` with the
+message alone: no Go object is ever handed to a script.
 
 Then enable it: its id into `runtimeSettings.enabledWebhookActions` (or
 `PUT <admin>/api/settings`), and into the row's `allowedActions`
@@ -226,13 +268,24 @@ written against the reference:
   line per run — provider, webhook id, outcome, reason, duration — and one per
   script exception, console line (outside production) and failed action. The
   runner itself never writes the body; what a script puts in its own console
-  lines or exception messages is the script's doing.
+  lines or exception messages is the script's doing — and on a stack whose
+  `DeploymentEnvironment` is not `production` (the template's default is
+  `development`) the console is on, so a `console.log(body)` left in a mapping
+  script puts the provider's payload, personal data included, in this log
+  group for `LogRetentionDays`. The reference's development console does the
+  same to stderr. A script's exception message and stack are logged in every
+  environment, and can quote the body too.
+- **A provider dashboard full of 429s** is the `rateLimit` block refusing more
+  than `rateLimit.max` deliveries per window from one address for one
+  provider. The provider redelivers; if that is its normal rate, raise
+  `rateLimit.max` or turn the block off and rely on the reservation.
 - **`ScriptRunnerDurationAlarm`** fires when a run takes 80 % of the deadline:
   find the provider in that log group and fix or clear its script.
 - **A provider dashboard full of 400s** is a failed run: the auth function's
   log has an `auth core` line reading `auth: tools inbound webhook
   "<provider>": …` with the reason — the runner unreachable or not permitted,
-  the deadline, a crash.
+  throttled at its reserved concurrency, the deadline, a crash, a result the
+  runner could not read.
 - **RS-15** refuses a document that mounts the route with no runner named:
   set `tools.inboundWebhooks.scriptRunnerFunction`, or
   `tools.inboundWebhooks.enabled: false`.
