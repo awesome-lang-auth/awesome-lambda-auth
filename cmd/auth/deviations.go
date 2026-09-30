@@ -346,15 +346,20 @@ func WireDeviations() []WireDeviation {
 		{
 			ID:      "tools-stream-is-not-mounted-on-api-gateway",
 			Surface: "GET <tools>/stream, and the tools.stream.enabled and tools.sse.distributor knobs behind it",
-			Behaviour: "The stream route is not mounted, in every configuration: HTTPConfig.Tools.DisableStream is set " +
-				"unconditionally, so GET <tools>/stream answers 404 whatever tools.stream.enabled says, and the knob is " +
-				"reported at cold start as one this runtime cannot honour. A tools.sse.distributor of any type but none is " +
-				"refused at cold start (RS-14). tools.sse.enabled is honoured as far as it goes -- the in-process manager " +
-				"is built and Track and Notify broadcast into it -- and the cold start says that nothing is listening. The " +
-				"tools OpenAPI document describes the routes that are mounted and not this one.",
-			Reference: "GET /stream is registered whenever the stream feature is on (tools.router.ts:184-221), which is the " +
-				"default, and serves text/event-stream through SseManager.connect for as long as the client holds the " +
-				"socket; the distributor is an object the host constructs and passes (sse-manager.ts:110-112).",
+			Behaviour: "The stream route is not mounted on the auth function, in every configuration: HTTPConfig.Tools.DisableStream " +
+				"is set unconditionally there, so GET <tools>/stream through API Gateway answers 404 whatever tools.stream.enabled " +
+				"says, and the tools OpenAPI document of that function does not describe it. Since D9c the stream is served by a " +
+				"second function instead -- the SSE function, the same artifact started with AWESOME_AUTH_ENTRYPOINT=stream " +
+				"behind a Lambda Function URL with response streaming -- which answers GET <tools>/stream and 404s every other " +
+				"request, and which a client reaches at the Function URL, or at <tools>/stream on the distribution when " +
+				"CloudFront is on. That stream is a sequence of segments: an invocation lives at most fifteen minutes " +
+				"(the function's Timeout, less a five-second margin), and then the response ends cleanly and EventSource " +
+				"reconnects. The two functions are joined by the one distributor this product implements, the dynamodb event " +
+				"log; redis and sns are refused at cold start as not implemented in this product (RS-14), and without " +
+				"tools.sse.distributor.type: dynamodb the stream knobs are reported at cold start as ones this runtime cannot honour.",
+			Reference: "GET /stream is registered on the one tools router whenever the stream feature is on (tools.router.ts:184-221), " +
+				"which is the default, and serves text/event-stream through SseManager.connect for as long as the client " +
+				"holds the socket; the distributor is an object the host constructs and passes (sse-manager.ts:110-112).",
 			Why: "API Gateway -- the REST API and the HTTP API alike -- buffers the integration response and enforces a " +
 				"29-second integration timeout, so behind it the route would be a response that ends every 29 seconds with " +
 				"whatever had been buffered. EventSource, the client the reference wrote the route for, reconnects on a " +
@@ -367,10 +372,69 @@ func WireDeviations() []WireDeviation {
 				"than ignored because on Lambda it is the whole feature and not an optimisation: every concurrent " +
 				"invocation is its own process, so a manager without one reaches only the environment that happened to " +
 				"serve the tracking request, silently. The transport that makes the route real is a Lambda Function URL " +
-				"with response streaming and a distributor, mandatory there, which is D9c's; that block clears " +
-				"DisableStream, adds WithSseDistributor, retires RS-14 and retires this entry. " +
-				"cmd/auth/tools_test.go TestToolsRoutesComeFromTheAdapter fails the day the route answers.",
-			Spec: "docs/spec/config-schema.md §1.14; docs/config-reference.md §17.3; docs/cost-model.md §3.1; docs/spec/serverless-gap-analysis.md §1.5",
+				"with response streaming and a distributor, mandatory there, and D9c built it as a second function rather " +
+				"than by clearing DisableStream here: the auth function stays behind API Gateway, where the route is still a " +
+				"spinner, and the entry stays because a client that talks to the API Gateway URL still gets 404 for it. " +
+				"The fifteen-minute segment is Lambda's invocation cap, not a choice, and the resume guarantee " +
+				"(sse-resume-replays-from-the-event-log) is what makes the reconnect between segments lose nothing. " +
+				"cmd/auth/tools_test.go TestToolsRoutesComeFromTheAdapter fails the day the auth function answers the route, " +
+				"and cmd/auth/stream_test.go TestTheSSEFunctionAnswersTheStreamAlone the day the SSE function answers any other.",
+			Spec: "docs/spec/config-schema.md §1.14; docs/config-reference.md §17.3, §17.9; docs/cost-model.md §3.1; docs/sse.md; docs/spec/serverless-gap-analysis.md §1.5",
+		},
+		// ── D9c: the two guarantees and one difference the event log brings ──
+		{
+			ID:      "sse-resume-replays-from-the-event-log",
+			Surface: "GET <tools>/stream on the SSE function: the Last-Event-ID request header and the ?lastEventId= query parameter",
+			Behaviour: "A connection that presents a cursor -- Last-Event-ID, or ?lastEventId= exactly once when the header is " +
+				"absent, the header winning because EventSource reuses the URL across reconnects -- is first handed every event " +
+				"logged after that cursor on the topics it holds, oldest first, and then the live stream. Delivery is " +
+				"at-least-once and ordered by ULID, per topic and across the topics of one connection; an event whose write " +
+				"became visible after a later one had been delivered is delivered late, never skipped, when it is visible " +
+				"within three seconds of the newest one. Replay is bounded by tools.sse.eventLogRetentionSeconds (24 h by " +
+				"default): a cursor older than that replays from the oldest event still held, and the connected frame is " +
+				"followed by the comment `: replay truncated: ...`; a cursor this log did not mint (the connected frame's " +
+				"UUID, a value from elsewhere, garbage, the far future) starts from now with the comment `: last event id not " +
+				"recognised; resuming from now`. After the connected frame, and after the comment when there is one, every " +
+				"stream carries one id-only frame (`id: <ULID>` and a blank line) naming its starting cursor: it dispatches no " +
+				"event -- the EventSource parser sets the last event ID before it discards a frame with no data -- and it is " +
+				"what gives a client that heard nothing in a segment a cursor to reconnect with. A client that presents no " +
+				"cursor starts from now, as the reference always does.",
+			Reference: "Nothing reads Last-Event-ID anywhere in the reference's source; the per-connection lastEventId " +
+				"(sse-manager.ts:39) is written and compared only for deduplication (:214-215) and is never read on a new " +
+				"connection, which starts with none. A reconnecting client resumes from now and the events raised while it " +
+				"was away are gone; nothing is retained to replay, no comment is written after the connected frame, and the " +
+				"only id-bearing frames are events and the connected frame itself (:140-146).",
+			Why: "An event log is adding a guarantee, not implementing one, and it is registered because a guarantee the " +
+				"reference does not give is as much a difference as one it gives and this product withholds. It is added " +
+				"because this runtime makes the reference's gap unavoidable rather than occasional: a Lambda invocation lives " +
+				"at most fifteen minutes, so every connection is cut on a schedule, and without replay each cut loses whatever " +
+				"was raised during the reconnect. The log the stream needs as its distributor anyway (the SSE function holds " +
+				"one connection per execution environment, and only a shared carrier reaches it) is already that log, so " +
+				"replay costs one Query per topic at connect. The cursor frame is the minimum the guarantee needs on the wire: " +
+				"without it a quiet segment leaves the client holding the connected frame's UUID, which no log can place. The " +
+				"two comments are SSE comments, discarded by every parser, and exist for the operator reading a stream and for " +
+				"a client that wants to know it missed something. cmd/auth/stream_test.go " +
+				"TestTheSSEFunctionStreamsWhatTheAuthFunctionPublishes replays across a disconnect; " +
+				"internal/store/dynamodb/sse_log_test.go pins the order, the retention and the cursor rules.",
+			Spec: "docs/sse.md; docs/spec/data-model.md §1.9; docs/config-reference.md §17.9; docs/cost-model.md §3.1",
+		},
+		{
+			ID:      "sse-event-ids-are-ulids",
+			Surface: "the `id:` line of every event frame on the SSE function, and the `id` inside its `data:` JSON",
+			Behaviour: "An event delivered through the event log carries a ULID -- 26 characters of Crockford base32, 48 bits of " +
+				"milliseconds and 80 random, minted by the log when the event is first published and shared by every topic the " +
+				"one event reaches -- as its id, in both places. The UUIDv4 the core minted for the event is kept in the log as " +
+				"coreId and is still what the telemetry row and the outgoing-webhook envelope carry. The connected frame's id is " +
+				"the core's UUIDv4, unchanged.",
+			Reference: "Every event id is a crypto.randomUUID() (sse-manager.ts:184) unless the publisher supplied one, and it is " +
+				"written verbatim as the id line and inside the frame (:250-252).",
+			Why: "The id is the resume cursor, and a cursor has to be placeable: a ULID sorts as its time, so `SK > E#<id>` " +
+				"is the replay and the id's age is the retention check, with no read. It must be one id per event and not one " +
+				"per topic because the core's deduplication and the log's cross-topic order both key on it. It is minted from " +
+				"the log's clock and never from the event's timestamp, which is the publisher's to fill and would let a " +
+				"future-dated event move every cursor past everything after it. A client that treats the id as opaque, which " +
+				"is what the reference's UUID invites, sees no difference; one that parsed it as a UUID would.",
+			Spec: "docs/spec/data-model.md §1.9; docs/sse.md",
 		},
 		{
 			ID:      "library-events-are-bridged-into-the-tools-fan-out",
