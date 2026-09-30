@@ -1599,6 +1599,15 @@ Rules:
   # hash is a root login that is served and can never succeed; the function
   # refuses it at cold start too (cmd/auth/admin.go, checkAdminRootUser), but
   # a Rule refuses it before anything is touched.
+  AdminRootUserNeedsItsPasswordHash:
+    RuleCondition: !Not [!Equals [!Ref AdminRootEmail, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
+        AssertDescription: >-
+          AdminRootEmail is set, so AdminRootPasswordHashArn must name the
+          Secrets Manager secret holding that user's bcrypt password hash.
+          Without it the root login is served and can never succeed.
+
   # D9b. Parameter-only: EnableTools is always set by this template and a
   # ConfigFile cannot turn the block on, so a queue asked for without the
   # block is knowably a queue nothing would fill. WebhookQueueEnabled ANDs
@@ -1612,15 +1621,6 @@ Rules:
           webhooks are fanned out by the tools block, so without it nothing
           would ever be enqueued and no queue is created. Set EnableTools to
           "true", or EnableWebhookQueue to "false".
-
-  AdminRootUserNeedsItsPasswordHash:
-    RuleCondition: !Not [!Equals [!Ref AdminRootEmail, '']]
-    Assertions:
-      - Assert: !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
-        AssertDescription: >-
-          AdminRootEmail is set, so AdminRootPasswordHashArn must name the
-          Secrets Manager secret holding that user's bcrypt password hash.
-          Without it the root login is served and can never succeed.
 
   # RS-18 at changeset time. The console sits outside the CSRF chain and its
   # guard accepts the ordinary access-token cookie, so that cookie's SameSite

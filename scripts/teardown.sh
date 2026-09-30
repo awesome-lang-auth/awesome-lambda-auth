@@ -106,6 +106,17 @@ SECRET_ARNS="$("${AWS[@]}" cloudformation describe-stack-resources --stack-name 
   --query "StackResources[?ResourceType=='AWS::SecretsManager::Secret'].PhysicalResourceId" \
   --output text 2>/dev/null || true)"
 
+# D9b. The webhook queues exist only with EnableWebhookQueue; when they do, the
+# stack delete destroys the dead-letter queue and every webhook that gave up
+# in the last fourteen days with it, which is exactly what the DLQ was for.
+QUEUE_COUNT="$("${AWS[@]}" cloudformation describe-stack-resources --stack-name "${STACK_NAME}" \
+  --query "length(StackResources[?ResourceType=='AWS::SQS::Queue'])" \
+  --output text 2>/dev/null || echo 0)"
+QUEUE_LINE=""
+if [ "${QUEUE_COUNT:-0}" != "0" ] && [ "${QUEUE_COUNT}" != "None" ]; then
+  QUEUE_LINE="  webhook queues         yes, with any dead-lettered deliveries in them (read WebhookDeadLetterQueueUrl first)"
+fi
+
 if [ "${DELETE_BUCKET}" -eq 1 ] && [ -z "${ARTIFACT_BUCKET}" ]; then
   ARTIFACT_BUCKET="awesome-lambda-auth-artifacts-${ACCOUNT_ID}-${REGION}"
 fi
@@ -118,7 +129,8 @@ About to delete, in ${ACCOUNT_ID}/${REGION}:
   dynamodb table         ${TABLE_NAME:-<unknown>}   (and every user, session and token in it)
   lambda + role + api    yes
   log group              yes, with its contents
-  signing secrets        $([ "${PURGE_SECRETS}" -eq 1 ] && echo 'force-deleted immediately (irreversible)' || echo 'scheduled for deletion, 30-day recovery window')
+${QUEUE_LINE:+${QUEUE_LINE}
+}  signing secrets       $([ "${PURGE_SECRETS}" -eq 1 ] && echo 'force-deleted immediately (irreversible)' || echo 'scheduled for deletion, 30-day recovery window')
   artifact bucket        $([ "${DELETE_BUCKET}" -eq 1 ] && echo "${ARTIFACT_BUCKET} (emptied and deleted)" || echo 'left alone')
 
 EOF

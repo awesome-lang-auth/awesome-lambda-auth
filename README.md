@@ -65,7 +65,7 @@ CI (`.github/workflows/go.yml`) runs the same gate with a DynamoDB Local service
 ## Deploy
 
 ```bash
-./scripts/build-lambda.sh                                   # dist/auth-lambda.zip, reproducible
+LAMBDAS="auth webhook-worker" ./scripts/build-lambda.sh      # one reproducible dist/<name>-lambda.zip per function the template names (D9b)
 ./scripts/deploy.sh --profile <profile> --region <region>   # package + deploy with the AWS CLI, no SAM CLI
 ```
 

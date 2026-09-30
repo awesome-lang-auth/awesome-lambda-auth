@@ -56,23 +56,27 @@ jobs:
   artifact:
     name: lambda zip within budget
     runs-on: ubuntu-latest
+    # One zip per function the template deploys. Each name is a cmd/<name>
+    # binary and a dist/<name>-lambda.zip CodeUri; a block that adds a
+    # function adds its name here, marked with the block id in this comment
+    # (a comment cannot sit inside the folded scalar). Job-level, so the build
+    # and the size check read one list and a function cannot be built and not
+    # checked.
+    #   D9b: webhook-worker
+    env:
+      LAMBDAS: >-
+        auth
+        webhook-worker
     steps:
       - uses: actions/checkout@v5
 
-      # One zip per function the template deploys. Each name is a cmd/<name>
-      # binary and a dist/<name>-lambda.zip CodeUri; a block that adds a
-      # function adds its name here, marked with the block id.
       - name: build the Lambda zips in the pinned toolchain image
-        env:
-          LAMBDAS: >-
-            auth
-            webhook-worker
         run: ./scripts/build-lambda.sh
 
       - name: enforce the artifact size budget
         run: |
-          for zip in dist/auth-arm64.zip dist/webhook-worker-arm64.zip; do
-            ./scripts/check-artifact-size.sh "$zip" "${ARTIFACT_BUDGET_BYTES:-12582912}"
+          for name in $LAMBDAS; do
+            ./scripts/check-artifact-size.sh "dist/${name}-arm64.zip" "${ARTIFACT_BUDGET_BYTES:-12582912}"
           done
 
       - uses: actions/upload-artifact@v5
