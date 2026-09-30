@@ -1,11 +1,13 @@
-// Fissa due difetti del client Flutter ufficiale contro le forme che il
-// contratto manda davvero.
+// Fissa il comportamento corretto del client Flutter ufficiale contro le forme
+// che il contratto manda davvero, per i due difetti che questo demo ha fatto
+// emergere e che awesome_flutter_auth ha chiuso in 1.10.1.
 //
-// I casi asseriscono cio' che il client **fa oggi**, non cio' che dovrebbe:
-// cosi' la suite resta un segnale per rotture nuove invece di portarsi dietro
-// un rosso permanente che tutti imparano a ignorare. Quando le issue upstream
-// si chiudono questi test falliscono, ed e' il punto — il fallimento dice di
-// togliere i `try` da home_screen.dart e di aggiornare questo file.
+// I casi asseriscono cio' che il client deve fare. Contro
+// `awesome_node_auth_flutter` 1.10.0 falliscono tutti: `SessionInfo.fromJson`
+// lanciava un `TypeError` sulla risposta reale, `TotpSetupData.fromJson`
+// lanciava quando `qrCode` non arrivava, e `otpauthUrl` non esisteva nemmeno
+// (il file non compilerebbe). Se uno di questi torna rosso, il difetto e'
+// rientrato e il demo torna a morire su /sessions o su /2fa/setup.
 //
 // La forma dei payload non e' inventata: e' quella di `docs/spec/wire-contract.md`
 // e quella osservata su uno stack vivo.
@@ -13,8 +15,7 @@ import 'package:awesome_flutter_auth/awesome_flutter_auth.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  group('awesome-node-auth-flutter#21 — SessionInfo legge la chiave sbagliata',
-      () {
+  group('awesome-flutter-auth#21 — SessionInfo legge sessionHandle', () {
     // GET /sessions -> {"sessions":[{...}]}, e ogni elemento porta
     // `sessionHandle` (wire-contract.md:236; la reference definisce
     // SessionInfo con sessionHandle in src/models/session.model.ts).
@@ -25,49 +26,52 @@ void main() {
       'expiresAt': '2026-08-22T18:19:25.574355646Z',
     };
 
-    test('lancia sulla risposta reale, invece di degradare', () {
-      // `handle: json['handle'] as String` con la chiave assente prende null,
-      // e il cast non e' nullable.
-      expect(() => SessionInfo.fromJson(fromTheWire), throwsA(isA<TypeError>()));
+    test('legge la risposta reale', () {
+      final parsed = SessionInfo.fromJson(fromTheWire);
+      expect(parsed.handle, fromTheWire['sessionHandle']);
+      expect(parsed.createdAt, isNotNull);
+      // Questo stack non manda `isCurrent`.
+      expect(parsed.isCurrent, isFalse);
     });
 
-    test('accetta solo la chiave che nessun server manda', () {
-      final invented = <String, dynamic>{'handle': 'ses_x'};
-      expect(SessionInfo.fromJson(invented).handle, 'ses_x');
+    test('senza handle lancia FormatException, non TypeError', () {
+      // getActiveSessions() la intercetta e salta la voce invece di far
+      // fallire tutta la lista.
+      expect(
+        () => SessionInfo.fromJson(<String, dynamic>{'userId': 'usr_x'}),
+        throwsA(isA<FormatException>()),
+      );
     });
   });
 
-  group('awesome-node-auth-flutter#22 — TotpSetupData pretende qrCode', () {
+  group('awesome-flutter-auth#22 — TotpSetupData senza qrCode', () {
     // POST /2fa/setup su questo port -> {"secret":…,"otpauthUrl":…}.
     // `qrCode` e' assente per deviazione registrata: un encoder QR non sta ne'
     // nella stdlib ne' in golang.org/x/crypto, e il port Rust della famiglia
-    // fa la stessa scelta. La reference lo manda, ma la sua stessa interfaccia
-    // servita lo tratta come facoltativo (`if (setupData.qrCode)`).
+    // fa la stessa scelta.
     final fromTheWire = <String, dynamic>{
       'secret': 'FU4HO3DFPBGFMVKRLJ4WG4JSIEZG4WJVORDEKNTIGNZQ',
       'otpauthUrl':
           'otpauth://totp/demo@example.com?issuer=awesome-go-auth&secret=FU4HO3DFPBGFMVKRLJ4WG4JSIEZG4WJVORDEKNTIGNZQ',
     };
 
-    test('lancia quando qrCode non arriva', () {
-      expect(
-        () => TotpSetupData.fromJson(fromTheWire),
-        throwsA(isA<TypeError>()),
-      );
+    test('legge la risposta reale, con qrCode null', () {
+      final parsed = TotpSetupData.fromJson(fromTheWire);
+      expect(parsed.secret, fromTheWire['secret']);
+      expect(parsed.qrCode, isNull);
     });
 
-    test('otpauthUrl non e\' comunque raggiungibile attraverso il modello', () {
-      // Anche rendendo qrCode nullable il client non potrebbe disegnare il QR:
-      // TotpSetupData non ha un campo per il provisioning URI e fromJson non
-      // lo legge. E' la seconda meta' della #22.
-      final withQr = Map<String, dynamic>.from(fromTheWire)
-        ..['qrCode'] = 'data:image/png;base64,iVBORw0KGgo=';
-      final parsed = TotpSetupData.fromJson(withQr);
+    test('espone otpauthUrl, da cui un client disegna il QR', () {
+      final parsed = TotpSetupData.fromJson(fromTheWire);
+      expect(parsed.otpauthUrl, fromTheWire['otpauthUrl']);
+    });
 
-      expect(parsed.secret, fromTheWire['secret']);
-      expect(parsed.qrCode, startsWith('data:image/png;base64,'));
-      // Nessuna asserzione su otpauthUrl: il campo non esiste. Se un giorno
-      // comparisse, questo test va esteso a pretenderlo.
+    test('senza secret lancia FormatException, non TypeError', () {
+      // setup2fa() la trasforma in AuthResult.failure.
+      expect(
+        () => TotpSetupData.fromJson(<String, dynamic>{'otpauthUrl': 'x'}),
+        throwsA(isA<FormatException>()),
+      );
     });
   });
 }

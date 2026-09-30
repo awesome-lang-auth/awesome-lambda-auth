@@ -7,24 +7,15 @@ import '../open_url.dart';
 
 /// Profilo, sessioni e iscrizione TOTP.
 ///
-/// Due chiamate qui sono avvolte in `try`, e non per prudenza generica: contro
-/// questo stack il client spedito ci **lancia**, e sono difetti del client, non
-/// del server. Entrambi sono della stessa famiglia del campo `sub` mancante
-/// chiuso da awesome-go-auth#46 — un cast non-nullable su un campo che non
-/// arriva non degrada un client, lo termina.
+/// Fino a `awesome_node_auth_flutter` 1.10.0 due chiamate qui lanciavano contro
+/// questo stack (`SessionInfo` leggeva `handle` invece di `sessionHandle`,
+/// `TotpSetupData` pretendeva `qrCode`), e il demo le avvolgeva in `try`.
+/// Sono chiuse in 1.10.1 (awesome-flutter-auth#21 e #22) e i `try` non servono
+/// piu': `test/client_defects_test.dart` fissa il comportamento corretto.
 ///
-/// 1. `getActiveSessions()`: `SessionInfo.fromJson` legge `json['handle']`,
-///    ma il contratto manda `sessionHandle` (wire-contract.md:236, e la
-///    reference fa lo stesso). Il cast e' `as String`, non nullable.
-///
-/// 2. `setup2fa()`: `TotpSetupData.fromJson` fa `json['qrCode'] as String`,
-///    e questo port non manda `qrCode` — e' una deviazione registrata, perche'
-///    un encoder QR non sta ne' nella stdlib ne' in golang.org/x/crypto.
-///    Il commento upstream dice «un client disegna da se' otpauthUrl», ma
-///    questo client non ci arriva: muore prima, e `TotpSetupData` non espone
-///    nemmeno `otpauthUrl`.
-///
-/// Il demo li mostra invece di morire, cosi' il difetto si vede.
+/// Questo port non manda `qrCode` (deviazione registrata), quindi l'iscrizione
+/// mostra il segreto da inserire a mano e l'URI `otpauth://` che la libreria
+/// ora espone.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.auth, required this.user});
 
@@ -37,8 +28,8 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   List<SessionInfo> _sessions = const [];
-  String? _sessionsError;
   String? _totpSecret;
+  String? _totpOtpauthUrl;
   String? _totpError;
   String? _notice;
   bool _busy = false;
@@ -58,23 +49,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadSessions() async {
-    try {
-      final list = await widget.auth.getActiveSessions();
-      if (!mounted) return;
-      setState(() {
-        _sessions = list;
-        _sessionsError = null;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _sessions = const [];
-        _sessionsError =
-            'Il client non riesce a leggere le sessioni: SessionInfo.fromJson '
-            'cerca "handle" mentre il contratto manda "sessionHandle", e il '
-            'cast non e\' nullable.\n\n$e';
-      });
-    }
+    final list = await widget.auth.getActiveSessions();
+    if (!mounted) return;
+    setState(() => _sessions = list);
   }
 
   Future<void> _startTotp() async {
@@ -82,27 +59,17 @@ class _HomeScreenState extends State<HomeScreen> {
       _busy = true;
       _totpError = null;
     });
-    try {
-      final res = await widget.auth.setup2fa();
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        if (res.success && res.data != null) {
-          _totpSecret = res.data!.secret;
-        } else {
-          _totpError = res.error ?? 'Iscrizione non riuscita';
-        }
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        _totpError =
-            'Il client non riesce a leggere la risposta di /2fa/setup: '
-            'TotpSetupData.fromJson pretende "qrCode", che questo port non '
-            'manda (deviazione registrata), e il cast non e\' nullable.\n\n$e';
-      });
-    }
+    final res = await widget.auth.setup2fa();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (res.success && res.data != null) {
+        _totpSecret = res.data!.secret;
+        _totpOtpauthUrl = res.data!.otpauthUrl;
+      } else {
+        _totpError = res.error ?? 'Iscrizione non riuscita';
+      }
+    });
   }
 
   Future<void> _confirmTotp() async {
@@ -114,6 +81,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _busy = false;
       if (res.success) {
         _totpSecret = null;
+        _totpOtpauthUrl = null;
         _totpCode.clear();
         _notice = 'TOTP attivato.';
       } else {
@@ -224,10 +192,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ],
               ),
-              if (_sessionsError != null)
-                Text(_sessionsError!,
-                    style: TextStyle(color: Theme.of(context).colorScheme.error))
-              else if (_sessions.isEmpty)
+              if (_sessions.isEmpty)
                 Text('Nessuna sessione elencata.', style: small)
               else
                 for (final s in _sessions)
@@ -261,6 +226,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: small),
                 const SizedBox(height: 6),
                 SelectableText(_totpSecret!),
+                // Il port non manda `qrCode`: l'URI di provisioning si incolla
+                // in un'app di autenticazione o in un generatore di QR.
+                if (_totpOtpauthUrl != null) ...[
+                  const SizedBox(height: 12),
+                  Text('URI di provisioning:', style: small),
+                  const SizedBox(height: 6),
+                  SelectableText(_totpOtpauthUrl!),
+                ],
                 const SizedBox(height: 12),
                 TextField(
                   controller: _totpCode,
