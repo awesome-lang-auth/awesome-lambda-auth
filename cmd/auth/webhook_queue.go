@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -78,9 +79,13 @@ import (
 // be taken before the goroutines exist, or a goroutine not yet scheduled would
 // be missed: webhookDefaults.FindByEvent — synchronous, on the request
 // goroutine, the step before the emitter spawns — expects one settlement per
-// config it returns, and this deliverer settles one when an attempt succeeds or
-// when it was the last (Remaining 0). A config with a negative Retries() is not
-// counted, because the core makes no attempt for it.
+// config it returns, and this deliverer settles one when an attempt succeeds,
+// when it was the last (Remaining 0), or at once for an envelope too large to
+// queue (DeliverWebhook says why). A config with a negative Retries() is not
+// counted, because the core makes no attempt for it. One path leaves a count
+// unsettled: the core's Send returning before it calls the deliverer at all (an
+// encode or UUID failure). A JSON-decoded payload cannot fail to encode, and
+// the flush bound caps what it would cost in any case.
 //
 // What that costs is the SendMessage latency on the requests that match a
 // webhook, instead of a delivery lost to the freeze (docs/cost-model.md §3.3).
@@ -135,14 +140,20 @@ func newWebhookQueue(cfg *config.Config, injected auth.WebhookDeliverer) *webhoo
 		return q
 	}
 	q.inner = &awsintegration.SQSWebhookDeliverer{
-		QueueURL:   queueURL,
-		Client:     awsintegration.NewSQSClient(awsintegration.SQSOptions{}),
-		RetryDelay: q.retryDelay,
-		// The id the correlating transport would have put on an in-process
-		// POST, filtered the same way, for the worker to put back.
-		CorrelationID: func(ctx context.Context) string { return forwardableCorrelationID(correlationIDOf(ctx)) },
+		QueueURL:      queueURL,
+		Client:        awsintegration.NewSQSClient(awsintegration.SQSOptions{}),
+		RetryDelay:    q.retryDelay,
+		CorrelationID: queuedCorrelationID,
 	}
 	return q
+}
+
+// queuedCorrelationID is the id the correlating transport would have put on an
+// in-process POST, filtered the same way (logging.go, correlatingTransport),
+// for the worker to put back. A named function rather than a closure so that
+// the test which captures a bridged delivery's context runs exactly this.
+func queuedCorrelationID(ctx context.Context) string {
+	return forwardableCorrelationID(correlationIDOf(ctx))
 }
 
 // observe is webhookDefaults.FindByEvent's hook: record each config's resolved
@@ -169,10 +180,32 @@ func (q *webhookQueue) retryDelay(_ context.Context, attempt auth.WebhookAttempt
 }
 
 // DeliverWebhook enqueues through the inner deliverer and settles the
-// request's count when the core will make no further attempt at this one.
+// request's count exactly once per delivery: when an attempt is stored, when
+// the last attempt fails, or — for an envelope too large to queue — at the
+// first failure.
+//
+// The last case is not a retry worth waiting for. The size is deterministic:
+// the core serialises the body once for every attempt, and the headers and
+// attributes differ between attempts only in values of fixed length (a v4
+// delivery id), so if attempt 0 is too large every attempt is. Waiting on the
+// core's back-off would hold the response for the whole flush bound — two
+// seconds of the auth function at 512 MB — for an enqueue that cannot happen,
+// and whoever can make an event carry a large payload (POST <tools>/track
+// under tools.auth none or session) could buy that per request. So the count
+// is settled at attempt 0 and, because the retries that follow fail the same
+// way, never again for this delivery: settling on the last one too would
+// release another delivery's wait early.
 func (q *webhookQueue) DeliverWebhook(ctx context.Context, attempt auth.WebhookAttempt) error {
 	err := q.inner.DeliverWebhook(ctx, attempt)
-	if err == nil || attempt.Remaining <= 0 {
+	permanent := errors.Is(err, awsintegration.ErrWebhookTooLargeToQueue)
+	switch {
+	case err == nil:
+		q.pending.settle()
+	case permanent:
+		if attempt.Attempt == 0 {
+			q.pending.settle()
+		}
+	case attempt.Remaining <= 0:
 		q.pending.settle()
 	}
 	return err
@@ -210,6 +243,13 @@ func (p *pendingDeliveries) expect(k int) {
 		p.zero = make(chan struct{})
 	}
 	p.n += k
+}
+
+// outstanding is the current count, for the tests.
+func (p *pendingDeliveries) outstanding() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
 }
 
 func (p *pendingDeliveries) settle() {
@@ -250,6 +290,11 @@ func (p *pendingDeliveries) wait(ctx context.Context, bound time.Duration) bool 
 	return false
 }
 
+// webhookFlushTimedOut is the request log's message when the flush bound gave
+// out first. A constant because the tests match on it, and a reworded warning
+// must not turn their assertion vacuous.
+const webhookFlushTimedOut = "outgoing webhook enqueue still in flight when the response was ready"
+
 // flushWebhookQueue is App.Handle's call: wait for the request's enqueues and
 // say so when the bound gave out first.
 func flushWebhookQueue(ctx context.Context, tw *toolsWiring, log *slog.Logger) {
@@ -257,7 +302,7 @@ func flushWebhookQueue(ctx context.Context, tw *toolsWiring, log *slog.Logger) {
 		return
 	}
 	if !tw.queue.flush(ctx) {
-		log.Warn("outgoing webhook enqueue still in flight when the response was ready",
+		log.Warn(webhookFlushTimedOut,
 			slog.String("path", "tools.outboundWebhooks.queueUrl"),
 			slog.String("effect", "the response was released after "+webhookFlushBound.String()+"; the enqueue continues and completes if this execution environment is thawed, and is lost if it is not"))
 	}

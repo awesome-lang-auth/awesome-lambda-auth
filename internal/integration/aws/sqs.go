@@ -128,11 +128,12 @@ const (
 	WebhookAttrLastStatus       = "LastStatus"
 )
 
-// MaxQueuedWebhookBytes is the largest message body the deliverer will send:
-// SQS's classic 256 KiB, the ceiling every queue has whatever its configured
-// MaximumMessageSize. Base64 makes the payload budget about three quarters of
-// it, roughly 190 KiB of envelope, which is far above anything an identity
-// event carries and is stated in docs/config-reference.md all the same.
+// MaxQueuedWebhookBytes is the largest message the deliverer will send, body
+// and attributes together as SQS counts them: SQS's classic 256 KiB, the
+// ceiling every queue has whatever its configured MaximumMessageSize. Base64
+// makes the payload budget about three quarters of it, roughly 190 KiB of
+// envelope, which is far above anything an identity event carries and is
+// stated in docs/config-reference.md all the same.
 const MaxQueuedWebhookBytes = 256 * 1024
 
 // DefaultSQSSendTimeout bounds one SendMessage when SQSWebhookDeliverer.Timeout
@@ -189,8 +190,9 @@ func (q QueuedWebhook) WebhookAttempt() auth.WebhookAttempt {
 }
 
 // ErrWebhookTooLargeToQueue means the envelope exceeds MaxQueuedWebhookBytes.
-// The core retries it like any other error and every retry fails the same
-// way; the error reaches the fan-out log through OnError, which is where an
+// It is permanent: the core retries it like any other error and every retry
+// fails the same way, which is why cmd/auth's flush stops waiting at the first
+// one. The error reaches the fan-out log through OnError, which is where an
 // operator learns an event's payload has outgrown the queue.
 var ErrWebhookTooLargeToQueue = errors.New("sqs: the webhook is larger than an SQS message can carry")
 
@@ -242,17 +244,22 @@ func (d *SQSWebhookDeliverer) DeliverWebhook(ctx context.Context, attempt auth.W
 	if err != nil {
 		return fmt.Errorf("sqs: encode webhook %s: %w", attempt.Event, err)
 	}
-	if len(body) > MaxQueuedWebhookBytes {
-		return fmt.Errorf("%w: %s is %d bytes encoded, the limit is %d", ErrWebhookTooLargeToQueue, attempt.Event, len(body), MaxQueuedWebhookBytes)
-	}
 	correlation := ""
 	if d.CorrelationID != nil {
 		correlation = d.CorrelationID(ctx)
 	}
+	attrs := QueuedWebhookAttributes(attempt, d.RetryDelay(ctx, attempt), correlation)
+	// SQS counts the attributes toward the limit with the body — each one's
+	// name, type and value — so an envelope just under the bound with its
+	// attributes over it would otherwise fail as SQS's InvalidParameterValue,
+	// retried like a network error, instead of as this.
+	if size := len(body) + MessageAttributesSize(attrs); size > MaxQueuedWebhookBytes {
+		return fmt.Errorf("%w: %s is %d bytes encoded with its attributes, the limit is %d", ErrWebhookTooLargeToQueue, attempt.Event, size, MaxQueuedWebhookBytes)
+	}
 	input := &sqs.SendMessageInput{
 		QueueUrl:          awssdk.String(d.QueueURL),
 		MessageBody:       awssdk.String(string(body)),
-		MessageAttributes: QueuedWebhookAttributes(attempt, d.RetryDelay(ctx, attempt), correlation),
+		MessageAttributes: attrs,
 	}
 
 	timeout := d.Timeout
@@ -296,6 +303,16 @@ func QueuedWebhookAttributes(a auth.WebhookAttempt, retryDelay time.Duration, co
 		attrs[WebhookAttrCorrelationID] = stringAttr(correlationID)
 	}
 	return attrs
+}
+
+// MessageAttributesSize is what SQS counts of a message's attributes toward
+// its size limit: every name, data type and value, in bytes.
+func MessageAttributesSize(attrs map[string]sqstypes.MessageAttributeValue) int {
+	n := 0
+	for name, a := range attrs {
+		n += len(name) + len(awssdk.ToString(a.DataType)) + len(awssdk.ToString(a.StringValue)) + len(a.BinaryValue)
+	}
+	return n
 }
 
 func numberAttr(n int64) sqstypes.MessageAttributeValue {

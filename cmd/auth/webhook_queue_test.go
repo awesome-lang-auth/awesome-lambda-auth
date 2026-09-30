@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
+
+	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
 )
 
 // D9b's composition: which deliverer the sender gets, what the queued one is
@@ -26,14 +29,29 @@ type recordingDeliverer struct {
 	delay    time.Duration
 	err      error
 	attempts []auth.WebhookAttempt
+	// contexts is the context each attempt arrived with: what the production
+	// SQS deliverer reads the correlation id from.
+	contexts []context.Context
 }
 
-func (r *recordingDeliverer) DeliverWebhook(_ context.Context, a auth.WebhookAttempt) error {
+func (r *recordingDeliverer) DeliverWebhook(ctx context.Context, a auth.WebhookAttempt) error {
 	time.Sleep(r.delay)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.attempts = append(r.attempts, a)
+	r.contexts = append(r.contexts, ctx)
 	return r.err
+}
+
+func (r *recordingDeliverer) contextOf(event string) (context.Context, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, a := range r.attempts {
+		if a.Event == event {
+			return r.contexts[i], true
+		}
+	}
+	return nil, false
 }
 
 func (r *recordingDeliverer) seen() []auth.WebhookAttempt {
@@ -81,10 +99,21 @@ func TestQueuedWebhookIsEnqueuedBeforeTheResponseLeaves(t *testing.T) {
 	rec := &recordingDeliverer{delay: 150 * time.Millisecond}
 	app := newQueuedApp(t, bundle, rec)
 
+	// With a correlation id, because a bridged delivery must carry the
+	// caller's across the queue as the in-process client carries it on the POST.
+	const correlation = "queued-test-51c9"
 	invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
-	login := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(testEmail))
+	login := invoke(t, app, http.MethodPost, "/auth/login",
+		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer, "x-correlation-id", correlation), nil, registerBody(testEmail))
 	if login.StatusCode != http.StatusOK {
 		t.Fatalf("login status = %d", login.StatusCode)
+	}
+	// The production deliverer's CorrelationID is queuedCorrelationID over the
+	// context the attempt arrives with, and this is that context.
+	if ctx, ok := rec.contextOf(auth.EventAuthLoginSuccess); !ok {
+		t.Error("no login attempt reached the deliverer")
+	} else if got := queuedCorrelationID(ctx); got != correlation {
+		t.Errorf("the queued delivery would carry CorrelationId %q, want the login's %q", got, correlation)
 	}
 
 	// No polling: the flush is the property under test.
@@ -168,9 +197,54 @@ func TestQueuedWebhookFailureDoesNotHoldTheResponse(t *testing.T) {
 		t.Fatal("no attempt reached the deliverer")
 	}
 	// Timing a login under -race proves nothing; the flush's own warning is
-	// the evidence that it waited out its bound.
-	if out := logs.String(); strings.Contains(out, "still in flight") {
+	// the evidence that it waited out its bound. Matched on the constant the
+	// code logs, so a reworded warning cannot make this vacuous.
+	if out := logs.String(); strings.Contains(out, webhookFlushTimedOut) {
 		t.Errorf("a failed last attempt did not settle, and the flush waited out its bound:\n%s", out)
+	}
+}
+
+// TestTooLargeEnvelopeDoesNotHoldTheResponse: an envelope SQS cannot carry is
+// refused on every attempt, so the count settles at the first refusal and the
+// flush returns at once instead of waiting out its two-second bound while the
+// core backs off — and the core's later retries of the same delivery do not
+// settle again and release some other delivery's wait. The core's own sender,
+// with its real one-second back-off, is what drives it.
+func TestTooLargeEnvelopeDoesNotHoldTheResponse(t *testing.T) {
+	t.Parallel()
+	rec := &recordingDeliverer{err: fmt.Errorf("%w: test", awsintegration.ErrWebhookTooLargeToQueue)}
+	q := &webhookQueue{inner: rec, fallback: time.Second}
+	cfg := auth.WebhookConfig{ID: "whk_big", URL: "https://receiver.example.test/hook", MaxRetries: intPtr(3), RetryDelayMs: intPtr(1000)}
+	q.observe([]auth.WebhookConfig{cfg})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sender := &auth.WebhookSender{Deliverer: q}
+	ev := auth.Event{Name: auth.EventAuthLoginSuccess, UserID: "u1"}
+	go func() { _ = sender.Send(ctx, cfg, ev.OutgoingWebhook("")) }()
+
+	start := time.Now()
+	if !q.flush(context.Background()) {
+		t.Fatal("the flush waited out its bound for an envelope that can never be queued")
+	}
+	// The core's first back-off is one second; settling only on the last
+	// attempt would have left the flush waiting two.
+	if elapsed := time.Since(start); elapsed >= 900*time.Millisecond {
+		t.Errorf("the flush took %s, want it released at the first refusal, well before the core's 1 s back-off", elapsed)
+	}
+
+	// Another delivery in the next request, while the core retries the big
+	// one after its back-off: that retry must not settle the new count.
+	q.observe([]auth.WebhookConfig{{ID: "whk_other", URL: "https://receiver.example.test/other"}})
+	deadline := time.Now().Add(3 * time.Second)
+	for len(rec.seen()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(rec.seen()) < 2 {
+		t.Fatal("the core never retried the refused enqueue")
+	}
+	if got := q.pending.outstanding(); got != 1 {
+		t.Errorf("after the core's retry of the refused delivery, %d pending, want 1 (the other delivery's)", got)
 	}
 }
 

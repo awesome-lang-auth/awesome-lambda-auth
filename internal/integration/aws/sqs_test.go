@@ -207,3 +207,39 @@ func TestSQSDelivererErrorsNeverQuoteTheReceiver(t *testing.T) {
 		t.Error("an unconfigured deliverer reported success")
 	}
 }
+
+// TestQueuedWebhookSizeCountsTheAttributes: SQS counts the attributes toward
+// the 256 KiB limit with the body, so an envelope that fits alone and not with
+// its attributes is refused here, as ErrWebhookTooLargeToQueue, and never
+// reaches SQS to come back as an InvalidParameterValue retried like an outage.
+func TestQueuedWebhookSizeCountsTheAttributes(t *testing.T) {
+	t.Parallel()
+	a := pinnedAttempt()
+	attrs := MessageAttributesSize(QueuedWebhookAttributes(a, 1500*time.Millisecond, "corr-1"))
+	if attrs < 40 {
+		t.Fatalf("the attributes count %d bytes, which is less than their names alone", attrs)
+	}
+	encoded := func(n int) int {
+		a.Body = []byte(strings.Repeat("x", n))
+		b, err := json.Marshal(NewQueuedWebhook(a))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(b)
+	}
+	// The largest body whose envelope alone fits.
+	n := MaxQueuedWebhookBytes * 3 / 4
+	for encoded(n) > MaxQueuedWebhookBytes {
+		n--
+	}
+	if encoded(n)+attrs <= MaxQueuedWebhookBytes {
+		t.Fatalf("no envelope in the gap: %d + %d fits", encoded(n), attrs)
+	}
+	f := &fakeSQS{}
+	if err := deliverer(f).DeliverWebhook(context.Background(), a); !errors.Is(err, ErrWebhookTooLargeToQueue) {
+		t.Errorf("an envelope of %d bytes with %d of attributes: %v, want ErrWebhookTooLargeToQueue", encoded(n), attrs, err)
+	}
+	if len(f.sent) != 0 {
+		t.Error("the oversized message reached SQS")
+	}
+}
