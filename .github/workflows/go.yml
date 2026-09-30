@@ -59,14 +59,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: build the Lambda zip in the pinned toolchain image
+      # One zip per function the template deploys. Each name is a cmd/<name>
+      # binary and a dist/<name>-lambda.zip CodeUri; a block that adds a
+      # function adds its name here, marked with the block id.
+      - name: build the Lambda zips in the pinned toolchain image
+        env:
+          LAMBDAS: >-
+            auth
+            webhook-worker
         run: ./scripts/build-lambda.sh
 
       - name: enforce the artifact size budget
-        run: ./scripts/check-artifact-size.sh dist/auth-arm64.zip "${ARTIFACT_BUDGET_BYTES:-12582912}"
+        run: |
+          for zip in dist/auth-arm64.zip dist/webhook-worker-arm64.zip; do
+            ./scripts/check-artifact-size.sh "$zip" "${ARTIFACT_BUDGET_BYTES:-12582912}"
+          done
 
       - uses: actions/upload-artifact@v5
         with:
-          name: auth-lambda
-          path: dist/auth-*.zip
+          name: lambda-artifacts
+          path: dist/*.zip
           if-no-files-found: error

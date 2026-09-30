@@ -26,7 +26,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 TEMPLATE="${REPO_ROOT}/infra/sam/template.yaml"
-ARTIFACT="${REPO_ROOT}/dist/auth-lambda.zip"
+# Every artifact the template names in a CodeUri, not only the auth function's:
+# `cloudformation package` uploads each CodeUri whatever the function's
+# Condition, so a stack with EnableWebhookQueue off still needs the webhook
+# worker's zip to package (D9b). Read from the template so that the next
+# function is checked without anybody remembering to add it here.
+# A read loop rather than mapfile, which the bash 3.2 macOS ships lacks.
+ARTIFACTS=()
+while IFS= read -r a; do
+  ARTIFACTS+=("${a}")
+done < <(sed -n 's#^[[:space:]]*CodeUri:[[:space:]]*\.\./\.\./\(dist/[A-Za-z0-9._-]*-lambda\.zip\)[[:space:]]*$#\1#p' "${TEMPLATE}" | sort -u)
 PACKAGED="${REPO_ROOT}/dist/packaged.yaml"
 
 PROFILE=""
@@ -92,20 +101,31 @@ command -v aws >/dev/null 2>&1 || die "the AWS CLI is not on PATH"
 AWS=(aws --profile "${PROFILE}" --region "${REGION}")
 
 if [ "${BUILD}" -eq 1 ]; then
-  echo "==> building the Lambda artifact"
-  "${SCRIPT_DIR}/build-lambda.sh"
+  echo "==> building the Lambda artifacts"
+  names=""
+  for a in "${ARTIFACTS[@]}"; do
+    n="$(basename "${a}")"
+    names="${names} ${n%-lambda.zip}"
+  done
+  LAMBDAS="${names# }" "${SCRIPT_DIR}/build-lambda.sh"
 fi
 
 # A zip that does not contain a root-level `bootstrap` deploys fine and then
 # fails every invocation with Runtime.InvalidEntrypoint, which is a slow way to
-# find out. Check before uploading, not after.
-[ -f "${ARTIFACT}" ] || die "missing ${ARTIFACT} — run scripts/build-lambda.sh (or pass --build)"
-if command -v unzip >/dev/null 2>&1; then
-  unzip -l "${ARTIFACT}" | grep -qE '[[:space:]]bootstrap$' \
-    || die "${ARTIFACT} has no root-level 'bootstrap' entry; provided.al2023 will refuse it"
-else
-  echo "note: unzip not found, skipping the bootstrap-entry check" >&2
-fi
+# find out. Check before uploading, not after — every artifact, for the reason
+# ARTIFACTS is read from the template.
+[ "${#ARTIFACTS[@]}" -gt 0 ] || die "found no CodeUri under dist/ in ${TEMPLATE}; this script no longer understands the template"
+for a in "${ARTIFACTS[@]}"; do
+  ARTIFACT="${REPO_ROOT}/${a}"
+  n="$(basename "${a}")"
+  [ -f "${ARTIFACT}" ] || die "missing ${ARTIFACT} — run LAMBDAS=\"${n%-lambda.zip}\" scripts/build-lambda.sh (or pass --build, which builds every artifact the template names)"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -l "${ARTIFACT}" | grep -qE '[[:space:]]bootstrap$' \
+      || die "${ARTIFACT} has no root-level 'bootstrap' entry; provided.al2023 will refuse it"
+  else
+    echo "note: unzip not found, skipping the bootstrap-entry check" >&2
+  fi
+done
 
 echo "==> resolving caller identity"
 IDENTITY_JSON="$("${AWS[@]}" sts get-caller-identity --output json)" \
@@ -128,7 +148,7 @@ cat <<EOF
   caller           ${CALLER_ARN}
   stack            ${STACK_NAME}
   artifact bucket  ${ARTIFACT_BUCKET}
-  artifact         ${ARTIFACT}
+  artifacts        ${ARTIFACTS[*]}
 
 EOF
 

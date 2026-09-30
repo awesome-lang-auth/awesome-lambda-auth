@@ -344,8 +344,9 @@ func TestEveryAlarmIsActionableAndGated(t *testing.T) {
 				"DynamoDB metrics at all, and an alarm that fires because nothing happened is an alarm "+
 				"somebody turns off", a.name)
 		}
-		if a.condition != "AlarmsEnabled" {
-			t.Errorf("%s has Condition %q, want AlarmsEnabled so that EnableAlarms turns the whole set "+
+		if a.condition != "AlarmsEnabled" && !gatedOnAlarmsEnabled(t, a.condition) {
+			t.Errorf("%s has Condition %q, want AlarmsEnabled — or a feature condition defined as "+
+				"!And [!Condition AlarmsEnabled, …] — so that EnableAlarms turns the whole set "+
 				"off in one place", a.name, a.condition)
 		}
 	}
@@ -410,6 +411,142 @@ func numericDefault(t *testing.T, tpl *template, name string) float64 {
 		t.Fatalf("parameter %s has a non-numeric Default %q: %v", name, param.fields["Default"], err)
 	}
 	return v
+}
+
+// ── D9b: the webhook queue ──────────────────────────────────────────────────
+
+// conditionDefinition returns the one-line definition of a named condition
+// under Conditions:, or "" when there is none. The reader above does not parse
+// that section; the conditions an alarm may be gated on are one-liners by
+// convention, and a multi-line one simply fails the check that needs it.
+func conditionDefinition(t *testing.T, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	inConditions := false
+	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+		if m := topLevelKey.FindStringSubmatch(line); m != nil {
+			inConditions = m[1] == "Conditions"
+			continue
+		}
+		if inConditions && strings.HasPrefix(line, "  "+name+":") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "  "+name+":"))
+		}
+	}
+	return ""
+}
+
+// gatedOnAlarmsEnabled accepts an alarm condition that is an !And over
+// AlarmsEnabled and the switch of the feature the alarm watches. An alarm on a
+// resource that exists only with a feature must be gated on that feature too —
+// CloudFormation refuses a reference to a resource whose condition is false —
+// and EnableAlarms must still turn it off, which the AlarmsEnabled term is.
+func gatedOnAlarmsEnabled(t *testing.T, condition string) bool {
+	t.Helper()
+	def := conditionDefinition(t, condition)
+	return strings.HasPrefix(def, "!And") && strings.Contains(def, "!Condition AlarmsEnabled")
+}
+
+// TestTheWebhookQueueIsConditionalEncryptedAndConsistent is the structural
+// half of D9b's stack: nothing exists without EnableWebhookQueue, both queues
+// are encrypted, the visibility timeout honours the SQS event source's
+// six-times rule against the worker's own timeout, the worker reports batch
+// item failures, and its grants are the four it needs and no wider.
+func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+
+	for _, name := range []string{"WebhookQueue", "WebhookDLQ", "WebhookWorkerLogGroup", "WebhookWorkerFunction"} {
+		r, ok := tpl.resources[name]
+		if !ok {
+			t.Fatalf("%s is gone", name)
+		}
+		if r.condition != "WebhookQueueEnabled" {
+			t.Errorf("%s has Condition %q, want WebhookQueueEnabled: an empty parameter adds no resource and no cost", name, r.condition)
+		}
+	}
+	if def := conditionDefinition(t, "WebhookQueueEnabled"); !strings.Contains(def, "!Condition ToolsEnabled") || !strings.Contains(def, "EnableWebhookQueue") {
+		t.Errorf("WebhookQueueEnabled = %q, want it to need both EnableTools and EnableWebhookQueue", def)
+	}
+	if got := tpl.parameters["EnableWebhookQueue"].fields["Default"]; got != "'false'" {
+		t.Errorf("EnableWebhookQueue defaults to %s, want 'false'", got)
+	}
+
+	for _, name := range []string{"WebhookQueue", "WebhookDLQ"} {
+		q := tpl.resources[name]
+		if q.props["SqsManagedSseEnabled"] != "true" {
+			t.Errorf("%s is not encrypted at rest with SSE-SQS", name)
+		}
+		if strings.Contains(q.body, "QueueName:") {
+			t.Errorf("%s sets a QueueName; a fixed name collides with a queue a previous stack left behind", name)
+		}
+	}
+	if got := tpl.resources["WebhookDLQ"].props["MessageRetentionPeriod"]; got != "1209600" {
+		t.Errorf("WebhookDLQ keeps messages %s s, want 1209600 (fourteen days, the maximum)", got)
+	}
+
+	worker := tpl.resources["WebhookWorkerFunction"]
+	timeout, err := strconv.Atoi(worker.props["Timeout"])
+	if err != nil {
+		t.Fatalf("WebhookWorkerFunction Timeout %q is not a number", worker.props["Timeout"])
+	}
+	visibility, err := strconv.Atoi(tpl.resources["WebhookQueue"].props["VisibilityTimeout"])
+	if err != nil {
+		t.Fatalf("WebhookQueue VisibilityTimeout %q is not a number", tpl.resources["WebhookQueue"].props["VisibilityTimeout"])
+	}
+	if visibility < 6*timeout {
+		t.Errorf("WebhookQueue VisibilityTimeout %d s is under six times the worker's %d s timeout, "+
+			"so a message could reappear while its invocation still runs", visibility, timeout)
+	}
+	if got := literal(worker.props["CodeUri"]); got != "../../dist/webhook-worker-lambda.zip" {
+		t.Errorf("WebhookWorkerFunction CodeUri = %q, want its own artifact", got)
+	}
+	for _, want := range []string{
+		"ReportBatchItemFailures",
+		"deadLetterTargetArn",
+		"Sid: ConsumeWebhookQueue", "Sid: DeadLetterWebhooks", "Sid: WebhookDeliveryLedger",
+		"dynamodb:LeadingKeys", "'IDEM#webhook#*'",
+	} {
+		if !strings.Contains(worker.body+tpl.resources["WebhookQueue"].body, want) {
+			t.Errorf("the worker or its queue lacks %q", want)
+		}
+	}
+	// The ledger grant is UpdateItem alone: the worker reads nothing else in
+	// the table and writes nothing outside its partition prefix.
+	ledger := worker.body[strings.Index(worker.body, "Sid: WebhookDeliveryLedger"):]
+	if end := strings.Index(ledger, "Events:"); end > 0 {
+		ledger = ledger[:end]
+	}
+	for _, wider := range []string{"GetItem", "PutItem", "Query", "DeleteItem", "dynamodb:*"} {
+		if strings.Contains(ledger, wider) {
+			t.Errorf("the worker's ledger grant includes %s", wider)
+		}
+	}
+
+	auth := tpl.resources["AuthFunction"]
+	i := strings.Index(auth.body, "Sid: EnqueueOutgoingWebhooks")
+	if i < 0 {
+		t.Fatal("AuthFunction cannot enqueue: no EnqueueOutgoingWebhooks statement")
+	}
+	if j := strings.LastIndex(auth.body[:i], "- !If"); j < 0 || !strings.Contains(auth.body[j:i], "WebhookQueueEnabled") {
+		t.Error("EnqueueOutgoingWebhooks is not conditioned on WebhookQueueEnabled")
+	}
+	if !strings.Contains(auth.body, "AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL: !If [WebhookQueueEnabled, !Ref WebhookQueue, !Ref 'AWS::NoValue']") {
+		t.Error("the auth function's queue URL variable is not conditioned on WebhookQueueEnabled")
+	}
+
+	alarm, ok := tpl.resources["WebhookDeadLetterAlarm"]
+	if !ok {
+		t.Fatal("the dead-letter alarm is gone: a webhook that gave up is exactly the event nobody sees otherwise")
+	}
+	if alarm.condition != "WebhookQueueAlarmed" || !gatedOnAlarmsEnabled(t, alarm.condition) {
+		t.Errorf("WebhookDeadLetterAlarm Condition = %q, want WebhookQueueAlarmed over AlarmsEnabled", alarm.condition)
+	}
+	if !strings.Contains(alarm.body, "ApproximateNumberOfMessagesVisible") || !strings.Contains(alarm.body, "WebhookDLQ.QueueName") {
+		t.Error("WebhookDeadLetterAlarm does not watch the dead-letter queue's depth")
+	}
 }
 
 // ── the upload bucket ───────────────────────────────────────────────────────
