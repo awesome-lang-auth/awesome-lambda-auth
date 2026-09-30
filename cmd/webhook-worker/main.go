@@ -14,8 +14,11 @@
 // because it needs none of the auth function: no configuration document, no
 // signing secret, no route, and IAM on exactly four things — receive, delete
 // and change the visibility of messages on the webhook queue, send to the DLQ,
-// and the ledger partition of the table. A compromised worker can POST what is
-// already on the queue and nothing else.
+// the ledger partition of the table, and its own log group. The role is
+// written out in the template (WebhookWorkerRole) rather than generated, because
+// a generated role on an SQS event source also gets the managed
+// AWSLambdaSQSQueueExecutionRole, which reaches every queue in the account. A
+// compromised worker can POST what is already on the queue and nothing else.
 //
 // # Environment
 //

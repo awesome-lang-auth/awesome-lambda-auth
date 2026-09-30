@@ -2762,6 +2762,67 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-webhook-worker'
       RetentionInDays: !Ref LogRetentionDays
 
+  # The worker's execution role, written out rather than generated: see the
+  # note on the function's Role. Five statements, each on one resource, and
+  # no managed policy — a compromised worker can consume this queue, write
+  # to its DLQ, touch the ledger partition and write its own log, nothing else.
+  # No RoleName, for the reason the queues have no QueueName.
+  WebhookWorkerRole:
+    Type: AWS::IAM::Role
+    Condition: WebhookQueueEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: webhook-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # What the event source does on the worker's behalf (receive,
+              # delete, read the queue's attributes) and what the worker does
+              # itself (set a message's visibility to the back-off). The worker
+              # never sends to this queue.
+              - Sid: ConsumeWebhookQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WebhookQueue.Arn
+              # The explicit dead-letter hand-off, with its reason attribute.
+              - Sid: DeadLetterWebhooks
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt WebhookDLQ.Arn
+              # The delivery ledger (data-model.md §1.9) and nothing else in the
+              # table: UpdateItem only, on items whose partition key starts
+              # IDEM#webhook#. The worker can read no user, session or secret.
+              - Sid: WebhookDeliveryLedger
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AuthTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'IDEM#webhook#*'
+              # Its own log group, which exists before the function does
+              # (DependsOn), so no logs:CreateLogGroup. The group's Arn
+              # attribute ends in ":*", which covers its streams.
+              - Sid: WriteWebhookWorkerLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt WebhookWorkerLogGroup.Arn
+
   WebhookWorkerFunction:
     Type: AWS::Serverless::Function
     Condition: WebhookQueueEnabled
@@ -2785,40 +2846,18 @@ Resources:
           AWESOME_AUTH_WEBHOOK_QUEUE_URL: !Ref WebhookQueue
           AWESOME_AUTH_WEBHOOK_DLQ_URL: !Ref WebhookDLQ
           AWESOME_AUTH_WEBHOOK_MAX_RECEIVE_COUNT: !Ref WebhookQueueMaxReceiveCount
+          # WebhookQueue's MessageRetentionPeriod, which CloudFormation does
+          # not expose as an attribute; template_test.go pins the two equal.
+          # The worker dead-letters a failing message ("expiring") rather than
+          # hand it back to a queue that would drop it unseen.
+          AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS: '1209600'
           AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME: !Ref AuthTable
-      Policies:
-        - Version: '2012-10-17'
-          Statement:
-            # What the event source does on the worker's behalf (receive,
-            # delete, read the queue's attributes) and what the worker does
-            # itself (set a message's visibility to the back-off). The worker
-            # never sends to this queue.
-            - Sid: ConsumeWebhookQueue
-              Effect: Allow
-              Action:
-                - sqs:ReceiveMessage
-                - sqs:DeleteMessage
-                - sqs:ChangeMessageVisibility
-                - sqs:GetQueueAttributes
-              Resource: !GetAtt WebhookQueue.Arn
-            # The explicit dead-letter hand-off, with its reason attribute.
-            - Sid: DeadLetterWebhooks
-              Effect: Allow
-              Action:
-                - sqs:SendMessage
-              Resource: !GetAtt WebhookDLQ.Arn
-            # The delivery ledger (data-model.md §1.9) and nothing else in the
-            # table: UpdateItem only, on items whose partition key starts
-            # IDEM#webhook#. The worker can read no user, session or secret.
-            - Sid: WebhookDeliveryLedger
-              Effect: Allow
-              Action:
-                - dynamodb:UpdateItem
-              Resource: !GetAtt AuthTable.Arn
-              Condition:
-                ForAllValues:StringLike:
-                  dynamodb:LeadingKeys:
-                    - 'IDEM#webhook#*'
+      # An explicit role, and no Policies: here. With Policies and an SQS event
+      # source, SAM generates the role and ALSO attaches the AWS managed
+      # AWSLambdaSQSQueueExecutionRole, which grants receive and delete on
+      # every queue in the account (Resource "*"). With Role set, SAM attaches
+      # nothing; the grants are exactly WebhookWorkerRole's below.
+      Role: !GetAtt WebhookWorkerRole.Arn
       Events:
         WebhookQueue:
           Type: SQS

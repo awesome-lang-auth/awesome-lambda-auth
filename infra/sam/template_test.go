@@ -446,19 +446,54 @@ func conditionDefinition(t *testing.T, name string) string {
 func gatedOnAlarmsEnabled(t *testing.T, condition string) bool {
 	t.Helper()
 	def := conditionDefinition(t, condition)
-	return strings.HasPrefix(def, "!And") && strings.Contains(def, "!Condition AlarmsEnabled")
+	// The first term, literally: a bare Contains would accept
+	// !And [!Not [!Condition AlarmsEnabled], …], which is the opposite.
+	return strings.HasPrefix(def, "!And [!Condition AlarmsEnabled,")
+}
+
+// statement returns the text of the IAM statement with the given Sid inside a
+// resource body, up to the next statement or the end of the body.
+func statement(body, sid string) string {
+	i := strings.Index(body, "- Sid: "+sid+"\n")
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len("- Sid: "+sid+"\n"):]
+	if j := strings.Index(rest, "- Sid: "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// statementActions is the block-list under a statement's Action:, in order.
+func statementActions(stmt string) []string {
+	var out []string
+	in := false
+	for _, line := range strings.Split(stmt, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "Action:":
+			in = true
+		case in && strings.HasPrefix(trimmed, "- "):
+			out = append(out, strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
+		case in:
+			return out
+		}
+	}
+	return out
 }
 
 // TestTheWebhookQueueIsConditionalEncryptedAndConsistent is the structural
 // half of D9b's stack: nothing exists without EnableWebhookQueue, both queues
 // are encrypted, the visibility timeout honours the SQS event source's
 // six-times rule against the worker's own timeout, the worker reports batch
-// item failures, and its grants are the four it needs and no wider.
+// item failures, and its role is explicit and holds exactly the four
+// statements it needs — so that SAM attaches no managed policy beside them.
 func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 	t.Parallel()
 	tpl := load(t)
 
-	for _, name := range []string{"WebhookQueue", "WebhookDLQ", "WebhookWorkerLogGroup", "WebhookWorkerFunction"} {
+	for _, name := range []string{"WebhookQueue", "WebhookDLQ", "WebhookWorkerLogGroup", "WebhookWorkerRole", "WebhookWorkerFunction"} {
 		r, ok := tpl.resources[name]
 		if !ok {
 			t.Fatalf("%s is gone", name)
@@ -510,26 +545,75 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 	if got := literal(worker.props["CodeUri"]); got != "../../dist/webhook-worker-lambda.zip" {
 		t.Errorf("WebhookWorkerFunction CodeUri = %q, want its own artifact", got)
 	}
-	for _, want := range []string{
-		"ReportBatchItemFailures",
-		"deadLetterTargetArn",
-		"Sid: ConsumeWebhookQueue", "Sid: DeadLetterWebhooks", "Sid: WebhookDeliveryLedger",
-		"dynamodb:LeadingKeys", "'IDEM#webhook#*'",
-	} {
+	for _, want := range []string{"ReportBatchItemFailures", "deadLetterTargetArn"} {
 		if !strings.Contains(worker.body+tpl.resources["WebhookQueue"].body, want) {
 			t.Errorf("the worker or its queue lacks %q", want)
 		}
 	}
-	// The ledger grant is UpdateItem alone: the worker reads nothing else in
-	// the table and writes nothing outside its partition prefix.
-	ledger := worker.body[strings.Index(worker.body, "Sid: WebhookDeliveryLedger"):]
-	if end := strings.Index(ledger, "Events:"); end > 0 {
-		ledger = ledger[:end]
+
+	// The worker's grants. An SQS event source on a function whose role SAM
+	// generates gets the managed AWSLambdaSQSQueueExecutionRole attached on
+	// top of whatever Policies: say — receive and delete on every queue in the
+	// account — and nothing in this file could see it, because the transform
+	// adds it. So the function must name an explicit role, carry no Policies
+	// of its own, and the role must attach no managed policy: then the
+	// statements below are the whole grant, and asserting them means something.
+	if got := worker.props["Role"]; got != "!GetAtt WebhookWorkerRole.Arn" {
+		t.Errorf("WebhookWorkerFunction Role = %q, want !GetAtt WebhookWorkerRole.Arn: without an explicit role "+
+			"SAM attaches AWSLambdaSQSQueueExecutionRole (Resource \"*\") for the SQS event source", got)
 	}
-	for _, wider := range []string{"GetItem", "PutItem", "Query", "DeleteItem", "dynamodb:*"} {
-		if strings.Contains(ledger, wider) {
-			t.Errorf("the worker's ledger grant includes %s", wider)
+	if strings.Contains(worker.body, "Policies:") {
+		t.Error("WebhookWorkerFunction carries Policies:; its grants belong on WebhookWorkerRole, and SAM " +
+			"would generate a role with the managed SQS policy attached for them")
+	}
+	role, ok := tpl.resources["WebhookWorkerRole"]
+	if !ok {
+		t.Fatal("WebhookWorkerRole is gone")
+	}
+	if role.typ != "AWS::IAM::Role" || role.condition != "WebhookQueueEnabled" {
+		t.Errorf("WebhookWorkerRole is %s under %q, want AWS::IAM::Role under WebhookQueueEnabled", role.typ, role.condition)
+	}
+	for _, never := range []string{"ManagedPolicyArns", "RoleName"} {
+		if strings.Contains(role.body, never) {
+			t.Errorf("WebhookWorkerRole sets %s", never)
 		}
+	}
+	// Exact action lists, not a deny-list: a Scan, a BatchWriteItem or a
+	// wildcard added later fails here whatever it is called.
+	for sid, want := range map[string][]string{
+		"ConsumeWebhookQueue":    {"sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"},
+		"DeadLetterWebhooks":     {"sqs:SendMessage"},
+		"WebhookDeliveryLedger":  {"dynamodb:UpdateItem"},
+		"WriteWebhookWorkerLogs": {"logs:CreateLogStream", "logs:PutLogEvents"},
+	} {
+		stmt := statement(role.body, sid)
+		if stmt == "" {
+			t.Errorf("WebhookWorkerRole has no statement %s", sid)
+			continue
+		}
+		if got := statementActions(stmt); !slices.Equal(got, want) {
+			t.Errorf("WebhookWorkerRole %s allows %v, want exactly %v", sid, got, want)
+		}
+		if strings.Contains(stmt, "Resource: '*'") || strings.Contains(stmt, `Resource: "*"`) {
+			t.Errorf("WebhookWorkerRole %s is on every resource", sid)
+		}
+	}
+	if n := strings.Count(role.body, "- Sid: "); n != 4 {
+		t.Errorf("WebhookWorkerRole has %d statements, want the four above and no other", n)
+	}
+	ledger := statement(role.body, "WebhookDeliveryLedger")
+	if !strings.Contains(ledger, "dynamodb:LeadingKeys") || !strings.Contains(ledger, "'IDEM#webhook#*'") {
+		t.Error("the worker's ledger grant is not confined to the IDEM#webhook# partitions")
+	}
+	if !strings.Contains(statement(role.body, "WriteWebhookWorkerLogs"), "!GetAtt WebhookWorkerLogGroup.Arn") {
+		t.Error("the worker's log grant is not confined to its own log group")
+	}
+
+	// The retention the worker is told is the queue's own, or its "expiring"
+	// hand-off fires at the wrong age.
+	retention := tpl.resources["WebhookQueue"].props["MessageRetentionPeriod"]
+	if !strings.Contains(worker.body, "AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS: '"+retention+"'") {
+		t.Errorf("the worker's AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS is not WebhookQueue's MessageRetentionPeriod (%s)", retention)
 	}
 
 	auth := tpl.resources["AuthFunction"]
