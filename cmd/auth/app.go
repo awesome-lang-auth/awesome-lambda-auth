@@ -117,6 +117,15 @@ type Options struct {
 	// It is auth.UploadStore and not awsintegration.S3API, for the reason
 	// IDPKeySource is not KMSAPI: the SDK stays under internal/integration/aws.
 	UploadStore auth.UploadStore
+
+	// WebhookDeliverer (D9b) injects the transport queued webhooks leave by, in
+	// place of the SQS deliverer, for the reason Mail and SMS are injectable.
+	// Nil builds the real one, lazily. Injecting it switches nothing on —
+	// whether webhooks are queued at all is a question about
+	// tools.outboundWebhooks.queueUrl (webhook_queue.go). It is
+	// auth.WebhookDeliverer and not awsintegration.SQSAPI, for the reason
+	// IDPKeySource is not KMSAPI.
+	WebhookDeliverer auth.WebhookDeliverer
 }
 
 // App is one cold start's worth of state.
@@ -306,7 +315,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// I/O: the stores it is handed are already open and the webhook sender's
 	// client is deferred to the first delivery. With tools.enabled off it
 	// returns nil, and every consumer below reads nil as "no tools block".
-	tools, err := newToolsWiring(ctx, cfg, users, deliver, opts.HTTPClient, log)
+	tools, err := newToolsWiring(ctx, cfg, users, deliver, opts.HTTPClient, opts.WebhookDeliverer, log)
 	if err != nil {
 		return nil, err
 	}
@@ -574,13 +583,19 @@ func buildCore(ctx context.Context, cfg *config.Config, opts Options, users auth
 // Handle is the lambda.Start entrypoint.
 //
 // Its only per-request work is attaching the request id, so a log line can be
-// traced back to an invocation, and handing the payload to the adapter.
+// traced back to an invocation, handing the payload to the adapter, and — with
+// a webhook queue (D9b) — waiting for the enqueues the request started.
 func (a *App) Handle(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
 	log := a.Logger
 	if lc, ok := lambdacontext.FromContext(ctx); ok && lc.AwsRequestID != "" {
 		log = log.With(slog.String("requestId", lc.AwsRequestID))
 	}
-	return a.adapter.Handle(withLogger(ctx, log), payload)
+	resp, err := a.adapter.Handle(withLogger(ctx, log), payload)
+	// D9b: the enqueues this request started finish before the runtime gets the
+	// response and freezes the environment (webhook_queue.go). A no-op without
+	// a webhook queue.
+	flushWebhookQueue(ctx, a.tools, log)
+	return resp, err
 }
 
 // rotationScopeMiddleware installs the DynamoDB refresh-rotation precondition
@@ -1269,6 +1284,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, runtimeSettingsKnobGaps(cfg)...)
 	gaps = append(gaps, adminKnobGaps(cfg)...)
 	gaps = append(gaps, toolsKnobGaps(cfg)...)
+	gaps = append(gaps, webhookQueueKnobGaps(cfg)...) // D9b
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

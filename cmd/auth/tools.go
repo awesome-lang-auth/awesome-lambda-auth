@@ -223,7 +223,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the two seams left empty on purpose ──────────────────────────────────────
+// ── the two seams left to later blocks (D9b fills the first when configured) ─
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries
@@ -232,12 +232,14 @@ import (
 // execution environment the moment the response is written, so a delivery that
 // has not completed by then completes — if the same environment is ever thawed
 // — on some later invocation, and the retry schedule (one, two and four seconds
-// between attempts) is almost never honoured. D9b replaces the deliverer with
-// one that enqueues a signed, numbered WebhookAttempt on SQS and lets a worker
-// reproduce the schedule from Retries() and RetryDelay(). Until then delivery
-// is best-effort, the register says so
+// between attempts) is almost never honoured. D9b fills the seam when
+// tools.outboundWebhooks.queueUrl is set: a deliverer that enqueues the signed,
+// numbered WebhookAttempt on SQS before the response leaves, and a worker that
+// reproduces the schedule from Retries() and RetryDelay() (webhook_queue.go,
+// cmd/webhook-worker). Unset — the default — the in-process deliverer stays,
+// delivery is best-effort, the register says so
 // (outgoing-webhook-delivery-races-the-response), and docs/cost-model.md
-// records what it costs.
+// records what each costs.
 //
 // ScriptRunner is nil. The core runs no inbound-webhook script in process and
 // fails closed without a runner — 400, nothing tracked, and the provider
@@ -267,6 +269,11 @@ type toolsWiring struct {
 	// The stores that were wired, by name, for the cold-start log.
 	telemetry bool
 	webhooks  bool
+
+	// queue is the SQS deliverer (D9b, webhook_queue.go), or nil when
+	// tools.outboundWebhooks.queueUrl is unset and the core's in-process
+	// deliverer is in force. App.Handle flushes it.
+	queue *webhookQueue
 }
 
 // telemetryStoreProvider, webhookStoreProvider and apiKeyStoreProvider are what
@@ -296,7 +303,9 @@ type apiKeyStoreProvider interface {
 // exactly as emailOptions refuses for one with no template store — a refusal
 // that cannot happen on the two drivers this build ships, and stays because
 // the next driver is the one it is for.
-func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStore, deliver *delivery, client *http.Client, log *slog.Logger) (*toolsWiring, error) {
+//
+// queueDeliverer (D9b) is Options.WebhookDeliverer, handed to newWebhookQueue.
+func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStore, deliver *delivery, client *http.Client, queueDeliverer auth.WebhookDeliverer, log *slog.Logger) (*toolsWiring, error) {
 	if !cfg.Tools.Enabled {
 		return nil, nil
 	}
@@ -347,6 +356,15 @@ func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStor
 
 	tw := &toolsWiring{bus: auth.NewEventBus()}
 
+	// D9b: with tools.outboundWebhooks.queueUrl set, the one field D9a left at
+	// the in-process deliverer gets the queued one instead. The sender itself
+	// is the core's — envelope, headers, signature and numbering are
+	// untouched — and only its transport changes (webhook_queue.go).
+	if queue := newWebhookQueue(cfg, queueDeliverer); queue != nil {
+		opts.WebhookSender = &auth.WebhookSender{Deliverer: queue}
+		tw.queue = queue
+	}
+
 	if cfg.Stores.Enable.Telemetry {
 		provider, ok := users.(telemetryStoreProvider)
 		if !ok || provider.Telemetry() == nil {
@@ -369,6 +387,7 @@ func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStor
 			WebhookStore: provider.Webhooks(),
 			maxRetries:   cfg.Tools.OutboundWebhooks.Defaults.MaxRetries,
 			retryDelayMs: cfg.Tools.OutboundWebhooks.Defaults.RetryDelayMs,
+			queue:        tw.queue, // D9b
 		}
 		tw.webhooks = true
 	}
@@ -454,6 +473,10 @@ type webhookDefaults struct {
 	auth.WebhookStore
 	maxRetries   int
 	retryDelayMs int
+	// queue (D9b) is told every config this returns, with the defaults
+	// applied: the snapshot the queued deliverer reads RetryDelay from, and the
+	// count App.Handle waits on (webhook_queue.go). Nil without a queue.
+	queue *webhookQueue
 }
 
 func (w webhookDefaults) FindByEvent(ctx context.Context, event, tenantID string) ([]auth.WebhookConfig, error) {
@@ -470,6 +493,9 @@ func (w webhookDefaults) FindByEvent(ctx context.Context, event, tenantID string
 			delay := w.retryDelayMs
 			configs[i].RetryDelayMs = &delay
 		}
+	}
+	if w.queue != nil { // D9b: the snapshot and the flush count (webhook_queue.go)
+		w.queue.observe(configs)
 	}
 	return configs, nil
 }
@@ -819,7 +845,7 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 		slog.Bool("docs", docsEnabled(cfg)),
 		slog.String("bridge", "on: every identity.* event the auth core raises is persisted to the telemetry store and delivered to every matching outgoing webhook"),
 		slog.String("stream", "not mounted on this runtime: GET "+mount+"/stream answers 404 whatever tools.stream.enabled says, until D9c (deviation tools-stream-is-not-mounted-on-api-gateway)"),
-		slog.String("outgoingWebhooks", "delivered in process on a detached goroutine, which a Lambda freezes with the response: best-effort until D9b (deviation outgoing-webhook-delivery-races-the-response)"))
+		slog.String("outgoingWebhooks", outgoingWebhooksLine(cfg))) // D9b: which deliverer is in force
 
 	// What each guarded posture still costs, said where the operator reads what
 	// came up rather than only in the config reference. The session line is a

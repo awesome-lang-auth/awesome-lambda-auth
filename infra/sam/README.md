@@ -30,6 +30,7 @@ Inside the stack:
 | `AuthDistribution` + `AuthCachePolicy` + `AuthOriginRequestPolicy` | **Only when `EnableCloudFront=true`.** A CloudFront distribution in front of the HTTP API, so the hosted UI and the auth routes share one hostname a custom domain can be attached to. It caches **nothing** — see [The distribution is a front door, not a cache](#the-distribution-is-a-front-door-not-a-cache). **No fixed monthly charge**; the two policies are free. |
 | `IdpSigningKey` + `IdpSigningKeyAlias` | **Only when `EnableIdp=true` and `IdpKmsKeyId` is empty.** An `AWS::KMS::Key`, `KeySpec: RSA_2048`, `KeyUsage: SIGN_VERIFY`, plus `alias/<stack>-idp`. The private half never leaves KMS; the function is granted `kms:Sign` and `kms:GetPublicKey` on this one ARN, and `kms:GetPublicKey` on any ARN in `IdpPreviousKmsKeyArns` — nothing else in the account. **USD 1.00 per month** — see [Cost at rest](#cost-at-rest). |
 | `AdminUploadsBucket` | **Only when `EnableAdminUploads=true`.** A private `AWS::S3::Bucket` for the logos and backgrounds the admin console uploads: every public-access block on, ACLs disabled (`BucketOwnerEnforced`), SSE-S3 at rest, no website configuration. The function is granted `s3:GetObject`/`PutObject`/`DeleteObject` under `uploads/*` and `s3:ListBucket` on the bucket — unconditioned, because S3 answers a missing key 404 only to a caller that may list, and 403 to everyone else — and nothing else in S3; a bucket policy refuses every request that is not over TLS; it serves the objects itself under `<ApiPrefix>/ui/assets/uploads`. **Storage only** — cents — see [Admin console](#admin-console). |
+| `WebhookQueue` + `WebhookDLQ` + `WebhookWorkerFunction` + `WebhookWorkerRole` + its log group + `WebhookDeadLetterAlarm` | **Only when `EnableWebhookQueue=true` and `EnableTools=true`** (D9b). Two SSE-SQS queues (the DLQ keeps 14 days) and a 128 MB arm64 worker on the queue's event source (batch 10, `ReportBatchItemFailures`, at most `WebhookWorkerMaxConcurrency` environments). The auth function gains `sqs:SendMessage` on the queue and the queue URL in its environment, and waits for each enqueue before answering; the worker runs under its own explicit role, `WebhookWorkerRole` — a role SAM generated for an SQS event source would also get the managed `AWSLambdaSQSQueueExecutionRole`, receive and delete on every queue in the account — which holds receive/delete/change-visibility on the queue, `sqs:SendMessage` on the DLQ, `dynamodb:UpdateItem` on the table **only for partition keys starting `IDEM#webhook#`**, and writes to its own log group, and nothing else. **No standing charge** — see [docs/cost-model.md](../../docs/cost-model.md) §3.3 and [docs/config-reference.md](../../docs/config-reference.md) §17.4. |
 
 Both secret resources are skipped when you supply both of `JwtAccessSecretArn` and
 `JwtRefreshSecretArn`. The KMS key is skipped when you supply `IdpKmsKeyId`, and
@@ -585,7 +586,7 @@ in `ConfigFile` for a stack that should not publish it.
 
 ## Observability
 
-Nine alarms, an optional notification target, an optional budget and one rule
+Nine alarms (ten with the D9b webhook queue), an optional notification target, an optional budget and one rule
 about log groups that every later block has to follow. The reasoning for each
 threshold is in the template beside the alarm; the money is in
 [docs/cost-model.md](../../docs/cost-model.md).
@@ -622,7 +623,11 @@ the same mistake in slow motion.
 `EnableAlarms` is `true` by default. The set is **nine standard-resolution alarm
 metrics against CloudWatch's always-free ten**, which is a design constraint and
 not a coincidence: in an account with no other alarms this section is free, and
-it is $0.90/month in one that has already spent the allowance.
+it is $0.90/month in one that has already spent the allowance. The D9b webhook
+queue (`EnableWebhookQueue`) adds exactly one, its dead-letter depth, gated on
+its own switch, so a stack with the queue has ten — still free — and the
+worker's other four metrics are left unalarmed on purpose
+(docs/cost-model.md §3.3).
 
 | alarm | metric | fires at | the incident |
 |---|---|---|---|
@@ -635,8 +640,9 @@ it is $0.90/month in one that has already spent the allowance.
 | `-table-write-capacity` | DynamoDB `ConsumedWriteCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | The same incident one step earlier — 30% of the ceiling. The limiter spends 1 WCU per limited request either way, so this rate is a credential-attempt rate, not a user base |
 | `-table-read-capacity` | DynamoDB `ConsumedReadCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | Where `sessions.checkOn: allcalls` shows up, and where a polling event stream will |
 | `-auth-log-ingestion` | Logs `IncomingBytes`, Sum | ≥ `LogIngestionAlarmBytes` (25 MiB) in 1 hour | A loop that logs per iteration. Retention bounds *storage*; nothing bounds *ingestion*, which is where the ~$0.50/GB is charged |
+| `-webhook-dead-letters` (D9b, only with `EnableWebhookQueue`) | SQS `ApproximateNumberOfMessagesVisible` on the webhook DLQ | ≥ 1 in 5 min | An outgoing webhook gave up: every attempt refused, the receive ceiling reached, about to expire, or a message the worker could not schedule. The message is in the DLQ for 14 days from the hand-off with a `DeadLetterReason`; nothing retries it (docs/config-reference.md §17.4) |
 
-All nine treat missing data as not breaching — an idle stack publishes no Lambda
+All of them (nine, ten with the webhook queue) treat missing data as not breaching — an idle stack publishes no Lambda
 or DynamoDB metrics at all, and an alarm that fires because nothing happened is
 an alarm somebody turns off. None has an `OKActions`: "the alarm cleared" is not
 news, and doubling the mail volume is the reliable way to get alerts filtered
@@ -768,12 +774,12 @@ at rest or billed per request:
   only grows. Ingestion is the line that scales with traffic — roughly **$0.30
   per million requests** at the two lines this binary writes per request, which
   is a quarter of the API Gateway charge for the same traffic.
-- The observability block — nine alarms, the SNS topic, the budget, the anomaly
+- The observability block — nine alarms (ten with `EnableWebhookQueue`), the SNS topic, the budget, the anomaly
   monitor: **$0 at rest.** Nine alarm metrics fit inside CloudWatch's always-free
   ten, the topic and its subscription have no standing charge (and the first
   1 000 email notifications a month are free), the budget is the free second of
   two, and cost anomaly detection is free. In an account that has already spent
-  its ten alarm metrics elsewhere, $0.90/month.
+  its ten alarm metrics elsewhere, $0.90/month ($1.00 with the webhook queue).
 - S3 artifact bucket: a few megabytes per deployed version. Cents.
 - Admin uploads bucket (`EnableAdminUploads=true`): storage at ~$0.023 per
   GB-month — cents for a handful of logos — plus ~$0.0004 per thousand
@@ -847,14 +853,16 @@ not the resource server.
 ## Deploy
 
 ```sh
-# 1. build the artifact (arm64, `bootstrap` at the archive root, reproducible)
-./scripts/build-lambda.sh
+# 1. build the artifacts (arm64, `bootstrap` at the archive root, reproducible) --
+#    one per function the template names, whether or not its switch is on:
+#    `cloudformation package` uploads every CodeUri, and deploy.sh checks them all
+LAMBDAS="auth webhook-worker" ./scripts/build-lambda.sh
 
 # 2. package + deploy. --profile and --region are required and have no defaults.
 ./scripts/deploy.sh --profile <your-profile> --region <your-region>
 ```
 
-`--build` folds step 1 into step 2. The script prints the account it resolved
+`--build` folds step 1 into step 2, building every artifact the template names. The script prints the account it resolved
 and asks for confirmation before it touches anything; `--yes` skips the prompt
 for CI.
 

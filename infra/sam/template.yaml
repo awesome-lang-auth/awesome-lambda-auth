@@ -86,6 +86,8 @@ Metadata:
         Parameters: [EnableCloudFront, CloudFrontAliases, CloudFrontCertificateArn, CloudFrontPriceClass]
       - Label: {default: Admin console}
         Parameters: [EnableAdminConsole, AdminAccessPolicy, AdminRootEmail, AdminRootPasswordHashArn, EnableAdminUploads]
+      - Label: {default: Outgoing webhook queue (D9b)}
+        Parameters: [EnableWebhookQueue, WebhookQueueMaxReceiveCount, WebhookWorkerMaxConcurrency]
       - Label: {default: Observability and alarms}
         Parameters:
           - LogRetentionDays
@@ -761,6 +763,54 @@ Parameters:
       admin console's mount or a path inside it; each of those is refused at
       cold start rather than mounted (internal/config, validateMounts).
 
+  # --- D9b: outgoing webhooks from a queue --------------------------------
+  # Off by default, and off means nothing: no queue, no dead-letter queue, no
+  # worker function, no alarm, no IAM statement and no variable, so the
+  # auth function keeps D9a's in-process deliverer — best-effort on Lambda,
+  # registered as outgoing-webhook-delivery-races-the-response. On (with
+  # EnableTools), each matching delivery is enqueued before the response
+  # leaves and cmd/webhook-worker delivers it on the reference's retry
+  # schedule, dead-lettering a delivery whose attempts are spent
+  # (docs/config-reference.md §17.4, docs/cost-model.md §3.3).
+  EnableWebhookQueue:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      "true" (with EnableTools "true") creates the webhook queue, its
+      dead-letter queue, the webhook worker function and one alarm on the
+      dead-letter queue's depth, and sets
+      AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL on the auth function.
+      Outgoing webhooks are then delivered at least once, retried on the
+      reference's schedule and dead-lettered after the last attempt. "false"
+      creates none of it and costs nothing.
+  WebhookQueueMaxReceiveCount:
+    Type: Number
+    Default: 12
+    MinValue: 2
+    MaxValue: 1000
+    Description: >-
+      The webhook queue's RedrivePolicy.maxReceiveCount: a CEILING on how many
+      times one message is received — attempts, duplicate receives and worker
+      crashes together. The worker enforces each subscription's own retry
+      count and dead-letters it explicitly; this ceiling only cuts a
+      subscription that wants more attempts than it allows (reason
+      receive-ceiling) and catches a message the worker crashes on. The
+      default is the largest attempt count
+      tools.outboundWebhooks.defaults.maxRetries may produce (11) plus one.
+  WebhookWorkerMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 1000
+    Description: >-
+      The most worker execution environments the SQS event source runs at
+      once (ScalingConfig.MaximumConcurrency; SQS's minimum is 2). A burst of
+      events waits on the queue instead of becoming a burst of concurrent
+      POSTs at every receiver. It bounds the RATE the worker spends at, not
+      the total: every message enqueued is eventually received and attempted,
+      so the bill follows arrivals (docs/cost-model.md §3.3).
+
   # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
   # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
@@ -1097,9 +1147,10 @@ Parameters:
   # DynamoDB MaxRead/MaxWriteRequestUnits ceilings. Everything here is how you
   # find out in ten minutes instead of at the end of the month.
   #
-  # Costs. Nine standard-resolution alarm metrics, against a CloudWatch
+  # Costs. Nine standard-resolution alarm metrics (ten with EnableWebhookQueue,
+  # D9b), against a CloudWatch
   # always-free allowance of ten — so in an account with no other alarms this
-  # section is free, and USD 0.90/month in one that has already spent the
+  # section is free, and USD 0.90/month (1.00 with the queue) in one that has already spent the
   # allowance. The SNS topic and its subscription cost nothing at rest and are
   # not created at all unless AlarmEmail is set. The budget is the second budget
   # in an account that has the AWS-provided zero-spend one, and the first two per
@@ -1123,11 +1174,11 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      Create the nine CloudWatch alarms. On by default: they are within the
+      Create the nine CloudWatch alarms (ten with EnableWebhookQueue). On by default: they are within the
       always-free ten alarm metrics, and an unmonitored serverless stack is the
       failure mode this section exists to prevent. Turn them off only in an
       account whose free allowance is already spent and where 0.90 USD/month is
-      not worth it — or where the alarms are managed centrally somewhere else.
+      (1.00 with the queue) not worth it — or where the alarms are managed centrally somewhere else.
 
   # The notification target. Empty is the default and empty means NOTHING is
   # created — no topic, no subscription, no charge — and the alarms are then
@@ -1289,6 +1340,12 @@ Conditions:
   # carry a store nothing reads.
   ToolsEnabled: !Equals [!Ref EnableTools, 'true']
   ToolsAuthApiKey: !And [!Condition ToolsEnabled, !Equals [!Ref ToolsAuth, 'apiKey']]
+  # D9b. The queue only exists beside the block that fills it: a queue with the
+  # tools block off would be two queues and a function nothing enqueues on.
+  WebhookQueueEnabled: !And [!Condition ToolsEnabled, !Equals [!Ref EnableWebhookQueue, 'true']]
+  # The dead-letter alarm follows both switches: EnableAlarms turns the whole
+  # set off in one place, and there is no queue to watch without the other.
+  WebhookQueueAlarmed: !And [!Condition AlarmsEnabled, !Condition WebhookQueueEnabled]
 
   IdpEnabled: !Equals [!Ref EnableIdp, 'true']
   HasIdpIssuer: !Not [!Equals [!Ref IdpIssuer, '']]
@@ -1550,6 +1607,20 @@ Rules:
           AdminRootEmail is set, so AdminRootPasswordHashArn must name the
           Secrets Manager secret holding that user's bcrypt password hash.
           Without it the root login is served and can never succeed.
+
+  # D9b. Parameter-only: EnableTools is always set by this template and a
+  # ConfigFile cannot turn the block on, so a queue asked for without the
+  # block is knowably a queue nothing would fill. WebhookQueueEnabled ANDs
+  # the two and would silently create nothing; this says so instead.
+  WebhookQueueNeedsTheToolsBlock:
+    RuleCondition: !Equals [!Ref EnableWebhookQueue, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref EnableTools, 'true']
+        AssertDescription: >-
+          EnableWebhookQueue is "true", but EnableTools is "false": outgoing
+          webhooks are fanned out by the tools block, so without it nothing
+          would ever be enqueued and no queue is created. Set EnableTools to
+          "true", or EnableWebhookQueue to "false".
 
   # RS-18 at changeset time. The console sits outside the CSRF chain and its
   # guard accepts the ordinary access-token cookie, so that cookie's SameSite
@@ -2129,6 +2200,10 @@ Resources:
           AWESOME_AUTH_STORES_ENABLE_TELEMETRY: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_ENABLE_WEBHOOKS: !If [ToolsEnabled, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_STORES_ENABLE_API_KEYS: !If [ToolsAuthApiKey, 'true', !Ref 'AWS::NoValue']
+          # D9b. The queue's URL (Ref of an SQS queue is its URL), which is
+          # what switches the sender's transport from in-process HTTP to SQS.
+          # Absent without the queue, so the in-process deliverer stands.
+          AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL: !If [WebhookQueueEnabled, !Ref WebhookQueue, !Ref 'AWS::NoValue']
 
           # --- migration from Amazon Cognito -----------------------------
           # The source is derived from the pool id rather than being a parameter
@@ -2607,6 +2682,22 @@ Resources:
                 Resource: !GetAtt AdminUploadsBucket.Arn
           - !Ref 'AWS::NoValue'
 
+        # -----------------------------------------------------------------
+        # D9b. Enqueue on the webhook queue and nothing else: one action, one
+        # queue ARN. No receive, no delete — the worker owns the far side —
+        # and no kms: SSE-SQS uses a key SQS manages, which needs no grant.
+        # -----------------------------------------------------------------
+        - !If
+          - WebhookQueueEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: EnqueueOutgoingWebhooks
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt WebhookQueue.Arn
+          - !Ref 'AWS::NoValue'
+
       Events:
         Root:
           Type: HttpApi
@@ -2622,6 +2713,183 @@ Resources:
             Path: /{proxy+}
             Method: ANY
             PayloadFormatVersion: '2.0'
+
+  # ---------------------------------------------------------------------
+  # D9b: outgoing webhooks from a queue
+  #
+  # Created only with EnableWebhookQueue (and EnableTools) "true". The auth
+  # function enqueues each signed, numbered attempt (sqs:SendMessage above) and
+  # waits for the enqueue before answering; the worker below POSTs it, retries
+  # it by setting the message's visibility to the reference's back-off, and
+  # moves it to the dead-letter queue when the subscription's attempts are
+  # spent. cmd/webhook-worker/worker.go argues every number here.
+  #
+  # Both queues are encrypted at rest with SSE-SQS (a key SQS manages: no
+  # cost, no grant), and neither has a QueueName, for the reason the upload
+  # bucket has no BucketName: a fixed name collides with what a previous stack
+  # left behind. The URLs are in the outputs.
+  # ---------------------------------------------------------------------
+
+  # Fourteen days, SQS's maximum: a dead-lettered webhook is a delivery a
+  # receiver never got, and the alarm below is the only thing that says so, so
+  # the message has to outlive a fortnight of nobody reading the alarm mail.
+  # Fourteen days from the worker's hand-off, which is a new message; one SQS
+  # redrove itself (no DeadLetterReason) keeps its original enqueue time, so it
+  # is kept fourteen days less the time it spent on the webhook queue.
+  #
+  # What sits in both queues: the whole signed request — the receiver URL
+  # (where a Slack- or Zapier-style endpoint keeps its capability token), the
+  # headers and the body, which is every identity.* payload: email addresses
+  # (including what was typed into a failed login), IP, user agent, session id.
+  # Never the subscription's secret. Any principal in this account with
+  # sqs:ReceiveMessage on the queue can read it (docs/config-reference.md §17.4).
+  WebhookDLQ:
+    Type: AWS::SQS::Queue
+    Condition: WebhookQueueEnabled
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  # VisibilityTimeout is six times the worker's timeout (30 s), which is what
+  # SAM and Lambda require of an SQS event source: a message whose invocation
+  # is still running must not reappear. It is also the wait before a message
+  # the worker crashed on is retried — the worker's own back-off replaces it on
+  # every ordinary failure. Retention is the maximum for the same reason as
+  # the DLQ's: a schedule the worker caps at twelve hours per wait must fit.
+  # Past it SQS deletes a message and does NOT redrive it to the DLQ. The worker
+  # is told this number (AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS below;
+  # template_test.go pins the two equal) and dead-letters a failing message
+  # near it as "expiring"; one never received in fourteen days is lost unseen.
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Condition: WebhookQueueEnabled
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookDLQ.Arn
+        maxReceiveCount: !Ref WebhookQueueMaxReceiveCount
+
+  WebhookWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WebhookQueueEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-webhook-worker'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # The worker's execution role, written out rather than generated: see the
+  # note on the function's Role. Five statements, each on one resource, and
+  # no managed policy — a compromised worker can consume this queue, write
+  # to its DLQ, touch the ledger partition and write its own log, nothing else.
+  # No RoleName, for the reason the queues have no QueueName.
+  WebhookWorkerRole:
+    Type: AWS::IAM::Role
+    Condition: WebhookQueueEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: webhook-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # What the event source does on the worker's behalf (receive,
+              # delete, read the queue's attributes) and what the worker does
+              # itself (set a message's visibility to the back-off). The worker
+              # never sends to this queue.
+              - Sid: ConsumeWebhookQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WebhookQueue.Arn
+              # The explicit dead-letter hand-off, with its reason attribute.
+              - Sid: DeadLetterWebhooks
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt WebhookDLQ.Arn
+              # The delivery ledger (data-model.md §1.9) and nothing else in the
+              # table: UpdateItem only, on items whose partition key starts
+              # IDEM#webhook#. The worker can read no user, session or secret.
+              - Sid: WebhookDeliveryLedger
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AuthTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'IDEM#webhook#*'
+              # Its own log group, which exists before the function does
+              # (DependsOn), so no logs:CreateLogGroup. The group's Arn
+              # attribute ends in ":*", which covers its streams.
+              - Sid: WriteWebhookWorkerLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt WebhookWorkerLogGroup.Arn
+
+  WebhookWorkerFunction:
+    Type: AWS::Serverless::Function
+    Condition: WebhookQueueEnabled
+    DependsOn: WebhookWorkerLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook-worker'
+      Description: !Sub 'awesome-lambda-auth outgoing webhook worker for ${AWS::StackName}'
+      # Its own artifact: LAMBDAS="auth webhook-worker" ./scripts/build-lambda.sh.
+      CodeUri: ../../dist/webhook-worker-lambda.zip
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      # The work is waiting on a receiver, not computing: the smallest size.
+      MemorySize: 128
+      # One POST is bounded at 10 s (the core's DefaultWebhookTimeout); a
+      # batch's records run concurrently, so 30 s covers the slowest POST plus
+      # the ledger and SQS calls around it with room to spare.
+      Timeout: 30
+      Environment:
+        Variables:
+          AWESOME_AUTH_WEBHOOK_QUEUE_URL: !Ref WebhookQueue
+          AWESOME_AUTH_WEBHOOK_DLQ_URL: !Ref WebhookDLQ
+          AWESOME_AUTH_WEBHOOK_MAX_RECEIVE_COUNT: !Ref WebhookQueueMaxReceiveCount
+          # WebhookQueue's MessageRetentionPeriod, which CloudFormation does
+          # not expose as an attribute; template_test.go pins the two equal.
+          # The worker dead-letters a failing message ("expiring") rather than
+          # hand it back to a queue that would drop it unseen.
+          AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS: '1209600'
+          AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME: !Ref AuthTable
+      # An explicit role, and no Policies: here. With Policies and an SQS event
+      # source, SAM generates the role and ALSO attaches the AWS managed
+      # AWSLambdaSQSQueueExecutionRole, which grants receive and delete on
+      # every queue in the account (Resource "*"). With Role set, SAM attaches
+      # nothing; the grants are exactly WebhookWorkerRole's below.
+      Role: !GetAtt WebhookWorkerRole.Arn
+      Events:
+        WebhookQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WebhookQueue.Arn
+            # Ten, SQS's standard maximum without a batching window: a burst
+            # is drained in a tenth of the invocations, the records of a batch
+            # run concurrently so its duration is its slowest POST, and a
+            # failure is reported per record, so a batch costs one record's
+            # retry and not ten. No batching window: an event waiting for
+            # company is a webhook delivered late.
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: !Ref WebhookWorkerMaxConcurrency
 
   # ---------------------------------------------------------------------
   # Admin uploads
@@ -2895,7 +3163,7 @@ Resources:
   # Observability
   # =====================================================================
   #
-  # Nine alarms, one optional topic to send them to, one optional budget and one
+  # Nine alarms (ten with EnableWebhookQueue), one optional topic to send them to, one optional budget and one
   # optional anomaly monitor. Each alarm below states the incident it catches and
   # why its threshold is that number, because an alarm whose threshold nobody can
   # justify is an alarm somebody eventually silences.
@@ -3292,6 +3560,58 @@ Resources:
         - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
         - !Ref 'AWS::NoValue'
 
+  # D9b. The one alarm the webhook queue gets, and the one that matters: a
+  # message in the dead-letter queue is a webhook that gave up — its attempts
+  # spent, its receives spent, about to expire, a message the worker could not
+  # schedule, or one it crashed on — and nothing else anywhere says so; the
+  # reference itself swallows the final failure. The worker's own errors,
+  # throttles and duration are deliberately NOT alarmed: each of them either
+  # ends here (a crash loop is redriven into this queue; a failing message
+  # near its retention is dead-lettered as "expiring") or delays delivery, and
+  # four more alarm metrics would break the free allowance this set is designed
+  # against (template_test.go, TestTheAlarmSetStaysInsideTheFreeAllowance).
+  # What this alarm cannot see, and nothing here alarms on: a message that is
+  # never RECEIVED before WebhookQueue's fourteen-day retention — a backlog
+  # deeper than the worker drains in that time, or a worker that cannot start —
+  # is deleted by SQS without a redrive, silently (docs/config-reference.md
+  # §17.4). An alarm on the queue's ApproximateAgeOfOldestMessage would catch
+  # it and would be the eleventh metric, past the free ten; it is left out on
+  # purpose. Gated on its own switch as well as EnableAlarms, so a stack
+  # without the queue has nine alarms and a stack with it has ten.
+  #
+  # Maximum over five minutes, threshold 1: the normal depth is zero. An idle
+  # DLQ publishes nothing, which is not breaching.
+  WebhookDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WebhookQueueAlarmed
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-webhook-dead-letters'
+      AlarmDescription: >-
+        An outgoing webhook was dead-lettered: a receiver did not accept it on
+        any attempt, or the worker could not deliver it at all. The message is
+        in the webhook dead-letter queue (stack output WebhookDeadLetterQueueUrl)
+        with a DeadLetterReason attribute — exhausted, receive-ceiling,
+        busy-at-ceiling, ledger-unavailable, expiring, abandoned-earlier or
+        malformed; none means the worker did not finish its last receive
+        (a crash, a timeout, or a failed hand-off) — and LastStatus, the
+        receiver's last answer. The DLQ keeps it fourteen days from the
+        worker's hand-off; a reasonless one keeps its original enqueue time,
+        so less. Nothing retries it.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt WebhookDLQ.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
   # =====================================================================
   # The budget, and why it is not a second zero-spend budget
   # =====================================================================
@@ -3514,6 +3834,20 @@ Outputs:
     Value: !Ref AuthFunction
     Export:
       Name: !Sub '${AWS::StackName}-FunctionName'
+
+  # D9b. Where queued webhooks wait, and where the ones that gave up are.
+  WebhookQueueUrl:
+    Condition: WebhookQueueEnabled
+    Description: SQS queue the auth function enqueues outgoing webhooks on.
+    Value: !Ref WebhookQueue
+  WebhookDeadLetterQueueUrl:
+    Condition: WebhookQueueEnabled
+    Description: >-
+      Dead-letter queue of outgoing webhooks the worker gave up on, kept 14
+      days from the hand-off (less for one SQS redrove itself, which keeps its
+      enqueue time); each message carries DeadLetterReason and, after a
+      refusal, LastStatus. Nothing redelivers from it automatically.
+    Value: !Ref WebhookDLQ
 
   # The console's front door and, when it exists, the bucket behind its upload
   # tab. The URL is the API's own; behind the distribution the same path is

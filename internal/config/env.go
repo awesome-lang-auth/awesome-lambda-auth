@@ -268,6 +268,8 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION", "tools.outboundWebhooks.payloadVersion", func(c *Config, v string) { c.Tools.OutboundWebhooks.PayloadVersion = v }),
 		envInt("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES", "tools.outboundWebhooks.defaults.maxRetries", func(c *Config, v int) { c.Tools.OutboundWebhooks.Defaults.MaxRetries = v }),
 		envInt("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_RETRY_DELAY_MS", "tools.outboundWebhooks.defaults.retryDelayMs", func(c *Config, v int) { c.Tools.OutboundWebhooks.Defaults.RetryDelayMs = v }),
+		// D9b: the webhook queue.
+		envString("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", "tools.outboundWebhooks.queueUrl", func(c *Config, v string) { c.Tools.OutboundWebhooks.QueueURL = v }),
 
 		// §1.16 rate limiting
 		envBool("AWESOME_AUTH_RATE_LIMIT_ENABLED", "rateLimit.enabled", func(c *Config, v bool) { c.RateLimit.Enabled = v }),

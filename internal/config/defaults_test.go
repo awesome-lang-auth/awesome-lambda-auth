@@ -105,6 +105,7 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		{"tools.outboundWebhooks.payloadVersion", c.Tools.OutboundWebhooks.PayloadVersion, "1"},
 		{"tools.outboundWebhooks.defaults.maxRetries", c.Tools.OutboundWebhooks.Defaults.MaxRetries, 3},
 		{"tools.outboundWebhooks.defaults.retryDelayMs", c.Tools.OutboundWebhooks.Defaults.RetryDelayMs, 1000},
+		{"tools.outboundWebhooks.queueUrl (D9b)", c.Tools.OutboundWebhooks.QueueURL, ""},
 
 		// §1.17 stores
 		{"stores.driver", c.Stores.Driver, StoreDriverMemory},

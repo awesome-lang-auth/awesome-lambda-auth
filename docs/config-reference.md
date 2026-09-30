@@ -2027,6 +2027,7 @@ core publish its `identity.*` events at all.
 | `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — mapped onto the core's `ScriptTimeout` for D9d | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
 | `tools.outboundWebhooks.payloadVersion` | string | `"1"` — the `version` member of every delivered envelope | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION` |
 | `tools.outboundWebhooks.defaults.maxRetries` / `.retryDelayMs` | int | `3` / `1000` — applied to every subscription row that carries no value of its own, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES`, `…_RETRY_DELAY_MS` |
+| `tools.outboundWebhooks.queueUrl` (D9b) | string | empty — the in-process deliverer; an SQS queue URL enqueues every delivery for the webhook worker, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL` |
 
 Three stores are consumed, each behind its `stores.enable.*` flag and each now
 listed by `driverStores` for both drivers (§4.1): `telemetry` (what track and
@@ -2184,7 +2185,7 @@ streaming, its own function at its own memory size (the cost model says why),
 and a distributor, mandatory there. That block clears the unconditional
 `DisableStream`, adds the distributor, retires RS-14 and retires the deviation.
 
-### 17.4 Outgoing webhooks: delivered now, best-effort until D9b
+### 17.4 Outgoing webhooks: in process by default, queued with `tools.outboundWebhooks.queueUrl`
 
 Subscriptions live in the webhook store — rows with a `url`, an `events` list,
 a `secret`, and optional `maxRetries` and `retryDelayMs` — written by the admin
@@ -2203,6 +2204,21 @@ which is what §1.15 of the schema means by "per-webhook rows may override
 them". With the schema defaults, which equal the core's built-in `3` and
 `1000`, the knobs change nothing.
 
+**Which deliverer is in force** is one knob, and the cold-start line
+`tools surface mounted` says which in its `outgoingWebhooks` attribute:
+
+| `tools.outboundWebhooks.queueUrl` | Deliverer | Guarantee | Registered as |
+|---|---|---|---|
+| empty — the default, and the template's with `EnableWebhookQueue` off | the core's in-process HTTP deliverer | best-effort: races the response | `outgoing-webhook-delivery-races-the-response` |
+| an SQS queue URL — the template sets it with `EnableWebhookQueue: "true"` | enqueue on SQS; `cmd/webhook-worker` POSTs | at-least-once, retried on the reference's schedule, dead-lettered after the last attempt | `queued-webhooks-are-delivered-at-least-once`, `queued-webhook-retries-reuse-the-delivery-id` |
+
+The knob is `[new]` (`AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL`); the
+loader refuses a value that is not an `https` URL with a queue path. Set with
+`tools.enabled` off or `stores.enable.webhooks` off it is inert, and the cold
+start reports it as an unwired knob rather than refusing it.
+
+#### Without the queue
+
 **Delivery is best-effort on this runtime**, and that is the registered
 deviation `outgoing-webhook-delivery-races-the-response`. The core delivers on
 a goroutine detached from the request and writes the response without waiting
@@ -2216,11 +2232,117 @@ one that does not may get it late, once, or not at all. Synchronous delivery on
 the request goroutine was rejected — a slow receiver would be a slow login,
 times the schedule, and the function timeout would still lose the tail.
 
-**What D9b brings:** the core's `WebhookDeliverer` seam — which receives a
-fully built, signed, numbered attempt with no secret in it — implemented as an
-SQS enqueue with a dead-letter queue, and a worker that reproduces the schedule
-from the row's `Retries()` and `RetryDelay()`. One field changes in
-`cmd/auth/tools.go`; the deviation retires.
+#### With the queue (D9b)
+
+The core's `WebhookDeliverer` seam receives an attempt that is already built,
+signed and numbered, with no secret in it. The queued deliverer puts it on SQS
+whole — URL, the complete header set with the signature, and the body bytes
+base64-encoded so they arrive as the bytes that were signed — and the webhook
+worker POSTs it with the core's own HTTP deliverer. The envelope, the headers,
+the signature and the numbering are unchanged; only the transport is.
+
+- **The response waits for the enqueue.** A Lambda freezes when it answers, so
+  the auth function waits — at most two seconds — until every delivery the
+  request started is stored on SQS before handing the response to the runtime.
+  That is one `SendMessage` (tens of milliseconds) on the requests that match a
+  subscription, and nothing on the rest. If the bound expires (SQS unreachable,
+  or an enqueue being retried), the response is released and that request's
+  log line says `outgoing webhook enqueue still in flight`. An envelope too
+  large to queue does not wait at all: the refusal is permanent, so the
+  response is released at the first one (see **Size**).
+- **The retry schedule is the reference's, per subscription.** At most the
+  row's `maxRetries` further attempts, the first after its `retryDelayMs`, each
+  wait twice the last — with the defaults, four requests with waits of 1 s, 2 s
+  and 4 s. The count and the delay are the ones the core resolved for the event
+  (the row's own values, or `tools.outboundWebhooks.defaults` for a row with
+  none) and travel with the message, so editing a subscription changes the
+  next event's schedule and never an event already queued. The worker waits by
+  setting the message's visibility: whole seconds, rounded **up**, and capped
+  just under SQS's twelve hours, so a schedule that reaches half a day waits
+  half a day and no longer. The wait is set on one copy of the message: an SQS
+  duplicate copy that happens to be visible when an attempt fails can make the
+  next attempt at once, ahead of the schedule — rare, and it spends a slot of
+  the budget as numbered. An enqueue that fails is retried by the core on the
+  same back-off and **spends one attempt** of the row's budget.
+- **Retries carry the same `X-Webhook-Delivery`.** The reference mints a fresh
+  id per attempt; here every attempt at one queued message carries the id the
+  core minted for the attempt it enqueued, so a receiver sees one id per queued
+  message and can deduplicate the worker's retries and duplicates on it
+  (`queued-webhook-retries-reuse-the-delivery-id`). That is one id per event
+  and subscription in the normal case, not always: an enqueue the core retried
+  after an ambiguous failure is a second message with a second id (next
+  bullet). `X-Correlation-Id` is
+  carried across the queue and set on the POST, as the in-process client does.
+- **At-least-once, with a 24-hour idempotency window.** The worker claims each
+  delivery in a ledger item in the table (`docs/spec/data-model.md` §1.9) before
+  it POSTs, so two copies of one SQS message make one request, and a delivery
+  already acknowledged is never re-sent within 24 hours of its last attempt.
+  The receiver can still see one event twice, which the reference's
+  at-most-once delivery never produces (`queued-webhooks-are-delivered-at-least-once`),
+  in two ways. A worker that stops after the receiver answered and before the
+  ledger recorded it is retried: the same request, same `X-Webhook-Delivery`,
+  twice. And an enqueue that fails ambiguously — the two-second deadline
+  expires after SQS has already stored the message — is enqueued again by the
+  core under a fresh id: two deliveries with two ids, which no header joins; a
+  receiver that must be exactly-once needs a key of its own in the payload.
+  The ledger's window is refreshed at every attempt, so it outlives any wait
+  the schedule sets; a message left waiting more than a day behind a backlog
+  can outlive it, and then gets its attempts again and may be delivered twice.
+- **The dead-letter queue.** When a subscription's attempts are spent, the
+  message goes to the dead-letter queue (the stack output
+  `WebhookDeadLetterQueueUrl`), kept fourteen days from the hand-off, with a
+  `DeadLetterReason` attribute:
+
+  | reason | what happened |
+  |---|---|
+  | `exhausted` | every attempt refused; `LastStatus` is the receiver's last answer, absent after a timeout or a connection failure |
+  | `receive-ceiling` | a refused attempt, with attempts left, on the queue's last receive: the queue's `maxReceiveCount` (template parameter `WebhookQueueMaxReceiveCount`, default 12) ran out first. Every receive counts, including the two below, so a row can meet it with fewer attempts than it asked for |
+  | `busy-at-ceiling` | a duplicate copy, bounced off another invocation's live claim, on its last receive; the other copy carries on, and the ledger says whether it delivered |
+  | `ledger-unavailable` | the ledger could not be reached on the last receive, so no request was made |
+  | `expiring` | a failing message whose next attempt would come within twelve hours of `WebhookQueue`'s fourteen-day retention, after which SQS deletes it without a redrive |
+  | `abandoned-earlier` | a copy received after the delivery was already given up; the first copy carries the real reason, if its hand-off succeeded |
+  | `malformed` | a message the worker could not schedule |
+
+  A message with **no** reason was redriven by SQS itself: the worker did not
+  finish its last receive (it crashed or timed out, or its own hand-off to the
+  DLQ failed). Such a message keeps its original enqueue time, so the DLQ keeps
+  it fourteen days *less* its time on the webhook queue. **A message that is
+  never received within the webhook queue's fourteen days is lost without a
+  trace** — a backlog deeper than the worker drains in that time, or a worker
+  that cannot start: SQS deletes it and redrives nothing, and no alarm watches
+  the queue's age (it would be the eleventh alarm metric, past the free ten;
+  `docs/cost-model.md` §3.3). One alarm watches the DLQ's depth; nothing
+  redelivers from it automatically — replaying a message is sending its body
+  and attributes back to the webhook queue, and it will then carry the same
+  delivery id, which the ledger has already recorded as abandoned, so a replay
+  within 24 hours of the last attempt goes straight back to the dead-letter
+  queue without a request; delete its `IDEM#webhook#<deliveryId>` item first to
+  replay sooner.
+- **Size.** An SQS message is at most 256 KiB, body and attributes together,
+  and base64 makes the envelope budget about 190 KiB. An event whose envelope
+  is larger cannot be queued; the refusal reaches the log as a `tools fan-out`
+  warning, and the response is released at once rather than after the flush
+  bound. What a caller can still cost: nothing caps a `POST <tools>/track`
+  body before it reaches the fan-out, so under `tools.auth: none` anyone, and
+  under `session` any self-registered user (§17.6), can send an event of up to
+  ~190 KiB that a subscription matches and have it queued — three billed SQS
+  requests per `SendMessage`, receive and dead-letter hand-off (SQS bills per
+  64 KB), and the full retry schedule if the receiver refuses it
+  (`docs/cost-model.md` §3.3). Over the budget, the request costs one
+  serialisation and no enqueue.
+- **What a queued message holds, and for how long.** The whole signed
+  request: the receiver URL — where a Slack- or Zapier-style endpoint keeps its
+  capability token — the headers, and the body, which is every `identity.*`
+  payload with its email addresses (including what was typed into a failed
+  login), IP, user agent and session id. Never the subscription's secret. It
+  lives on the webhook queue until it is delivered or dead-lettered (at most
+  fourteen days) and on the DLQ fourteen days more, encrypted at rest (SSE-SQS)
+  and readable by any principal in the account with `sqs:ReceiveMessage` on
+  the queue. A retention policy for personal data has to count both queues.
+
+The stack side is `EnableWebhookQueue` in the SAM template, with
+`EnableTools`; off, none of it exists and nothing of it is billed
+(`docs/cost-model.md` §3.3).
 
 ### 17.5 Inbound webhooks are refused until a runner exists
 
@@ -2469,7 +2591,7 @@ through it and not through any route:
 
 | Block | Seam | What it replaces in `cmd/auth/tools.go` |
 |---|---|---|
-| D9b | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field; retires `outgoing-webhook-delivery-races-the-response` |
+| D9b (landed) | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field, behind `tools.outboundWebhooks.queueUrl`; `outgoing-webhook-delivery-races-the-response` stays for the default, unqueued configuration (§17.4) |
 | D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
 | D9d | `InboundScriptRunner` as its own Lambda | `ScriptRunner: nil`, one field; retires RS-15 and `inbound-webhooks-are-refused-without-a-runner` |
 

@@ -55,9 +55,12 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist}"
 mkdir -p "${OUT_DIR}"
 # LAMBDAS names the cmd/<name> mains to build, one artifact each, so that the
 # functions D9b, D9c and D9d add ship from the same script and the same image.
-# The default builds the auth function alone, which is what every existing
-# caller — CI, deploy.sh, the README — expects; a name with no cmd/<name>
-# directory refuses the whole run rather than producing an empty archive.
+# The default builds the auth function alone. It is no longer enough to deploy:
+# the template names every function's CodeUri whether or not its switch is on,
+# and deploy.sh refuses a missing one. So CI and the README name each function
+# in LAMBDAS (D9b: "auth webhook-worker"), and deploy.sh --build passes its own
+# list, read from the template. A name with no cmd/<name> directory refuses the
+# whole run rather than producing an empty archive.
 LAMBDAS="${LAMBDAS:-auth}"
 for name in ${LAMBDAS}; do
   [ -d "${REPO_ROOT}/cmd/${name}" ] || { echo "LAMBDAS names ${name}, but there is no cmd/${name}" >&2; exit 2; }

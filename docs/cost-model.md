@@ -44,7 +44,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | Lambda, HTTP API | 0.00 | Purely per-request |
 | CloudFront, if enabled | 0.00 | No hourly or monthly charge; the two policies are free |
 | CloudWatch Logs storage | ~0.00 | At 14-day retention and this traffic, a few MB |
-| **The nine alarms** | **0.00** | Nine alarm metrics against a free allowance of ten |
+| **The nine alarms** | **0.00** | Nine alarm metrics against a free allowance of ten; ten with `EnableWebhookQueue` (§3.3), still free |
 | **SNS topic + subscription** | **0.00** | No charge at rest; first 1 000 email notifications a month are free |
 | **The budget** | **0.00** | First two budgets per account are free; this is the second |
 | **Cost anomaly detection** | **0.00** | Free |
@@ -55,7 +55,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
 other alarms, and **USD 0.90 a month** in one that has already spent the free
-allowance — nine alarm metrics at USD 0.10.
+allowance — nine alarm metrics at USD 0.10 (ten, USD 1.00, with `EnableWebhookQueue`, §3.3).
 
 Two things are worth saying plainly about this table. The whole standing bill is
 Secrets Manager and KMS, which are the two resources that exist to keep a signing
@@ -284,10 +284,11 @@ completed by then completes, if ever, on that environment's next invocation
   without waiting. In practice the receiver gets whatever fraction of a second
   the response took to serialise.
 
-D9b moves the attempt onto SQS, at USD 0.40 per million requests after the
-free million, plus one worker invocation per attempt (§3.3): a delivery then
-costs about **USD 0.60 per million attempts** and is actually delivered, with
-the schedule honoured and a dead-letter queue for the ones that never were.
+D9b moves the attempt onto SQS when `EnableWebhookQueue` is on (§3.3): a
+delivery then costs about **USD 4.60 per million attempts**, most of it the
+idempotency ledger's two DynamoDB writes, and is actually delivered, with the
+schedule honoured and a dead-letter queue for the ones that never were. With
+the queue off — the default — everything above stands.
 
 **What the block does not cost.** No new resource, no new parameter with a
 standing charge, no IAM statement: the three stores are partitions of the one
@@ -366,15 +367,114 @@ D9c's decision to record rather than this document's to make.
 
 ### 3.3 The other functions coming
 
-Each one adds four alarm metrics (errors, throttles, duration, concurrency) at
-USD 0.10 a month past the free ten, **and a log group that must be declared
-explicitly or it will never expire** — see §5.
+Each one brings **a log group that must be declared explicitly or it will never
+expire** — see §5 — and would bring four alarm metrics (errors, throttles,
+duration, concurrency) at USD 0.10 a month past the free ten if it took the auth
+function's set. The webhook worker does not; see below.
 
 | | shape of its cost |
 |---|---|
-| webhook worker | Per delivery: one invocation, one outbound request, retries billed again. SQS is USD 0.40 per million requests after the free million a month |
+| webhook worker | **Landed (D9b)**, below |
 | script runner | Per run, and the run is operator-initiated, so the exposure is a script that loops |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
+
+#### The webhook queue and its worker (D9b)
+
+Everything here exists only with `EnableWebhookQueue` (and `EnableTools`)
+`"true"`; the default adds no resource and costs nothing. Unit prices beyond
+the table at the top: **SQS standard, USD 0.40 per million requests after the
+first million a month** (a request is one API call of up to 64 KB; a batch of
+ten is one request). Lambda at 128 MB is **USD 0.0000016667 per second**.
+
+**At rest.**
+
+| resource | USD / month | why |
+|---|---|---|
+| `WebhookQueue`, `WebhookDLQ` | 0.00 | SQS has no hourly or per-queue charge; SSE-SQS encryption is free |
+| `WebhookWorkerFunction` | 0.00 | per invocation only |
+| `WebhookWorkerLogGroup` | ~0.00 | 14-day retention, a line or two per delivery |
+| the event source's empty receives | 0.00 / ~0.26 | Lambda long-polls the queue continuously; at 20-second long polls and the handful of pollers AWS runs for an idle source, that is in the order of 650 000 empty `ReceiveMessage` calls a month — inside the free million, USD ~0.26 in an account that has spent it. An estimate, not a measurement: check the queue's `NumberOfEmptyReceives` after a day |
+| `WebhookDeadLetterAlarm` | 0.00 / 0.10 | the tenth alarm metric — free in an account with no other alarms, USD 0.10 in one that has spent the allowance |
+
+**Per delivery attempt**, a receiver answering in about 200 ms:
+
+| operation | source | USD per million attempts |
+|---|---|---|
+| `SendMessage` from the auth function | `sqs.go`, `SQSWebhookDeliverer` | 0.40 |
+| the auth function waiting for it (~20 ms at 512 MB) | `webhook_queue.go`, the flush | 0.13 |
+| receive + delete by the event source, batched up to ten | Lambda SQS event source | ≤ 0.80, down to 0.08 when batches fill |
+| one worker invocation (a batch shares one) | `cmd/webhook-worker` | ≤ 0.20 |
+| worker duration, ~250 ms at 128 MB | the POST plus the ledger | 0.42 |
+| ledger claim + settle, 1 WCU each | `webhook_deliveries.go`, data-model.md §1.9 | **2.50** |
+| worker log, ~300 bytes | `worker.go` | 0.15 |
+| **total** | | **≈ USD 4.60 per million attempts**, of which the ledger is more than half |
+
+A failed attempt adds one `ChangeMessageVisibility` (USD 0.40 per million) and
+is billed again on the retry; a delivery with the default three retries against
+a dead receiver is four attempts, one DLQ `SendMessage` and nothing after. A
+duplicate receive — rare; SQS standard queues deliver at least once — costs one
+failed conditional write (1 WCU) and one invocation's share, and makes no
+request. A receiver that hangs costs its 10-second timeout at 128 MB, USD
+0.0000167 an attempt, which is why the worker is at the smallest memory size:
+the work is waiting, not computing.
+
+**Concurrency bounds the rate, not the total.** `WebhookWorkerMaxConcurrency`
+(default 5) bounds how many worker environments drain the queue at once, so a
+burst of a hundred thousand logins is a backlog that drains five batches at a
+time rather than a hundred thousand concurrent POSTs at every receiver. It
+does not bound the bill: every message enqueued is eventually received,
+claimed, settled, POSTed and deleted, so every per-attempt line above scales
+with **arrivals**, not with the drain. What concurrency does cap is the
+worker's *duration*: five environments busy for their whole 30-second timeout,
+around the clock, are 5 × 2 592 000 s × USD 0.0000016667 ≈ **USD 21.60 a
+month**, the most worker duration the default can bill in a month whatever
+arrives (a raised `WebhookWorkerMaxConcurrency` scales it linearly); the
+queue, ledger and invocation lines have no such ceiling.
+
+**Who fills the queue.** Anything that raises an event a subscription
+matches, and two of those need no credential at all:
+
+- `identity.auth.login.failed` is published for every refused login, an
+  unauthenticated request (the core's `login_2fa.go`). A subscription to it
+  turns a password-spraying run into one queued delivery per guess, and a
+  receiver that refuses them into four attempts each.
+- `POST <tools>/track/{event}` fires every matching subscription with a
+  caller-chosen payload under `tools.auth: none` (anyone) and `session` (any
+  self-registered user, config reference §17.6). The template's default,
+  `apiKey`, closes it.
+
+§2.8's "costs nothing further because the retry never runs" stops being true
+with the queue on: every such event now gets its full schedule — up to four
+attempts with the defaults, each up to a 10-second hang at 128 MB against a
+receiver that does not answer. And the per-request SQS price assumes a
+message under 64 KB, SQS's billing unit: a `track` payload near the
+~190 KiB envelope budget is **three** billed requests per `SendMessage`,
+receive and DLQ hand-off. A payload over the budget costs no SQS request —
+the enqueue is refused before it is sent — and, since the refusal is
+permanent, the auth function no longer waits out its two-second flush bound
+for it (about USD 0.33 per million requests for a 50 ms request, against
+USD 17 per million had it waited the bound at 512 MB).
+
+**A backlog is free to hold, for fourteen days.** Messages wait on the
+queue at no charge up to `WebhookQueue`'s retention. A failing message near
+it is dead-lettered as `expiring` (config reference §17.4); one never
+received within it — a backlog deeper than the worker drains in fourteen
+days, or a worker that cannot start — is deleted by SQS **silently**, with
+no redrive and no alarm. An alarm on the queue's
+`ApproximateAgeOfOldestMessage` would catch that and would cost USD 0.10 a
+month as the eleventh alarm metric; it is left out to keep the set inside the
+free ten.
+
+**The alarm budget (rule 10 of the block).** The worker adds one alarm, not
+four: `WebhookDeadLetterAlarm` on the dead-letter queue's depth, because a
+webhook that gave up is exactly the event nothing else reports, and every other
+failure of the worker either ends in that queue (a crash loop is redriven into
+it) or only delays a delivery (the message waits). It is gated on the queue's
+switch as well as `EnableAlarms`, so the set is **nine alarms without the queue
+and ten with it** — still inside CloudWatch's free ten, and `template_test.go`'s
+count is unchanged. The worker's errors, throttles, duration and concurrency
+would be four more metrics, USD 0.40 a month past the allowance, and are left
+unalarmed on purpose; the Lambda console shows them for free.
 
 ---
 
@@ -408,7 +508,7 @@ behind. **For this product the fastest spend alarm is not a spend alarm.**
 
 | | USD / month |
 |---|---|
-| Nine alarm metrics, standard resolution | 0.00 (free ten) / 0.90 beyond |
+| Nine alarm metrics, standard resolution (ten with `EnableWebhookQueue`, §3.3) | 0.00 (free ten) / 0.90 beyond (1.00 with the queue) |
 | SNS topic, one email subscription | 0.00 (first 1 000 notifications free; 2.00 per 100 000 after) |
 | One budget | 0.00 (second of two free per account) |
 | Cost anomaly detection | 0.00 |

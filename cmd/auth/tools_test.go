@@ -991,6 +991,28 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_STREAM", "false"),
 			want: []string{"security.jwt.refreshTokenSecret"},
 		},
+		// ── D9b: the webhook queue ──
+		{
+			// Consumed: the tools block fans out to subscriptions, and the
+			// queue is where their attempts go. Not a gap.
+			name: "a webhook queue under the tools block",
+			env:  toolsEnv("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+		},
+		{
+			// With the block off nothing is fanned out, so nothing is enqueued.
+			name: "a webhook queue with the tools block off",
+			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.outboundWebhooks.queueUrl"},
+		},
+		{
+			// With the webhook store off no subscription can match.
+			name: "a webhook queue with the webhook store off",
+			env: toolsEnv("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL,
+				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "false"),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.outboundWebhooks.queueUrl", "tools.stream.enabled"},
+		},
+		// ── end D9b ──
 		{
 			// A tools store switched on with the block off: driverStores lists
 			// it as supported, so it validates, and nothing reads it. Reported,

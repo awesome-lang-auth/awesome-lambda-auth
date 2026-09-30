@@ -27,6 +27,8 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"oauth-callback-skips-the-second-factor",
 		"outgoing-webhook-delivery-races-the-response",
 		"production-by-default",
+		"queued-webhook-retries-reuse-the-delivery-id", // D9b
+		"queued-webhooks-are-delivered-at-least-once",  // D9b
 		"rate-limited-routes-answer-429",
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",

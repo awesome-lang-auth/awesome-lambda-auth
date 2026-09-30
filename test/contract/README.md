@@ -32,11 +32,12 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential,tools,tools-guarded,tools-telemetry,tools-docs`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential,tools,tools-guarded,tools-telemetry,tools-docs,webhook-receiver`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 | `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_PATH` | Where the admin console is mounted, as an absolute path. Default `/admin`, the same default the reference's swagger base and this product's `admin.basePath` use. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` + `AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` | An account the console admits — the configured root user, or a user the operator promoted. **Opt-in and unset by default**, because the suite cannot mint an administrator. Both or neither: one without the other is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_TOOLS_PATH` | Where the tools router is mounted. Default `/tools`, the reference's own `swaggerBasePath` default, beside the api prefix; a deployment that followed the Angular demo and mounted it under the prefix at `<apiPrefix>/tools` sets this to `/auth/tools`. |
+| `AWESOME_AUTH_CONTRACT_WEBHOOK_RECEIVER_URL` + `AWESOME_AUTH_CONTRACT_WEBHOOK_LISTEN` (D9b) | A public URL the deployment can POST to, tunnelled to the address the suite listens on (default `:8787`). **Opt-in and unset by default**, because a Lambda cannot reach the machine running the suite; with it, `tools/outgoing-webhook-reaches-the-receiver-signed` subscribes through the admin API, logs in, and verifies the signed delivery. Needs the admin credential above too. See `cases_webhook_test.go`. |
 
 All of them are passed through `scripts/toolchain.sh` into the container.
 
@@ -480,6 +481,21 @@ on one and skip on the other. It joins the suite with the transport that carries
 it (D9c). Also not covered: the inbound webhook route, which this product refuses
 to mount until a script runner exists (RS-15), and the email and SMS channels of
 notify, which no HTTP route reaches in either tree.
+
+**The outgoing webhook (D9b).** One opt-in case, because the request under test
+is one the deployment makes to the suite, and a Lambda can reach only a public
+URL: `webhook-receiver` is declared by `AWESOME_AUTH_CONTRACT_WEBHOOK_RECEIVER_URL`
+(a tunnel to `AWESOME_AUTH_CONTRACT_WEBHOOK_LISTEN`), never probed. The case also
+skips, with the reason, when the tools router is not mounted (an anonymous
+`POST <tools>/track` answering `404`) or no webhook store is wired (`404` from
+`POST <admin>/api/webhooks`). It does not need `tools`: that capability is the
+router answering this suite's *session*, absent under `tools.auth: apiKey`, and
+the login is fanned out whatever the posture.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `tools/outgoing-webhook-reaches-the-receiver-signed` | the product deviation `library-events-are-bridged-into-the-tools-fan-out` — a login reaches a subscription to `identity.auth.login.success`, which a reference deployment never does, so there it fails by timing out — and the reference's delivery wire (`webhook-sender.ts:17-48`): at least one POST (queued delivery is at-least-once) with `X-Webhook-Event` equal to the body's `event`, a lowercase v4 `X-Webhook-Delivery`, `X-Webhook-Timestamp` in `toISOString` form equal to the body's `timestamp`, an envelope of exactly `event`/`version`/`timestamp`/`data`/`metadata`, and `X-Webhook-Signature: sha256=<hex HMAC-SHA256(secret, raw body)>` for the secret the suite chose | `admin`, `admin-session`, `admin-credential`, `webhook-receiver` |
+
 ## Adding a case
 
 Adding a route to the covered surface is adding a `Case`, never editing the
