@@ -16,9 +16,9 @@
 # account it resolved and refuses to continue without confirmation (or --yes).
 #
 # What it does, in order:
-#   1. checks the artifact exists and really contains an executable `bootstrap`
+#   1. checks every artifact the template names exists and has a `bootstrap`
 #   2. ensures a private, encrypted, versioned S3 bucket for the upload
-#   3. `cloudformation package`  — uploads the zip, rewrites CodeUri to an S3 URI
+#   3. `cloudformation package`  — uploads the zips, rewrites each CodeUri to an S3 URI
 #   4. `cloudformation deploy`   — creates or updates the stack
 #   5. prints the stack outputs
 set -euo pipefail
@@ -29,8 +29,9 @@ TEMPLATE="${REPO_ROOT}/infra/sam/template.yaml"
 # Every artifact the template names in a CodeUri, not only the auth function's:
 # `cloudformation package` uploads each CodeUri whatever the function's
 # Condition, so a stack with EnableWebhookQueue off still needs the webhook
-# worker's zip to package (D9b). Read from the template so that the next
-# function is checked without anybody remembering to add it here.
+# worker's zip to package (D9b), and one with EnableInboundWebhooks off the
+# script runner's (D9d). Read from the template so that the next function is
+# checked without anybody remembering to add it here.
 # A read loop rather than mapfile, which the bash 3.2 macOS ships lacks.
 ARTIFACTS=()
 while IFS= read -r a; do

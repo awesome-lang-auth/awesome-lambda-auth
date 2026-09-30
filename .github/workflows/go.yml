@@ -63,10 +63,12 @@ jobs:
     # and the size check read one list and a function cannot be built and not
     # checked.
     #   D9b: webhook-worker
+    #   D9d: script-runner
     env:
       LAMBDAS: >-
         auth
         webhook-worker
+        script-runner
     steps:
       - uses: actions/checkout@v5
 
