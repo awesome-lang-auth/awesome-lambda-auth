@@ -639,13 +639,13 @@ func TestTemplateStoreRefusesADriverWithoutOne(t *testing.T) {
 // Both drivers back templates: internal/store/dynamodb keeps them on its
 // TEMPLATES partition and the memory driver hangs the core's MemoryTemplateStore
 // off the user store, so email.templatesDir is deployable on either. The
-// refusal mechanism still has to work, because the claim and the store can
-// drift apart again — so the second half used to enable a store no driver
-// backed and require the early, named refusal (rbac, then telemetry, each
-// until a block made it a real switch). Every flag the schema knows is handed
-// over now, so the second half pins the other side of the same claim: both
-// drivers back the same set, and a driver this build does not implement is
-// refused early and by name. Early matters: without it the cold start would
+// second half used to enable a store no driver backed and require the early,
+// named refusal (rbac, then telemetry, each until a block made it a real
+// switch). Every flag the schema knows is handed over now, so checkStoreSupport's
+// per-flag refusal is unreachable through either driver and no test reaches it;
+// the second half pins the other side of the same claim instead: both drivers
+// are known and back the same set, and a driver this build does not implement
+// is refused early and by name. Early matters: without it the cold start would
 // get as far as building the real stores and then fail inside emailOptions
 // with a structural assertion that reads like an internal error.
 func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
@@ -660,8 +660,11 @@ func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
 		}
 	}
 
-	ddb, _ := driverStores(config.StoreDriverDynamoDB)
-	mem, _ := driverStores(config.StoreDriverMemory)
+	ddb, ddbKnown := driverStores(config.StoreDriverDynamoDB)
+	mem, memKnown := driverStores(config.StoreDriverMemory)
+	if !ddbKnown || !memKnown || len(ddb) == 0 || len(mem) == 0 {
+		t.Fatalf("driverStores: dynamodb known=%v (%d stores), memory known=%v (%d stores); the symmetry below would hold vacuously", ddbKnown, len(ddb), memKnown, len(mem))
+	}
 	for name := range ddb {
 		if !mem[name] {
 			t.Errorf("stores.enable.%s is backed on dynamodb and not on memory; the development driver must back what the production one backs", name)

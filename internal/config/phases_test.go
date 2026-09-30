@@ -49,7 +49,7 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 // one is gated.
 func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 	if len(unwiredDomains()) == 0 {
-		t.Skip("every domain is wired; this test retires with the phase gate")
+		t.Skip("every domain is wired; this test speaks again, with a new domain, the day one is gated")
 	}
 	env := baseEnv()
 	env["AWESOME_AUTH_ADMIN_LOGIN_PATH"] = "/console/login"
