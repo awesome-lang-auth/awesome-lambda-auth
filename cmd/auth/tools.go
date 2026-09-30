@@ -821,19 +821,19 @@ func csrfPostureOf(cfg *config.Config) string {
 // Two kinds. The stream and the SSE manager are runtime gaps — the core exposes
 // the field, API Gateway cannot carry the response — and both close with D9c.
 // The three store flags are the other kind: driverStores lists telemetry,
-// webhooks and apiKeys as supported from this block on, because the tools block
-// is what consumes them, and "supported" is a statement about the driver and
-// not about the document. A flag switched on with its one consumer switched off
-// therefore validates and is read by nothing — the state the comment on
-// driverStores says that map exists to refuse. It is reported here rather than
-// refused there because it is harmless and it is how a document is staged: an
-// operator who enables the store one deploy before the block has not made an
-// error. The admin console is the second consumer of two of the three: its
-// routes mint and revoke API keys and manage webhook subscriptions
-// (admin.go, adminOptions hands both stores to the core), so with the console
-// mounted those two flags are read whatever the tools block says, and only
-// telemetry — which reaches a route through ToolsOptions alone — is still
-// inert with the block off.
+// webhooks and apiKeys as supported, because they are consumed by the tools
+// block and, for two of them, by the console, and "supported" is a statement
+// about the driver and not about the document. A flag switched on while every
+// consumer it has is off therefore validates and is read by nothing — the state
+// the comment on driverStores says that map exists to refuse. It is reported
+// here rather than refused there because it is harmless and it is how a
+// document is staged: an operator who enables the store one deploy before the
+// block has not made an error. The admin console is the second consumer of two
+// of the three: its routes mint and revoke API keys and manage webhook
+// subscriptions (admin.go, adminOptions hands both stores to the core), so with
+// the console mounted those two flags are read whatever the tools block says,
+// and only telemetry — which reaches a route through ToolsOptions alone — is
+// still inert with the block off.
 func toolsKnobGaps(cfg *config.Config) []knobGap {
 	var gaps []knobGap
 	inert := func(flag string, on bool, consumer, remedy string) {

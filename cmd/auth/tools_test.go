@@ -842,8 +842,9 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			name: "a tools store with the block off",
 			env: with(baseEnv(),
 				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
-				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "stores.enable.telemetry"},
+				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true",
+				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "true"),
+			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "stores.enable.telemetry", "stores.enable.webhooks"},
 		},
 		{
 			// The same flags beside a mounted console: the console's key and
