@@ -336,9 +336,11 @@ fifteen-minute segment costs add USD 0.0000008.)
    real deployment.
 2. **A ceiling of 20 simultaneous connections** (`SseReservedConcurrency`).
    One connection holds one execution environment, so the reservation is the
-   listener count and the hard cap on this line of the bill: **USD 0.12 an
-   hour, USD 2.88 a day, about USD 88 a month** with every slot held around
-   the clock. It also keeps listeners out of the account pool, so a crowd of
+   listener count and the cap on this line of the bill — the compute: **USD
+   0.12 an hour, USD 2.88 a day, about USD 88 a month** with every slot held
+   around the clock. It is not a cap on the reads below, which grow with the
+   events a listener is sent, nor on refused requests, which it bounds in rate
+   only. It also keeps listeners out of the account pool, so a crowd of
    streams cannot throttle a login. `SseConcurrencyAlarm` fires at 15 held for
    fifteen minutes (§4).
 3. **Fifteen-minute segments** (`SseTimeout`, 900). Lambda's cap, so a
@@ -347,8 +349,8 @@ fifteen-minute segment costs add USD 0.0000008.)
    that vanishes without closing is billed until its segment ends — Lambda
    does not end an invocation because its client went away — so the worst
    case of an abandoned tab is fifteen minutes, USD 0.0015. A shorter timeout
-   trades that for more reconnects, each one an invocation and one replay
-   Query per topic.
+   trades that for more reconnects, each one an invocation and a resume
+   (priced below).
 
 **The poll, which is not noise any more.** The earlier version of this section
 priced a strongly consistent read every 30 seconds and found it an
@@ -362,18 +364,57 @@ latency an event on a live stream is allowed:
 | every 5 s, after a minute of silence | 720 RRU, USD 0.00018 | 1 080 RRU, USD 0.00027 | 3–5 % |
 
 Each Query is **eventually consistent, at DynamoDB's floor of 0.5 RRU** when
-nothing new is returned, which is most polls: the three-second look-back that
-makes an eventually consistent cursor safe (data-model.md §1.5) re-reads a few
-hundred bytes on a busy topic and nothing on a quiet one. A strongly consistent
-poll would cost twice as much and close only half the race the look-back
-exists for. **These are counted, not measured** — the 0.5 RRU floor is
-DynamoDB's documented minimum for a Query — and the check after the first
+nothing new is returned, which is most polls on a quiet topic. A strongly
+consistent poll would cost twice as much and close only half the race the
+look-back exists for. **These are counted, not measured** — the 0.5 RRU floor
+is DynamoDB's documented minimum for a Query — and the check after the first
 deploy is `ConsumedReadCapacityUnits` on the table against the number of
 connections held. The back-off (`tools.sse.pollIntervalMs` then five seconds
 after sixty of silence, snapping back on the next event) is what keeps an idle
 listener, which is most listeners, at the bottom row: a minute is long enough
 that an active conversation never backs off, and four seconds of added latency
 on the first event after a quiet minute is the whole price.
+
+**On a busy topic the table above is not the bill; the events are.** A Query
+is charged on the size of what it reads, 0.5 RRU per 4 KB eventually
+consistent, so per connection:
+
+    RRU per second ≈ Σ over held topics of 0.5 × ⌈(events read per second × item size) / 4 KB⌉ per Query
+    events read per second ≈ events delivered + look-back re-reads
+
+The events delivered are the irreducible part — a listener is sent what the
+topic carries, and every connection holds `global`, which carries every
+identity event. The look-back — the re-read that makes an eventually consistent
+cursor safe (data-model.md §1.5) — is bounded twice: three seconds behind the
+topic's newest event **and** at most 32 events, and a poll that is catching up
+after a full page skips it. So it adds at most one page per paced poll, not
+three seconds of events. Worked through for a busy `global`, **100 identity
+events a second of ~1 KB**: the connection delivers 100 KB/s (about 12.5 RRU/s
+in four pages), and its one paced poll a second re-reads at most 32 KB more (4
+RRU/s) — about **16.5 RRU/s, ~59 000 RRU an hour, USD 0.015 per
+connection-hour**, two and a half times the connection's compute. Twenty such
+listeners are USD 0.30 an hour, about USD 215 a month, against the USD 88 of
+their compute. Without the count bound the same topic would have re-read 300
+events on every poll; with it, three quarters of that bill is the delivery
+itself. At an ordinary auth workload — a few events a second — the reads stay
+at the table above.
+
+**A resume, and what a cursor can cost.** A reconnect with a cursor reads the
+replay once and then polls as above. The replay is bounded by
+`tools.sse.replayLimit` (100 events by default), and a resume from an event's
+id adds one keys-only Query per topic for the look-back below it — at most 33
+items, still charged on their size — and re-reads those ≤ 32 on its first poll:
+
+    RRU per resume ≲ 0.5 × ⌈(replayLimit + 2 × 33 × topics) × item size / 4 KB⌉
+
+At the defaults, two topics and ~1 KB items that is ≲ 30 RRU, **USD 0.0000075
+a resume**; at the 16 KiB item cap, ≲ 470 RRU, USD 0.00012. The bound matters
+because the cursor is the client's to write — the all-zero ULID, or any ULID
+dated to the horizon, is a valid one — and without the limit each such
+connection would page through the whole retention of `global`. With it, the
+worst a credentialed caller does by reconnecting on all twenty slots once a
+second is ~20 × 30 RRU/s, about USD 0.55 an hour at 1 KB items (USD 8.50 at
+the cap), on top of the invocations.
 
 **The publishing half, in the auth function.** With `EnableSse`, every
 broadcast is a `PutItem` per topic a stream can hold — `global` and
@@ -389,12 +430,32 @@ identity event is also fanned to is not written, since no stream can hold it
 
 The writes are awaited on the request goroutine, as the telemetry row is, so
 they are on a login's latency too: two single-digit-millisecond `PutItem`s.
-The TTL delete is free.
+The TTL delete is free. A caller-shaped event is the exception to "under 1 KB":
+`POST <tools>/notify` and `POST <tools>/track` log whatever payload they are
+handed, up to the 16 KiB item cap — 16 WCU a copy, three copies for a track,
+**~USD 0.00006 a request at the cap** — and `SSE#global`'s partition takes a
+thousand WCU a second, so about sixty such requests a second from one
+credential holder fill it, after which logins' publishes to `global` are
+throttled and those events reach no stream (docs/sse.md §4). An event over the
+cap is not written at all.
 
 **Refused requests.** The Function URL is `AuthType: NONE`
-(docs/config-reference.md §17.3), so a caller with no credential costs an
-invocation that answers `404` or the guard's refusal in a few milliseconds:
-about **USD 0.21 per million**, bounded in rate by the reservation.
+(docs/config-reference.md §17.3.3), so every request that reaches it is an
+invocation, and a refused one costs the request charge, a few milliseconds of
+128 MB and its log lines:
+
+| refused request | USD per million |
+|---|---|
+| the path gate's `404` — no line of the product's own, Lambda's `START`/`END`/`REPORT` only | ~0.38 |
+| the stream's guard refusal (`401`/`403`), one access-log line | ~0.51 |
+| under `apiKey`, a real key prefix with a wrong secret: bcrypt at the key's cost, ~1 s at 128 MB | ~2.20 |
+
+The reservation bounds the **rate**, not the total: twenty slots at ~5 ms is
+about 4 000 refusals a second, **USD 5.50–7.30 an hour** sustained. The same
+slots are the listeners', so such a flood also refuses every listener `429`.
+A legitimate `apiKey` connect pays the same bcrypt once per segment, about USD
+0.000002. The mitigations are CloudFront in front, or `EnableSse` off
+(config-reference §17.3.3).
 
 **What it adds at rest: nothing.** The function, its URL, its two permissions,
 its log group and the CloudFront behaviour have no standing charge, and all of
@@ -653,7 +714,8 @@ alarm that catches it and roughly what an unnoticed hour costs.
 
 | incident | per unnoticed hour | caught by |
 |---|---|---|
-| 20 SSE connections held open at 128 MB — the default reservation, full (D9c) | **~0.12**, and no more: past the reservation new listeners are refused | `SseConcurrencyAlarm`, ≥ 15 for 15 min |
+| 20 SSE connections held open at 128 MB — the default reservation, full (D9c) | **~0.12** of compute, and no more of it: past the reservation new listeners are refused `429`, which a native `EventSource` does not retry, so they stay disconnected until the page recreates the source; on a busy `global` add ~0.015 a connection in reads (§3.1) | `SseConcurrencyAlarm`, ≥ 15 for 15 min |
+| A flood of refused requests on the SSE function's public URL (D9c) | **~5.50–7.30** at the ~4 000 a second twenty slots allow, and every listener refused `429` while it lasts | `SseConcurrencyAlarm`, once the flood has held the slots for 15 min |
 | 1 000 SSE connections held open at 512 MB, had the stream no function and no reservation of its own | ~24 | `ConcurrentExecutions` ≥ 50 for 5 min — the auth function's alarm, which is why the stream is not in that function |
 | Function timing out at 10 s instead of answering in 300 ms | ~33× the duration bill for the same traffic | `Duration` ≥ 8 000 ms twice running |
 | Recursive invocation at 50 concurrent, 10 s each | **~24**, plus DynamoDB per iteration | `ConcurrentExecutions`, then `Throttles` |

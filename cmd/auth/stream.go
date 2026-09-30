@@ -144,8 +144,11 @@ func sseLogOptions(cfg *config.Config) ddbstore.SseLogOptions {
 // the resume hook inside the guard.
 //
 // It refuses the cold start for a document that cannot serve a stream, because
-// a Function URL that answered 404 or 503 to every connection would bill an
-// invocation per EventSource retry, forever, while looking deployed.
+// a Function URL that answered 404 or 503 to every connection would look
+// deployed while serving nothing: a native EventSource gives up on the first
+// such answer (it reconnects after nothing but a 200), so the feature would
+// silently not work, and a polyfill that retries would add an invocation per
+// retry.
 func streamToolsOptions(cfg *config.Config, tw *toolsWiring, opts auth.ToolsOptions, log *slog.Logger) (auth.ToolsOptions, error) {
 	switch {
 	case tw == nil:

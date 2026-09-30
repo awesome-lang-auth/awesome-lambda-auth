@@ -741,9 +741,11 @@ Parameters:
       session reads the STORE-WIDE telemetry (every identity.* event the
       bridge records, emails, IP addresses, user agents and session ids
       included), attributes tracked events to any userId in the body and so
-      fires signed outgoing webhooks, and notifies any topic
-      (docs/config-reference.md §17.6). A cookie caller is held to the CSRF
-      double-submit; a bearer caller is not. The reference's default, "none",
+      fires signed outgoing webhooks, and notifies any topic; with EnableSse it
+      also opens GET <ToolsBasePath>/stream, whose global topic carries every
+      identity event's full record live and replays the event log's retention
+      on a hand-written cursor (docs/config-reference.md §17.6). A cookie
+      caller is held to the CSRF double-submit; a bearer caller is not. The reference's default, "none",
       is not offered here and is not reachable through this template at all:
       this variable is set whenever EnableTools is "true", and the
       environment layer overrides ConfigFile, so a document's tools.auth is
@@ -1086,8 +1088,12 @@ Parameters:
   # stream's compute at 20 x USD 0.006 = USD 0.12 an hour, USD 2.88 a day, about
   # USD 88 a month if every slot were held around the clock. It also keeps the
   # listeners out of the account pool the auth function draws from, so a crowd
-  # of streams cannot throttle a login. Past it a new connection is refused with
-  # 429 — which EventSource retries — and SseConcurrencyAlarm says so first.
+  # of streams cannot throttle a login. It caps the compute, not the bill: the
+  # poll's reads grow with the events a listener is sent, and refused requests
+  # share these slots (docs/cost-model.md §3.1). Past it a new connection is
+  # refused with 429, which a native EventSource does not retry — it fails on
+  # any status but 200 — so the page has to recreate it; SseConcurrencyAlarm
+  # says so first.
   # Empty means no reservation, as ReservedConcurrentExecutions does; 0 is a
   # real value and refuses every connection.
   SseReservedConcurrency:
@@ -1098,8 +1104,9 @@ Parameters:
       SseReservedConcurrency must be a whole number of execution environments,
       or empty for no reservation.
     Description: >-
-      Simultaneous SSE connections the stack will hold; the hard cap on the
-      stream's bill. Reserved out of the account's concurrency pool.
+      Simultaneous SSE connections the stack will hold, and so the cap on the
+      stream's compute (not its reads, nor refused requests, which share the
+      slots). Reserved out of the account's concurrency pool.
 
   SseConcurrencyAlarmThreshold:
     Type: Number
@@ -3482,16 +3489,22 @@ Resources:
   # AWS_IAM URL is reachable only through CloudFront's origin access control,
   # which is off by default, and OAC signs the origin request with SigV4 in the
   # Authorization header, so a bearer client's own header could not reach the
-  # guard at all. With NONE the gate is the handler's own — the ToolsAuth guard
-  # the auth function applies, ahead of which only the path gate runs — and an
-  # anonymous caller costs one short invocation and a refusal before any stream
-  # starts, bounded by SseReservedConcurrency.
+  # guard at all. With NONE the gate is the handler's own: the path gate, the
+  # function's outermost handler, 404s everything but GET <ToolsBasePath>/stream,
+  # and then the ToolsAuth guard the auth function applies. Every request that
+  # reaches the URL is an invocation — about USD 0.38 a million for a 404, 0.51
+  # for a guard's refusal, log lines included — bounded in rate by
+  # SseReservedConcurrency and sharing its slots with the listeners
+  # (docs/config-reference.md §17.3.3 prices it, with the mitigations).
   #
   # No Cors block: CORS is the product's own layer, applied to this path exactly
   # as on the auth function (a tools mount beside ApiPrefix is outside it, one
   # under ApiPrefix inside it — cmd/auth/app.go, corsExemptMounts). Configuring
   # the URL's as well is how a response ends up with two
-  # Access-Control-Allow-Origin headers, which a browser rejects.
+  # Access-Control-Allow-Origin headers, which a browser rejects. The URL's host
+  # is never a page's origin, so with CloudFront off and the mount beside
+  # ApiPrefix (the defaults) no browser page can use the stream; the table of
+  # which client reaches it under which posture and topology is docs/sse.md §2.
   SseFunctionUrl:
     Type: AWS::Lambda::Url
     Condition: SseEnabled
@@ -4529,7 +4542,7 @@ Outputs:
     Condition: SseEnabled
     Description: >-
       The SSE function's own Function URL. GET <ToolsBasePath>/stream on it is
-      the stream; every other path answers 404.
+      the stream; every other path and method answers 404.
     Value: !GetAtt SseFunctionUrl.FunctionUrl
     Export:
       Name: !Sub '${AWS::StackName}-SseFunctionUrl'

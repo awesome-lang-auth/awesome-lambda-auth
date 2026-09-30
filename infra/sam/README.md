@@ -545,7 +545,7 @@ decision below.
 | `EnableSse` | `false` | Off creates nothing and changes neither function's environment. |
 | `SseMemorySize` | `128` | Every held stream is billed at this size for its whole life; an idle stream needs no CPU. |
 | `SseTimeout` | `900` | The longest a stream segment lives before the client reconnects with `Last-Event-ID`. Lambda's maximum. |
-| `SseReservedConcurrency` | `20` | Simultaneous listeners, and the hard cap on the stream's bill: USD 0.12 an hour at 128 MB. Empty reserves nothing. **An account whose concurrency limit is low — new accounts can start at 10 — cannot reserve 20;** set a smaller number or empty. |
+| `SseReservedConcurrency` | `20` | Simultaneous listeners, and the cap on the stream's compute: USD 0.12 an hour at 128 MB — not on its reads, which grow with the events a listener is sent, nor on refused requests, which share these slots. Past it a connection is refused `429`, which a native `EventSource` does not retry. Empty reserves nothing. **An account whose concurrency limit is low — new accounts can start at 10 — cannot reserve 20;** set a smaller number or empty. |
 | `SseConcurrencyAlarmThreshold` | `15` | `-sse-concurrency` fires when this many streams are held for fifteen minutes. |
 
 **Where a client connects.** With `EnableCloudFront`, on the distribution at
@@ -559,16 +559,21 @@ control, which needs the distribution, which is off by default — and OAC takes
 over the `Authorization` header, so a bearer client could not authenticate.
 With `NONE` the gate is the function's own: a path gate that answers 404 to
 anything but the stream, then the same `ToolsAuth` guard the auth function
-applies. A caller with no credential costs one short invocation, about USD 0.21
-per million, bounded by the reservation.
+applies. Every request that reaches the URL is an invocation — about USD 0.38
+a million for a 404, 0.51 for a guard's refusal, log lines included — bounded in
+rate by the reservation, whose slots it shares with the listeners; CloudFront
+in front, or `EnableSse` off, are the mitigations (config-reference §17.3.3).
+With CloudFront off and the default `ToolsBasePath`, no browser page can use
+the stream (`docs/sse.md` §2 has which client reaches it under which posture).
 
 **It is the same artifact.** `CodeUri` is `dist/auth-lambda.zip`, so there is
 nothing new to build and the 12 MiB budget CI checks is the one it already
 checks; the function is told which entry point to run by
 `AWESOME_AUTH_ENTRYPOINT=stream`. Its environment is a subset of the auth
 function's, line for line (`template_test.go` pins it), and its role is
-narrower: `GetItem`, `Query`, `BatchGetItem` and `UpdateItem` (the API-key
-`lastUsedAt` stamp) on the table, and the signing secret. A `ConfigFile` that
+narrower: `GetItem`, `Query` and `BatchGetItem` on the table, `UpdateItem` only
+under `ToolsAuth=apiKey` and only on `APIKEY#*` items (the API-key `lastUsedAt`
+stamp, `dynamodb:LeadingKeys`), and the signing secret. A `ConfigFile` that
 switches on something the stream role's grant does not cover — the identity
 provider's KMS key, a runtime-settings seed that writes — makes the SSE
 function's cold start fail loudly rather than be granted the permission.

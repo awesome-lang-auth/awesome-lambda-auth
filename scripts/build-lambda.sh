@@ -5,7 +5,8 @@
 #   ARCH=amd64 ./scripts/build-lambda.sh      # dist/auth-amd64.zip
 #   OUT_DIR=/tmp/x ./scripts/build-lambda.sh
 #   LAMBDAS="auth webhook-worker script-runner" ./scripts/build-lambda.sh
-#                                             # one dist/<name>-<arch>.zip per cmd/<name>
+#                                             # one dist/<name>-<arch>.zip per cmd/<name>; the SSE
+#                                             # function (D9c) is the auth artifact, so it has no name here
 #   CONFIG_FILE=./awesome-auth.json TEMPLATES_DIR=./templates ./scripts/build-lambda.sh
 #                                             # bake a config document and mail templates in
 #
