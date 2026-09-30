@@ -807,8 +807,9 @@ Parameters:
       The most worker execution environments the SQS event source runs at
       once (ScalingConfig.MaximumConcurrency; SQS's minimum is 2). A burst of
       events waits on the queue instead of becoming a burst of concurrent
-      POSTs at every receiver, and the worker's bill is bounded by the rate
-      it drains at rather than by the rate events arrive.
+      POSTs at every receiver. It bounds the RATE the worker spends at, not
+      the total: every message enqueued is eventually received and attempted,
+      so the bill follows arrivals (docs/cost-model.md §3.3).
 
   # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
@@ -2731,6 +2732,16 @@ Resources:
   # Fourteen days, SQS's maximum: a dead-lettered webhook is a delivery a
   # receiver never got, and the alarm below is the only thing that says so, so
   # the message has to outlive a fortnight of nobody reading the alarm mail.
+  # Fourteen days from the worker's hand-off, which is a new message; one SQS
+  # redrove itself (no DeadLetterReason) keeps its original enqueue time, so it
+  # is kept fourteen days less the time it spent on the webhook queue.
+  #
+  # What sits in both queues: the whole signed request — the receiver URL
+  # (where a Slack- or Zapier-style endpoint keeps its capability token), the
+  # headers and the body, which is every identity.* payload: email addresses
+  # (including what was typed into a failed login), IP, user agent, session id.
+  # Never the subscription's secret. Any principal in this account with
+  # sqs:ReceiveMessage on the queue can read it (docs/config-reference.md §17.4).
   WebhookDLQ:
     Type: AWS::SQS::Queue
     Condition: WebhookQueueEnabled
@@ -2744,6 +2755,10 @@ Resources:
   # the worker crashed on is retried — the worker's own back-off replaces it on
   # every ordinary failure. Retention is the maximum for the same reason as
   # the DLQ's: a schedule the worker caps at twelve hours per wait must fit.
+  # Past it SQS deletes a message and does NOT redrive it to the DLQ. The worker
+  # is told this number (AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS below;
+  # template_test.go pins the two equal) and dead-letters a failing message
+  # near it as "expiring"; one never received in fourteen days is lost unseen.
   WebhookQueue:
     Type: AWS::SQS::Queue
     Condition: WebhookQueueEnabled
@@ -3546,16 +3561,22 @@ Resources:
 
   # D9b. The one alarm the webhook queue gets, and the one that matters: a
   # message in the dead-letter queue is a webhook that gave up — its attempts
-  # spent, its subscription past the receive ceiling, a message the worker could
-  # not schedule, or one it crashed on — and nothing else anywhere says so; the
+  # spent, its receives spent, about to expire, a message the worker could not
+  # schedule, or one it crashed on — and nothing else anywhere says so; the
   # reference itself swallows the final failure. The worker's own errors,
   # throttles and duration are deliberately NOT alarmed: each of them either
-  # ends here (a crash loop is redriven into this queue) or delays delivery
-  # without losing it (the message waits up to fourteen days), and four more
-  # alarm metrics would break the free allowance this set is designed against
-  # (template_test.go, TestTheAlarmSetStaysInsideTheFreeAllowance). Gated on
-  # its own switch as well as EnableAlarms, so a stack without the queue has
-  # nine alarms and a stack with it has ten.
+  # ends here (a crash loop is redriven into this queue; a failing message
+  # near its retention is dead-lettered as "expiring") or delays delivery, and
+  # four more alarm metrics would break the free allowance this set is designed
+  # against (template_test.go, TestTheAlarmSetStaysInsideTheFreeAllowance).
+  # What this alarm cannot see, and nothing here alarms on: a message that is
+  # never RECEIVED before WebhookQueue's fourteen-day retention — a backlog
+  # deeper than the worker drains in that time, or a worker that cannot start —
+  # is deleted by SQS without a redrive, silently (docs/config-reference.md
+  # §17.4). An alarm on the queue's ApproximateAgeOfOldestMessage would catch
+  # it and would be the eleventh metric, past the free ten; it is left out on
+  # purpose. Gated on its own switch as well as EnableAlarms, so a stack
+  # without the queue has nine alarms and a stack with it has ten.
   #
   # Maximum over five minutes, threshold 1: the normal depth is zero. An idle
   # DLQ publishes nothing, which is not breaching.
@@ -3568,9 +3589,13 @@ Resources:
         An outgoing webhook was dead-lettered: a receiver did not accept it on
         any attempt, or the worker could not deliver it at all. The message is
         in the webhook dead-letter queue (stack output WebhookDeadLetterQueueUrl)
-        for fourteen days, with a DeadLetterReason attribute — exhausted,
-        receive-ceiling or malformed; none means the worker crashed on it —
-        and LastStatus, the receiver's last answer. Nothing retries it.
+        with a DeadLetterReason attribute — exhausted, receive-ceiling,
+        busy-at-ceiling, ledger-unavailable, expiring, abandoned-earlier or
+        malformed; none means the worker did not finish its last receive
+        (a crash, a timeout, or a failed hand-off) — and LastStatus, the
+        receiver's last answer. The DLQ keeps it fourteen days from the
+        worker's hand-off; a reasonless one keeps its original enqueue time,
+        so less. Nothing retries it.
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
@@ -3818,8 +3843,9 @@ Outputs:
     Condition: WebhookQueueEnabled
     Description: >-
       Dead-letter queue of outgoing webhooks the worker gave up on, kept 14
-      days; each message carries DeadLetterReason and, after a refusal,
-      LastStatus. Nothing redelivers from it automatically.
+      days from the hand-off (less for one SQS redrove itself, which keeps its
+      enqueue time); each message carries DeadLetterReason and, after a
+      refusal, LastStatus. Nothing redelivers from it automatically.
     Value: !Ref WebhookDLQ
 
   # The console's front door and, when it exists, the bucket behind its upload

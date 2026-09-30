@@ -33,11 +33,12 @@ import (
 //     can be scheduled, and guessing a delay or a URL would be delivering
 //     something nobody enqueued.
 //  2. Claim the delivery in the ledger (data-model.md §1.9). delivered →
-//     acknowledge, no request. abandoned → make sure it is in the DLQ,
-//     acknowledge. busy → another invocation holds a live claim on the same
-//     delivery id — a duplicate receive — so report a batch-item failure with
-//     the visibility set to the end of that lease and do NOT acknowledge: this
-//     copy may be the one the other claimant's retry depends on.
+//     acknowledge, no request. abandoned → make sure it is in the DLQ
+//     ("abandoned-earlier"), acknowledge. busy → another invocation holds a
+//     live claim on the same delivery id — a duplicate receive — so report a
+//     batch-item failure with the visibility set to the end of that lease and
+//     do NOT acknowledge: this copy may be the one the other claimant's retry
+//     depends on. The ledger unreachable → no request, back to the queue.
 //  3. POST, with the core's own HTTP deliverer, the headers and body exactly as
 //     the core built them. The only header added is X-Correlation-Id, which the
 //     in-process path adds in its transport too; the signature covers the body
@@ -64,24 +65,44 @@ import (
 // than hidden:
 //
 //   - Visibility is whole seconds and at most twelve hours from the receive.
-//     A wait is rounded UP to the second — never earlier than the reference —
-//     and capped just under twelve hours. With the defaults (1 s, three
-//     retries: waits of 1, 2 and 4 s) neither bites; a subscription whose
-//     schedule reaches half a day waits half a day rather than longer.
+//     A wait is rounded UP to the second — never earlier than the reference
+//     for the copy the wait is set on — and capped just under twelve hours.
+//     With the defaults (1 s, three retries: waits of 1, 2 and 4 s) neither
+//     bites; a subscription whose schedule reaches half a day waits half a day
+//     rather than longer. The visibility is a property of one receipt, not of
+//     the delivery: an SQS duplicate copy of the message that happens to be
+//     visible when an attempt fails can claim the settled "failed" at once and
+//     make the next attempt early. It spends a slot of the budget as numbered,
+//     and standard-queue duplicates are rare; closing it would take a
+//     retry-after time in the ledger and a fourth branch in the claim, which is
+//     not bought here.
 //   - The queue's redrive policy has one maxReceiveCount for every message,
 //     and Retries() is per subscription. So the queue's count is a CEILING on
-//     receives — attempts, duplicate bounces and crashes together — and the
-//     per-subscription count is enforced here, by the ledger, with an explicit
-//     dead-letter when it is spent. The ceiling only decides a delivery whose
-//     subscription wants more attempts than the stack allows: when a failure
-//     arrives on the receive that the queue would redrive next, the worker
-//     dead-letters it itself with reason "receive-ceiling", so that nothing
-//     reaches the DLQ without saying why except a message the worker crashed
-//     on maxReceiveCount times. The template's default ceiling is twelve
-//     receives: the largest attempt count the schema lets
-//     tools.outboundWebhooks.defaults.maxRetries produce (10 retries, 11
-//     attempts) plus one receive of slack for a duplicate or a crash. Only a
-//     row given more retries through the admin API meets the ceiling.
+//     receives — attempts, duplicate bounces, receives that met the ledger
+//     unreachable, and crashes together: every one of them is a receive — and
+//     the per-subscription count is enforced here, by the ledger, with an
+//     explicit dead-letter when it is spent. Whenever a receive would hand the
+//     message back to the queue and it is the receive the queue would redrive
+//     next, the worker dead-letters it itself, with the reason that held it
+//     back: "receive-ceiling" after a refused POST with attempts left,
+//     "busy-at-ceiling" after a duplicate bounce, "ledger-unavailable" when no
+//     claim could be made. So a message reaches the DLQ without a reason only
+//     when the worker did not finish its last receive at all — it crashed or
+//     timed out on it, or the hand-off to the DLQ itself failed. The
+//     template's default ceiling is twelve receives: the largest attempt count
+//     the schema lets tools.outboundWebhooks.defaults.maxRetries produce (10
+//     retries, 11 attempts) plus one receive of slack. A row given more
+//     retries through the admin API meets the ceiling, and so can a row at the
+//     schema's maximum whose receives were also spent on bounces or on the
+//     ledger — the price of one number for the whole queue.
+//   - The queue keeps a message for its MessageRetentionPeriod (fourteen days
+//     in the template) from the original enqueue, and then deletes it without
+//     redriving it anywhere. A message this worker would hand back with less
+//     than expiryMargin of that left after its wait is dead-lettered instead,
+//     reason "expiring", where it gets a fresh fourteen days and the alarm. A
+//     message that is never received before it expires — a backlog deeper than
+//     the worker drains, or a worker that cannot start — is beyond this: SQS
+//     drops it unseen, and the docs say so (config-reference.md §17.4).
 
 // ledger is the slice of the DynamoDB store the worker uses: the delivery
 // ledger and nothing else. *ddbstore.Store satisfies it.
@@ -93,12 +114,31 @@ type ledger interface {
 var _ ledger = (*ddbstore.Store)(nil)
 
 // Dead-letter reasons, written as the DeadLetterReason attribute on the copy
-// the DLQ receives.
+// the DLQ receives. The file header says when each is written.
 const (
-	reasonMalformed      = "malformed"
-	reasonExhausted      = "exhausted"
-	reasonReceiveCeiling = "receive-ceiling"
+	reasonMalformed         = "malformed"
+	reasonExhausted         = "exhausted"
+	reasonReceiveCeiling    = "receive-ceiling"
+	reasonBusyAtCeiling     = "busy-at-ceiling"
+	reasonLedgerUnavailable = "ledger-unavailable"
+	reasonExpiring          = "expiring"
+	// reasonAbandonedEarlier is a receive that found the ledger already
+	// abandoned: an earlier receive gave the delivery up and handed a copy to
+	// the DLQ with the real reason — or tried to and failed, which is why this
+	// one hands another. The ledger does not keep the first reason, so this
+	// copy does not repeat one it cannot know.
+	reasonAbandonedEarlier = "abandoned-earlier"
 )
+
+// expiryMargin is how much of the queue's retention a message must still have
+// after the wait it is handed back with, or it is dead-lettered as expiring:
+// twelve hours, which is the longest wait the worker sets, again — room for a
+// message to sit visible behind a backlog before it is received.
+const expiryMargin = 12 * time.Hour
+
+// queueDefault as a hand-back wait leaves the message's visibility to the
+// queue's own VisibilityTimeout rather than setting one.
+const queueDefault time.Duration = -1
 
 // maxVisibility is the longest wait the worker asks SQS for: twelve hours,
 // SQS's maximum counted from the receive, less a minute for the time this
@@ -121,6 +161,9 @@ type worker struct {
 	dlqURL   string
 	// maxReceives is the queue's RedrivePolicy.maxReceiveCount.
 	maxReceives int
+	// retention is the queue's MessageRetentionPeriod; zero turns the
+	// expiring check off.
+	retention time.Duration
 
 	now func() time.Time
 	log *slog.Logger
@@ -210,7 +253,7 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		// timeout; POSTing without a claim would give up the one guarantee
 		// the ledger exists for.
 		log.Warn("webhook delivery claim failed; the message will be retried", slog.String("error", err.Error()))
-		return false
+		return w.handBack(ctx, rec, queueDefault, reasonLedgerUnavailable, 0, nil, log)
 	}
 
 	switch claimed.Outcome {
@@ -221,7 +264,7 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		// The budget was spent on an earlier receive; the hand-off to the DLQ
 		// may not have completed, so make sure of it. A second copy in the
 		// DLQ is the cheap failure; none is the expensive one.
-		return w.deadLetter(ctx, rec, reasonExhausted, 0, log)
+		return w.deadLetter(ctx, rec, reasonAbandonedEarlier, 0, log)
 	case ddbstore.WebhookClaimBusy:
 		wait := claimed.BusyUntil.Sub(w.now())
 		if wait < time.Second {
@@ -229,8 +272,10 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		}
 		log.Info("webhook delivery is held by another invocation; retrying after its lease",
 			slog.Duration("after", wait))
-		w.setVisibility(ctx, rec, wait, log)
-		return false
+		// At the ceiling this copy is dead-lettered rather than redriven
+		// without a reason. The live claimant keeps its own copy; if it
+		// delivers, this DLQ copy is a duplicate the ledger shows as delivered.
+		return w.handBack(ctx, rec, wait, reasonBusyAtCeiling, 0, nil, log)
 	case ddbstore.WebhookClaimGranted:
 	default:
 		log.Error("webhook delivery claim returned an unknown outcome", slog.Int("outcome", int(claimed.Outcome)))
@@ -273,18 +318,59 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		log.Warn("webhook delivery gave up after its last attempt; dead-lettering", slog.String("reason", reasonExhausted))
 		return w.deadLetter(ctx, rec, reasonExhausted, status, log)
 	}
-	if w.maxReceives > 0 && receiveCount(rec) >= w.maxReceives {
-		w.settle(ctx, claimed.Claim, ddbstore.WebhookDeliveryAbandoned, log)
-		log.Warn("webhook delivery reached the queue's receive ceiling with attempts left; dead-lettering",
-			slog.String("reason", reasonReceiveCeiling), slog.Int("maxReceiveCount", w.maxReceives))
-		return w.deadLetter(ctx, rec, reasonReceiveCeiling, status, log)
-	}
-
-	w.settle(ctx, claimed.Claim, ddbstore.WebhookDeliveryFailed, log)
 	wait := backoff(q.retryDelay, attemptNo)
 	log.Info("webhook delivery failed; retrying after the back-off", slog.Duration("after", wait))
-	w.setVisibility(ctx, rec, wait, log)
+	return w.handBack(ctx, rec, wait, reasonReceiveCeiling, status, &claimed.Claim, log)
+}
+
+// handBack returns a record to the queue for another receive after wait —
+// settling its claim, if it holds one, as failed — unless the queue would not
+// give it one: on the receive the queue would redrive next (atCeiling names
+// what held it back) or when the message would expire first ("expiring"). In
+// those two cases it dead-letters the record itself, with the reason, and
+// settles a held claim as abandoned. It returns process's answer.
+func (w *worker) handBack(ctx context.Context, rec events.SQSMessage, wait time.Duration, atCeiling string, status int, claim *ddbstore.WebhookClaim, log *slog.Logger) bool {
+	reason := ""
+	switch {
+	case w.maxReceives > 0 && receiveCount(rec) >= w.maxReceives:
+		reason = atCeiling
+		log.Warn("webhook message is on the queue's last receive with its delivery unfinished; dead-lettering it rather than let the queue redrive it without a reason",
+			slog.String("reason", reason), slog.Int("maxReceiveCount", w.maxReceives))
+	case w.expiresFirst(rec, wait):
+		reason = reasonExpiring
+		log.Warn("webhook message would reach the queue's retention before its next attempt; dead-lettering it rather than let SQS drop it",
+			slog.String("reason", reason), slog.Duration("retention", w.retention))
+	}
+	if reason != "" {
+		if claim != nil {
+			w.settle(ctx, *claim, ddbstore.WebhookDeliveryAbandoned, log)
+		}
+		return w.deadLetter(ctx, rec, reason, status, log)
+	}
+	if claim != nil {
+		w.settle(ctx, *claim, ddbstore.WebhookDeliveryFailed, log)
+	}
+	if wait != queueDefault {
+		w.setVisibility(ctx, rec, wait, log)
+	}
 	return false
+}
+
+// expiresFirst reports whether a record handed back with wait would have less
+// than expiryMargin of the queue's retention left when it next becomes
+// visible. The age is SQS's SentTimestamp, the original enqueue — which a
+// visibility change does not reset.
+func (w *worker) expiresFirst(rec events.SQSMessage, wait time.Duration) bool {
+	if w.retention <= 0 {
+		return false
+	}
+	ms, err := strconv.ParseInt(rec.Attributes["SentTimestamp"], 10, 64)
+	if err != nil || ms <= 0 {
+		return false
+	}
+	wait = min(max(wait, 0), maxVisibility)
+	age := w.now().Sub(time.UnixMilli(ms))
+	return age+wait+expiryMargin >= w.retention
 }
 
 // settle records a claim's outcome. A failure is logged and not acted on: the

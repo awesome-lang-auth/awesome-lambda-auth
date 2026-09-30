@@ -22,11 +22,12 @@
 //
 // # Environment
 //
-//	AWESOME_AUTH_WEBHOOK_QUEUE_URL             the webhook queue (for ChangeMessageVisibility)
-//	AWESOME_AUTH_WEBHOOK_DLQ_URL               the dead-letter queue
-//	AWESOME_AUTH_WEBHOOK_MAX_RECEIVE_COUNT     the queue's RedrivePolicy.maxReceiveCount
-//	AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME  the table holding the delivery ledger
-//	AWESOME_AUTH_STORES_CONNECTION_ENDPOINT    optional: DynamoDB Local, for development
+//	AWESOME_AUTH_WEBHOOK_QUEUE_URL                the webhook queue (for ChangeMessageVisibility)
+//	AWESOME_AUTH_WEBHOOK_DLQ_URL                  the dead-letter queue
+//	AWESOME_AUTH_WEBHOOK_MAX_RECEIVE_COUNT        the queue's RedrivePolicy.maxReceiveCount
+//	AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS  the queue's MessageRetentionPeriod
+//	AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME     the table holding the delivery ledger
+//	AWESOME_AUTH_STORES_CONNECTION_ENDPOINT       optional: DynamoDB Local, for development
 //
 // All but the last are required and a missing one fails the init, which the
 // Lambda service reports and retries — better than a worker that acknowledges
@@ -55,6 +56,7 @@ const (
 	envQueueURL    = "AWESOME_AUTH_WEBHOOK_QUEUE_URL"
 	envDLQURL      = "AWESOME_AUTH_WEBHOOK_DLQ_URL"
 	envMaxReceives = "AWESOME_AUTH_WEBHOOK_MAX_RECEIVE_COUNT"
+	envRetention   = "AWESOME_AUTH_WEBHOOK_QUEUE_RETENTION_SECONDS"
 	envTable       = "AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME"
 	envEndpoint    = "AWESOME_AUTH_STORES_CONNECTION_ENDPOINT"
 )
@@ -100,6 +102,14 @@ func newWorker(ctx context.Context, getenv func(string) (string, bool), log *slo
 	if err != nil || maxReceives < 1 {
 		return nil, fmt.Errorf("%s must be a positive whole number, got %q", envMaxReceives, rawMax)
 	}
+	rawRetention, err := get(envRetention)
+	if err != nil {
+		return nil, err
+	}
+	retention, err := strconv.Atoi(rawRetention)
+	if err != nil || retention < 1 {
+		return nil, fmt.Errorf("%s must be a positive whole number of seconds, got %q", envRetention, rawRetention)
+	}
 	endpoint, _ := getenv(envEndpoint)
 
 	client, err := awsintegration.NewDynamoDBClient(ctx, awsintegration.DynamoDBOptions{Endpoint: strings.TrimSpace(endpoint)})
@@ -121,6 +131,7 @@ func newWorker(ctx context.Context, getenv func(string) (string, bool), log *slo
 		queueURL:    queueURL,
 		dlqURL:      dlqURL,
 		maxReceives: maxReceives,
+		retention:   time.Duration(retention) * time.Second,
 		now:         time.Now,
 		log:         log,
 	}, nil

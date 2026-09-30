@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -315,10 +316,123 @@ func TestWorkerReproducesTheReferenceSchedule(t *testing.T) {
 		}
 	}
 	// And a fifth receive — an SQS duplicate of the dead-lettered message —
-	// makes no request.
+	// makes no request, and hands a second copy to the DLQ under a reason that
+	// does not claim to know the first one's.
 	handle(t, w, record(msg, "m1", 5))
 	if len(rcv.requests) != 4 {
 		t.Errorf("an abandoned delivery was POSTed again")
+	}
+	if len(q.sent) != 2 {
+		t.Fatalf("%d DLQ sends after the duplicate, want 2", len(q.sent))
+	}
+	if r := awssdk.ToString(q.sent[1].MessageAttributes[awsintegration.WebhookAttrDeadLetterReason].StringValue); r != reasonAbandonedEarlier {
+		t.Errorf("the duplicate's DeadLetterReason = %q, want %q", r, reasonAbandonedEarlier)
+	}
+}
+
+// unreachableLedger is the ledger during a DynamoDB outage.
+type unreachableLedger struct{}
+
+func (unreachableLedger) ClaimWebhookDelivery(context.Context, string, string, time.Time) (ddbstore.WebhookClaimResult, error) {
+	return ddbstore.WebhookClaimResult{}, errors.New("throttled")
+}
+
+func (unreachableLedger) SettleWebhookDelivery(context.Context, ddbstore.WebhookClaim, ddbstore.WebhookDeliveryState) error {
+	return errors.New("throttled")
+}
+
+// TestWorkerNeverLetsTheQueueRedriveWithoutAReason: every path that hands a
+// record back to the queue — not only a refused POST — checks the receive
+// ceiling, so a message the worker handled on its last receive reaches the DLQ
+// with the reason that held it back, and never as SQS's reasonless redrive.
+func TestWorkerNeverLetsTheQueueRedriveWithoutAReason(t *testing.T) {
+	t.Parallel()
+	rcv := newReceiver(t, http.StatusOK)
+	built, msg := coreAttempts(t, rcv.url(), 3, 1000)
+
+	for name, tc := range map[string]struct {
+		ledger func() ledger
+		want   string
+	}{
+		"the ledger is unreachable": {func() ledger { return unreachableLedger{} }, reasonLedgerUnavailable},
+		"a live claim holds the delivery": {func() ledger {
+			l := newMemLedger()
+			_, _ = l.ClaimWebhookDelivery(context.Background(), built.DeliveryID, "", time.Now().Add(20*time.Second))
+			return l
+		}, reasonBusyAtCeiling},
+	} {
+		// Below the ceiling: handed back, nothing dead-lettered.
+		q := &fakeSQS{}
+		w := newTestWorker(q, tc.ledger(), time.Second, nil)
+		if resp := handle(t, w, record(msg, "m1", w.maxReceives-1)); len(resp.BatchItemFailures) != 1 || len(q.sent) != 0 {
+			t.Errorf("%s, below the ceiling: failures %v and %d DLQ sends, want handed back and none", name, resp.BatchItemFailures, len(q.sent))
+		}
+		// On the last receive: dead-lettered with its reason, acknowledged.
+		q = &fakeSQS{}
+		w = newTestWorker(q, tc.ledger(), time.Second, nil)
+		resp := handle(t, w, record(msg, "m1", w.maxReceives))
+		if len(resp.BatchItemFailures) != 0 || len(q.sent) != 1 {
+			t.Errorf("%s, on the last receive: failures %v and %d DLQ sends, want one hand-off and an acknowledgement", name, resp.BatchItemFailures, len(q.sent))
+			continue
+		}
+		if r := awssdk.ToString(q.sent[0].MessageAttributes[awsintegration.WebhookAttrDeadLetterReason].StringValue); r != tc.want {
+			t.Errorf("%s: DeadLetterReason %q, want %q", name, r, tc.want)
+		}
+	}
+	if rcv.hits.Load() != 0 {
+		t.Errorf("a record that could not be claimed made %d requests", rcv.hits.Load())
+	}
+}
+
+// TestWorkerDeadLettersAMessageAboutToExpire: SQS deletes a message at its
+// retention without redriving it, so a failing delivery whose next attempt
+// would come too close to that is dead-lettered as "expiring" — with a fresh
+// fourteen days and the alarm — while a young one is simply retried.
+func TestWorkerDeadLettersAMessageAboutToExpire(t *testing.T) {
+	t.Parallel()
+	rcv := newReceiver(t, http.StatusServiceUnavailable)
+	const retention = 14 * 24 * time.Hour
+
+	for name, tc := range map[string]struct {
+		age      time.Duration
+		expiring bool
+	}{
+		"young":                         {time.Minute, false},
+		"a day from expiry":             {retention - 25*time.Hour, false},
+		"inside the margin after a wait": {retention - expiryMargin, true},
+	} {
+		_, msg := coreAttempts(t, rcv.url(), 3, 1000)
+		q := &fakeSQS{}
+		l := newMemLedger()
+		w := newTestWorker(q, l, time.Second, nil)
+		w.retention = retention
+		rec := record(msg, "m1", 1)
+		rec.Attributes["SentTimestamp"] = strconv.FormatInt(time.Now().Add(-tc.age).UnixMilli(), 10)
+
+		resp := handle(t, w, rec)
+		if !tc.expiring {
+			if len(resp.BatchItemFailures) != 1 || len(q.sent) != 0 {
+				t.Errorf("%s: failures %v, %d DLQ sends; want a plain retry", name, resp.BatchItemFailures, len(q.sent))
+			}
+			continue
+		}
+		if len(resp.BatchItemFailures) != 0 || len(q.sent) != 1 {
+			t.Errorf("%s: failures %v, %d DLQ sends; want dead-lettered and acknowledged", name, resp.BatchItemFailures, len(q.sent))
+			continue
+		}
+		if r := awssdk.ToString(q.sent[0].MessageAttributes[awsintegration.WebhookAttrDeadLetterReason].StringValue); r != reasonExpiring {
+			t.Errorf("%s: DeadLetterReason %q, want %q", name, r, reasonExpiring)
+		}
+		if s := awssdk.ToString(q.sent[0].MessageAttributes[awsintegration.WebhookAttrLastStatus].StringValue); s != "503" {
+			t.Errorf("%s: LastStatus %q, want 503", name, s)
+		}
+		var id string
+		for k := range l.items {
+			id = k
+		}
+		if st := l.items[id].state; st != ddbstore.WebhookDeliveryAbandoned {
+			t.Errorf("%s: ledger state %q, want abandoned so a duplicate does not retry it", name, st)
+		}
 	}
 }
 
@@ -489,8 +603,12 @@ func TestWorkerDeliversOnceUnderDuplicateReceives(t *testing.T) {
 	}
 }
 
-// localStore is the real DynamoDB store on DynamoDB Local, reached through the
-// variable the store package's harness reads. The gate fails on this skip.
+// localStore is the real DynamoDB store on DynamoDB Local at DYNAMODB_ENDPOINT.
+// Unlike the store package's harness, which falls back to localhost:8000, it
+// skips when the variable is unset. The repository's CI sets it
+// (.github/workflows/go.yml), so the race runs there; so does the workspace
+// gate (.tools/gate-lambda.sh, outside this repository), which is also meant
+// to fail a run whose log shows a DynamoDB Local skip.
 func localStore(t *testing.T) *ddbstore.Store {
 	t.Helper()
 	endpoint := strings.TrimSpace(os.Getenv("DYNAMODB_ENDPOINT"))
@@ -519,7 +637,7 @@ func localStore(t *testing.T) *ddbstore.Store {
 func TestNewWorkerRefusesAnIncompleteEnvironment(t *testing.T) {
 	full := map[string]string{
 		envQueueURL: "https://sqs.example.test/q", envDLQURL: "https://sqs.example.test/d",
-		envTable: "t", envMaxReceives: "10",
+		envTable: "t", envMaxReceives: "10", envRetention: "1209600",
 	}
 	for missing := range full {
 		env := map[string]string{}

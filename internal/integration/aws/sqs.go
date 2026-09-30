@@ -122,8 +122,10 @@ const (
 	WebhookAttrEvent         = "Event"
 
 	// Set by the worker on the copy it hands the dead-letter queue, never by
-	// the deliverer. A message in the DLQ without a reason got there by the
-	// queue's own redrive — a worker that crashed maxReceiveCount times on it.
+	// the deliverer (cmd/webhook-worker/worker.go lists the reasons). A message
+	// in the DLQ without a reason got there by the queue's own redrive: the
+	// worker did not finish its last receive at all — it crashed or timed out
+	// on it, or its own hand-off to the DLQ failed.
 	WebhookAttrDeadLetterReason = "DeadLetterReason"
 	WebhookAttrLastStatus       = "LastStatus"
 )
