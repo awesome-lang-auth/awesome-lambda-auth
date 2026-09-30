@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -298,12 +300,25 @@ func TestTheSSEFunctionStreamsWhatTheAuthFunctionPublishes(t *testing.T) {
 	if f := nextFrame(t, frames, "the cursor frame on resume"); f.id != first.id || len(f.comments) != 0 {
 		t.Errorf("cursor frame on resume = %+v, want the client's own cursor and no comment", f)
 	}
-	replayed := nextEvent(t, frames, "the replayed event")
-	if replayed.event != "order.delivered" {
-		t.Fatalf("replayed %q, want the event raised while disconnected and not the one before the cursor", replayed.event)
-	}
-	if replayed.id <= first.id {
-		t.Errorf("replayed id %s does not sort after the cursor %s", replayed.id, first.id)
+	// The resume looks below the cursor (the late-visible event's window), so
+	// what it delivers first may be events older than the cursor — here the
+	// registration's own, published moments before the first connection —
+	// which at-least-once permits. The cursor's own event is never among
+	// them, and the missed event arrives after them.
+	for {
+		replayed := nextEvent(t, frames, "the replayed event")
+		if replayed.event == "order.shipped" {
+			t.Fatalf("the resume replayed the cursor's own event (%s), which the client holds", replayed.id)
+		}
+		if replayed.event == "order.delivered" {
+			if replayed.id <= first.id {
+				t.Errorf("replayed id %s does not sort after the cursor %s", replayed.id, first.id)
+			}
+			break
+		}
+		if replayed.id >= first.id {
+			t.Fatalf("before the missed event the resume delivered %q with id %s, which is not below the cursor %s", replayed.event, replayed.id, first.id)
+		}
 	}
 	stop()
 }
@@ -415,30 +430,135 @@ func TestTheSSEFunctionAnswersTheStreamAlone(t *testing.T) {
 	}
 }
 
-// TestTheStreamHookFollowsTheTopicsTheCoreGrants: the hook computes the topics
-// it follows itself, because the core's parse of ?topics= is unexported; the
-// two must agree on every shape the reference's parse distinguishes.
-func TestTheStreamHookFollowsTheTopicsTheCoreGrants(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name   string
-		values []string
-		want   []string
-	}{
-		{"absent", nil, nil},
-		{"one list", []string{" global , user:u1,,"}, []string{"global", "user:u1"}},
-		{"empty", []string{""}, []string{}},
-		{"repeated", []string{"global", "user:u1"}, nil},
-	} {
-		got := streamRequestedTopics(tc.values)
-		if strings.Join(got, "|") != strings.Join(tc.want, "|") || (got == nil) != (tc.want == nil) {
-			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
-		}
+// connectedTopics reads rawData.topics off a connected frame: the topics the
+// core's own handler granted the connection.
+func connectedTopics(t *testing.T, f sseFrame) []string {
+	t.Helper()
+	var payload struct {
+		RawData struct {
+			Topics []string `json:"topics"`
+		} `json:"rawData"`
 	}
-	// And through StreamTopics the two shapes the core cares about: no
-	// request is the whole authorised list, an empty one is too.
-	if got := auth.StreamTopics("u1", "", streamRequestedTopics([]string{""})); strings.Join(got, ",") != "global,user:u1" {
-		t.Errorf("an empty ?topics= resolved to %v", got)
+	if f.event != "connected" {
+		t.Fatalf("frame = %+v, want connected", f)
+	}
+	if err := json.Unmarshal([]byte(f.data), &payload); err != nil {
+		t.Fatalf("connected data %q: %v", f.data, err)
+	}
+	return payload.RawData.Topics
+}
+
+// TestTheStreamHookFollowsTheTopicsTheCoreGrants: the hook computes the topics
+// it follows itself, because the core's parse of ?topics= is unexported. So the
+// stream is opened end to end with every shape the reference's parse
+// distinguishes, and for each the topics the hook followed — StreamTopics over
+// streamRequestedTopics, exactly the hook's expression — must equal the
+// connected frame's rawData.topics, which is the core's answer, and an event
+// notified to each held topic must arrive.
+func TestTheStreamHookFollowsTheTopicsTheCoreGrants(t *testing.T) {
+	factory, table, endpoint := sseTable(t)
+	authApp := newSseApp(t, sseEnv(table, endpoint), factory)
+	streamApp := newSseApp(t, sseEnv(table, endpoint, EntrypointEnv, entrypointStream), factory)
+	token := registerAndToken(t, authApp, "sse-topics-"+randomSuffix(t)+"@example.test").accessToken
+	uid := subjectOf(t, token)
+
+	for _, tc := range []struct {
+		name  string
+		query url.Values
+	}{
+		{"absent", url.Values{}},
+		{"one list", url.Values{"topics": {" global , user:" + uid + ",,"}}},
+		{"reordered", url.Values{"topics": {"user:" + uid + ",global"}}},
+		{"empty", url.Values{"topics": {""}}},
+		{"repeated", url.Values{"topics": {"global", "user:" + uid}}},
+		{"one not authorised", url.Values{"topics": {"user:somebody-else,global"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := url.Values{"token": {token}}
+			for k, v := range tc.query {
+				q[k] = v
+			}
+			_, frames, stop := openStream(t, streamApp, q.Encode(), nil)
+			defer stop()
+			granted := connectedTopics(t, nextFrame(t, frames, "the connected frame"))
+			followed := auth.StreamTopics(uid, "", streamRequestedTopics(tc.query[auth.ToolsStreamTopicsParam]))
+			if strings.Join(followed, ",") != strings.Join(granted, ",") {
+				t.Fatalf("the hook followed %v, the core granted %v: streamRequestedTopics no longer parses ?topics= as the core does", followed, granted)
+			}
+			nextFrame(t, frames, "the cursor frame")
+			for _, topic := range granted {
+				eventType := "topic.check." + strings.ReplaceAll(topic, ":", ".")
+				notify(t, authApp, token, topic, eventType, map[string]any{"topic": topic})
+				if f := nextEvent(t, frames, "the event on "+topic); f.event != eventType {
+					t.Fatalf("on %s the stream delivered %q, want %q", topic, f.event, eventType)
+				}
+			}
+		})
+	}
+}
+
+// TestOneEventOnTwoTopicsIsFramedAsTheCoreFramesIt: a login is one event on
+// global and on user:<id>. In process the core broadcasts it global first, and
+// its per-connection deduplication suppresses the second copy — so the frame's
+// topic is global even for a connection that listed user:<id> first, and with
+// tools.sse.deduplicate off the connection gets both, global then user:<id>.
+// Through the log it must be the same.
+func TestOneEventOnTwoTopicsIsFramedAsTheCoreFramesIt(t *testing.T) {
+	for _, dedup := range []bool{true, false} {
+		t.Run("deduplicate "+strconv.FormatBool(dedup), func(t *testing.T) {
+			factory, table, endpoint := sseTable(t)
+			kv := []string{"AWESOME_AUTH_TOOLS_SSE_DEDUPLICATE", strconv.FormatBool(dedup)}
+			authApp := newSseApp(t, sseEnv(table, endpoint, kv...), factory)
+			streamApp := newSseApp(t, sseEnv(table, endpoint, append(kv, EntrypointEnv, entrypointStream)...), factory)
+			email := "sse-dedup-" + randomSuffix(t) + "@example.test"
+			token := registerAndToken(t, authApp, email).accessToken
+			uid := subjectOf(t, token)
+
+			q := url.Values{"token": {token}, "topics": {"user:" + uid + ",global"}}
+			_, frames, stop := openStream(t, streamApp, q.Encode(), nil)
+			defer stop()
+			nextFrame(t, frames, "the connected frame")
+			nextFrame(t, frames, "the cursor frame")
+
+			login := invoke(t, authApp, http.MethodPost, "/auth/login",
+				jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(email))
+			if login.StatusCode != http.StatusOK {
+				t.Fatalf("login = %d (%s)", login.StatusCode, login.Body)
+			}
+			notify(t, authApp, token, "user:"+uid, "sentinel", map[string]any{})
+
+			// Every frame up to the sentinel, by id: the login's events.
+			byID := map[string][]string{}
+			var order []string
+			for {
+				f := nextEvent(t, frames, "the login's frames and the sentinel")
+				if f.event == "sentinel" {
+					break
+				}
+				var frame struct {
+					Topic string `json:"topic"`
+				}
+				if err := json.Unmarshal([]byte(f.data), &frame); err != nil {
+					t.Fatalf("event data %q: %v", f.data, err)
+				}
+				if _, ok := byID[f.id]; !ok {
+					order = append(order, f.id)
+				}
+				byID[f.id] = append(byID[f.id], frame.Topic)
+			}
+			if len(order) == 0 {
+				t.Fatal("the login raised no event on the stream")
+			}
+			want := "global"
+			if !dedup {
+				want = "global,user:" + uid
+			}
+			for _, id := range order {
+				if got := strings.Join(byID[id], ","); got != want {
+					t.Errorf("event %s was framed under %s, want %s", id, got, want)
+				}
+			}
+		})
 	}
 }
 
@@ -489,6 +609,30 @@ func TestTheResumePreludeFollowsTheConnectedFrame(t *testing.T) {
 			t.Errorf("the writer hides Flush: %v", err)
 		}
 	}
+	// The replay limit's cut: written after the last replayed frame still
+	// draining from the queue, and before the first thing newer — a heartbeat
+	// or a frame whose id sorts after it.
+	const l1, l2, l3 = "01J8Z6R4Q1000000000000000A", "01J8Z6R4Q2000000000000000A", "01J8Z6R4Q3000000000000000A"
+	frame := func(id string) string { return "id: " + id + "\nevent: e\ndata: {}\n\n" }
+	cutBytes := string(sseReplayCutFrames(100, floor))
+	for _, next := range []string{": heartbeat\n\n", frame(l3)} {
+		rec := httptest.NewRecorder()
+		w := &resumeWriter{ResponseWriter: rec, prelude: resumePrelude(cases[0].resume)}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("id: x\nevent: connected\ndata: {}\n\n"))
+		w.cut(l2, sseReplayCutFrames(100, floor))
+		for _, p := range []string{frame(l1), frame(l2), next} {
+			_, _ = w.Write([]byte(p))
+		}
+		want := "id: x\nevent: connected\ndata: {}\n\n" + cases[0].want + frame(l1) + frame(l2) + cutBytes + next
+		if got := rec.Body.String(); got != want {
+			t.Errorf("stream with a cut = %q, want %q", got, want)
+		}
+	}
+	if !strings.HasPrefix(cutBytes, ": replay truncated: the replay reached 100 events") || !strings.HasSuffix(cutBytes, "id: "+floor+"\n\n") {
+		t.Errorf("the cut's frames = %q", cutBytes)
+	}
+
 	rec := httptest.NewRecorder()
 	w := &resumeWriter{ResponseWriter: rec, prelude: resumePrelude(cases[0].resume)}
 	w.Header().Set("Content-Type", "application/json")

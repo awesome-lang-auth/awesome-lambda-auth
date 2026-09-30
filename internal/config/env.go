@@ -269,6 +269,7 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE", "tools.sse.distributor.type", func(c *Config, v string) { c.Tools.SSE.Distributor.Type = v }),
 		envInt("AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS", "tools.sse.pollIntervalMs", func(c *Config, v int) { c.Tools.SSE.PollIntervalMs = v }),
 		envInt("AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS", "tools.sse.eventLogRetentionSeconds", func(c *Config, v int) { c.Tools.SSE.EventLogRetentionSeconds = v }),
+		envInt("AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT", "tools.sse.replayLimit", func(c *Config, v int) { c.Tools.SSE.ReplayLimit = v }),
 
 		// §1.15 webhooks
 		envBool("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS", "tools.inboundWebhooks.enabled", func(c *Config, v bool) { c.Tools.InboundWebhooks.Enabled = v }),

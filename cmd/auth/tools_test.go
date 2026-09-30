@@ -979,10 +979,34 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 		},
 		{
 			// And a second when the manager is asked for: built, listened to
-			// by nobody, until D9c.
+			// by nobody, without the event log as its distributor.
 			name: "the tools block with the SSE manager",
 			env:  toolsEnv("AWESOME_AUTH_SSE_ENABLED", "true"),
 			want: []string{"security.jwt.refreshTokenSecret", "tools.sse.enabled", "tools.stream.enabled"},
+		},
+		{
+			// D9c: with the event log as the distributor both are live — the
+			// SSE function serves the stream this function's manager writes —
+			// so the two gaps close.
+			name: "the tools block with the event log",
+			env: toolsEnv(
+				"AWESOME_AUTH_STORES_DRIVER", config.StoreDriverDynamoDB,
+				"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", "unused",
+				"AWESOME_AUTH_STORES_CONNECTION_REGION", "us-east-1",
+				"AWESOME_AUTH_SSE_ENABLED", "true",
+				"AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE", config.DistributorDynamoDB,
+				"AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT", "50"),
+			want: []string{"security.jwt.refreshTokenSecret"},
+		},
+		{
+			// D9c: the event log's three knobs are read by the log alone, so
+			// without it a value that is not the default changes nothing.
+			name: "the event log's knobs without the event log",
+			env: toolsEnv(
+				"AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS", "500",
+				"AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS", "3600",
+				"AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT", "50"),
+			want: []string{"security.jwt.refreshTokenSecret", "tools.sse.eventLogRetentionSeconds", "tools.sse.pollIntervalMs", "tools.sse.replayLimit", "tools.stream.enabled"},
 		},
 		{
 			// The stream knob written off is honoured — there is nothing to
@@ -1123,6 +1147,20 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			}
 		})
 	}
+
+	// D9c: a distributor connection field under the event log, which has no
+	// connection of its own. The fields are file-only, so the Config is
+	// edited rather than loaded.
+	t.Run("a distributor connection field under the event log", func(t *testing.T) {
+		cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(cases[3].env)})
+		if err != nil {
+			t.Fatalf("config.Load: %v", err)
+		}
+		cfg.Tools.SSE.Distributor.Endpoint = "redis://cache.example.test:6379"
+		if got, want := strings.Join(paths(cfg), ","), "security.jwt.refreshTokenSecret,tools.sse.distributor.endpoint"; got != want {
+			t.Errorf("unwiredKnobs = %s, want %s", got, want)
+		}
+	})
 }
 
 // TestDriversBackTheToolsStores: both drivers expose the three stores the

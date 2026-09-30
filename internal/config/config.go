@@ -597,6 +597,13 @@ type SSE struct {
 	// which a resume cursor is answered with a truncation comment instead of
 	// a replay (docs/sse.md). 86400 — a day — by default.
 	EventLogRetentionSeconds int `json:"eventLogRetentionSeconds"`
+	// ReplayLimit bounds how many events one resume replays. Past it the
+	// stream writes a truncation comment, moves the client's cursor to now
+	// and continues live (docs/sse.md §4), so that what a cursor costs —
+	// any credentialed caller can write one dated to the horizon — is a few
+	// pages of reads per connection and not the whole retention. 100 by
+	// default. [new], like the two above.
+	ReplayLimit int `json:"replayLimit"`
 }
 
 // Distributor covers tools.sse.distributor.*. Without one, events fan out only
@@ -953,6 +960,7 @@ func Defaults() *Config {
 				// D9c.
 				PollIntervalMs:           1000,
 				EventLogRetentionSeconds: 86_400,
+				ReplayLimit:              100,
 			},
 			InboundWebhooks: InboundWebhooks{
 				Enabled:         true,

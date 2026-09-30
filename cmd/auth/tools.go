@@ -138,9 +138,12 @@ import (
 // the in-process manager, so Notify's `sse` channel and Track's step 3 broadcast
 // to whatever connections the manager holds, which on this runtime is none.
 // That is stated in the cold-start log rather than refused, because the manager
-// costs nothing and D9c makes it reach somebody. What *is* refused — RS-14 — is
-// a distributor, because a document that names one has asked for cross-instance
-// delivery and this build cannot provide it.
+// costs nothing. D9c made it reach somebody: with tools.sse.distributor.type:
+// dynamodb the manager distributes through the event log, which the SSE
+// function follows (stream.go). What *is* refused — RS-14 — is a distributor
+// this product does not implement, redis or sns, because a document that names
+// one has asked for cross-instance delivery and this build cannot provide it
+// that way.
 //
 // ── the access posture ───────────────────────────────────────────────────────
 //
@@ -582,8 +585,9 @@ func toolsHTTPOptions(cfg *config.Config, tw *toolsWiring, core *auth.Auth, base
 		DisableNotify:    !cfg.Tools.Notify.Enabled,
 		// Unconditional. See the file header: behind API Gateway the stream is
 		// a spinner that bills, and 404 is the one answer EventSource does not
-		// retry. D9c sets this from tools.stream.enabled on a transport that
-		// can carry it.
+		// retry. It stays true here even with D9c: the transport that can
+		// carry the stream is the SSE function, whose streamToolsOptions
+		// (stream.go) clears it on that function alone.
 		DisableStream:  true,
 		DisableWebhook: !cfg.Tools.InboundWebhooks.Enabled,
 		// The router's own documentation pair, resolved the way docs.go
@@ -929,7 +933,7 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	if cfg.Tools.SSE.Enabled && cfg.Tools.SSE.Distributor.Type != config.DistributorDynamoDB {
 		log.Info("the SSE manager reaches no connection on this runtime",
 			slog.String("path", "tools.sse.enabled"),
-			slog.String("effect", "the manager is built and Track and Notify broadcast into it, but the stream is not mounted and there is no distributor, so nothing is listening until D9c"))
+			slog.String("effect", "the manager is built and Track and Notify broadcast into it, but the stream is not mounted and there is no distributor, so nothing is listening; tools.sse.distributor.type: dynamodb with the SSE function (the template's EnableSse) is the transport that carries it (docs/sse.md)"))
 	}
 }
 
@@ -946,7 +950,10 @@ func csrfPostureOf(cfg *config.Config) string {
 // and that change nothing as the document stands.
 //
 // Two kinds. The stream and the SSE manager are runtime gaps — the core exposes
-// the field, API Gateway cannot carry the response — and both close with D9c.
+// the field, API Gateway cannot carry the response — and both close with the
+// dynamodb distributor, which the SSE function follows (D9c); without it they
+// are still gaps, and so are the event log's own knobs, which nothing else
+// reads, and a distributor connection field the log has no use for.
 // The three store flags are the other kind: driverStores lists telemetry,
 // webhooks and apiKeys as supported, because they are consumed by the tools
 // block and, for two of them, by the console, and "supported" is a statement
@@ -1010,6 +1017,53 @@ func toolsKnobGaps(cfg *config.Config) []knobGap {
 			Problem: "the SSE manager is built, but with the stream unmounted and no distributor it holds no connection, so every broadcast reaches nobody",
 			Remedy:  "leave it set if the same document is deployed to another port in the family, or for D9c; nothing here is lost, and nothing here is delivered either",
 		})
+	}
+	// ── D9c: the event log's knobs, and the distributor's connection ─────────
+	//
+	// pollIntervalMs, eventLogRetentionSeconds and replayLimit are read by the
+	// dynamodb distributor alone, so a value that differs from the default
+	// under any other type validates and changes nothing. The connection
+	// fields are the other way round: redis and sns would read them (and are
+	// refused, RS-14), the event log has no connection of its own — it is a
+	// partition of the store's table — so under dynamodb they are read by
+	// nothing.
+	if !streamed {
+		def := config.Defaults().Tools.SSE
+		for _, k := range []struct {
+			path     string
+			got, def int
+		}{
+			{"tools.sse.pollIntervalMs", cfg.Tools.SSE.PollIntervalMs, def.PollIntervalMs},
+			{"tools.sse.eventLogRetentionSeconds", cfg.Tools.SSE.EventLogRetentionSeconds, def.EventLogRetentionSeconds},
+			{"tools.sse.replayLimit", cfg.Tools.SSE.ReplayLimit, def.ReplayLimit},
+		} {
+			if k.got != k.def {
+				gaps = append(gaps, knobGap{
+					Path:    k.path,
+					Problem: "read by the dynamodb event log alone, and tools.sse.distributor.type is not dynamodb, so the value changes nothing",
+					Remedy:  "leave it out, or set tools.sse.distributor.type: dynamodb with the SSE function (the template's EnableSse)",
+				})
+			}
+		}
+	} else {
+		d := cfg.Tools.SSE.Distributor
+		for _, k := range []struct {
+			path string
+			set  bool
+		}{
+			{"tools.sse.distributor.endpoint", d.Endpoint != ""},
+			{"tools.sse.distributor.topicArn", d.TopicARN != ""},
+			{"tools.sse.distributor.username", d.Username != ""},
+			{"tools.sse.distributor.password", d.Password != (config.Secret{})},
+		} {
+			if k.set {
+				gaps = append(gaps, knobGap{
+					Path:    k.path,
+					Problem: "the dynamodb event log is a partition of the store's own table and takes no connection of its own, so the field is read by nothing",
+					Remedy:  "leave it out: the log uses stores.connection",
+				})
+			}
+		}
 	}
 	return gaps
 }

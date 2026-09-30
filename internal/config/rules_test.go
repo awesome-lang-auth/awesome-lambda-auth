@@ -505,6 +505,15 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage: "1800-604800",
 		},
 		{
+			name: "the event log's replay limit at zero",
+			mutate: func(doc Document) {
+				set(doc, "tools.sse.replayLimit", 0)
+			},
+			wantRule:    "",
+			wantPath:    "tools.sse.replayLimit",
+			wantMessage: "1-10000",
+		},
+		{
 			// The type is the statement of intent: a distributor configured
 			// for a manager that is off is still one this build cannot honour
 			// the day the manager is switched on, so tools.sse.enabled does not

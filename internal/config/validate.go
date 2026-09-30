@@ -617,8 +617,12 @@ func validateTools(c *Config, d *diagnostics) {
 	// The poll interval's ceiling is the back-off's own: after a minute of
 	// silence the loop polls every five seconds, so a base above five would
 	// make an idle connection poll faster than a busy one. Its floor is a
-	// tenth of a second, below which the poll bill overtakes the connection's
-	// GB-seconds at 128 MB (docs/cost-model.md §3.1).
+	// tenth of a second, and it is a floor on latency, not a point of
+	// balance: by docs/cost-model.md §3.1's own prices the poll already
+	// costs more than a 128 MB connection's GB-seconds below about 150 ms on
+	// two topics and 225 ms on three — at 100 ms it is 1.5 to 2.25 times the
+	// compute — and the default of a second is where it is a few percent of
+	// it.
 	//
 	// The retention's floor is half an hour because a connection is a
 	// sequence of fifteen-minute segments: a client whose last event is a
@@ -635,6 +639,15 @@ func validateTools(c *Config, d *diagnostics) {
 		d.errf("", "tools.sse.eventLogRetentionSeconds",
 			fmt.Sprintf("%d s is outside the supported range 1800-604800", v),
 			"use 86400, the default: a day of replay, and at least two fifteen-minute connection segments")
+	}
+	// The replay limit's floor is one event, because zero would be "resume
+	// replays nothing", which is the reference's behaviour and not this
+	// knob's to switch on; its ceiling is ten thousand, about three hundred
+	// pages of reads for one connection, past which a replay is a backfill.
+	if v := c.Tools.SSE.ReplayLimit; v < 1 || v > 10_000 {
+		d.errf("", "tools.sse.replayLimit",
+			fmt.Sprintf("%d events is outside the supported range 1-10000", v),
+			"use 100, the default: the few seconds a reconnect misses on a busy topic, and a bound on what a cursor anybody can write costs")
 	}
 	switch c.Tools.SSE.Distributor.Type {
 	case DistributorRedis:

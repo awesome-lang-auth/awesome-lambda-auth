@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -129,11 +130,12 @@ type sseEventLog interface {
 
 var _ sseEventLog = (*ddbstore.SseLog)(nil)
 
-// sseLogOptions maps the two knobs onto the log.
+// sseLogOptions maps the three knobs onto the log.
 func sseLogOptions(cfg *config.Config) ddbstore.SseLogOptions {
 	return ddbstore.SseLogOptions{
 		Retention:    time.Duration(cfg.Tools.SSE.EventLogRetentionSeconds) * time.Second,
 		PollInterval: time.Duration(cfg.Tools.SSE.PollIntervalMs) * time.Millisecond,
+		ReplayLimit:  cfg.Tools.SSE.ReplayLimit,
 	}
 }
 
@@ -165,7 +167,7 @@ func streamToolsOptions(cfg *config.Config, tw *toolsWiring, opts auth.ToolsOpti
 	opts.TelemetryStore = nil
 	opts.InboundWebhooks = nil
 
-	hook := sseResumeHook(tw.tools.SSE, tw.sseLog, log)
+	hook := sseResumeHook(tw.tools.SSE, tw.sseLog, cfg.Tools.SSE.ReplayLimit, log)
 	var guard func(http.Handler) http.Handler
 	if opts.Access != nil {
 		guard = opts.Access.Middleware
@@ -235,14 +237,17 @@ const lastEventIDParam = "lastEventId"
 //     over the principal the guard put on the context and the ?topics= the
 //     client asked for (streamRequestedTopics reproduces the core's parse);
 //  2. resolves the cursor — Last-Event-ID, else ?lastEventId= — against the
-//     log (SseLog.Resume): a recognised one replays what followed it, one
+//     log (SseLog.Resume): a well-formed one replays what followed it, one
 //     older than the retention is truncated to the horizon, anything else is
 //     a start from now, which is the reference's only behaviour;
 //  3. starts following the log for those topics from that cursor, delivering
 //     through the manager the core's handler is about to register the
 //     connection with — gated on the registration, because Serve writes the
 //     connected frame before it registers (sse.go) and a delivery in between
-//     would reach nobody while the cursor moved past it;
+//     would reach nobody while the cursor moved past it — with the manager's
+//     own deduplication setting, so that the copies of one event on several
+//     topics reach the wire as the core frames them in process, and with the
+//     replay bounded by tools.sse.replayLimit;
 //  4. hands the core's handler a writer that, right after the connected
 //     frame, writes a comment when the replay was truncated or the cursor
 //     not recognised, and then an id-only frame carrying the connection's
@@ -251,19 +256,23 @@ const lastEventIDParam = "lastEventId"
 //     data — so it is invisible to every EventSource handler and is what
 //     makes a quiet segment resumable: without it a client that received
 //     nothing but `connected` would reconnect with the connected frame's
-//     UUID, which no log can place;
+//     UUID, which no log can place. When the replay limit cuts a replay, the
+//     same writer later puts the cut's comment and an id-only frame naming
+//     the jump after the last replayed event (resumeWriter.cut);
 //  5. ends the stream if following fails, so the client reconnects with its
 //     last id rather than holding a stream that has stopped hearing anything.
 //
 // One connection per execution environment is what makes step 3's gate exact
 // (a Function URL environment serves one invocation at a time); docs/sse.md
 // says what that means for a host that serves the stream role elsewhere.
-func sseResumeHook(manager *auth.SseManager, sseLog sseEventLog, log *slog.Logger) func(http.Handler) http.Handler {
+func sseResumeHook(manager *auth.SseManager, sseLog sseEventLog, replayLimit int, log *slog.Logger) func(http.Handler) http.Handler {
+	dedup := manager == nil || manager.Deduplicate()
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			user, _ := auth.UserFromContext(r.Context())
 			topics := auth.StreamTopics(user.ID, user.TenantID, streamRequestedTopics(r.URL.Query()[auth.ToolsStreamTopicsParam]))
 			resume := sseLog.Resume(streamCursor(r))
+			rw := &resumeWriter{ResponseWriter: w, prelude: resumePrelude(resume)}
 
 			ctx, cancel := context.WithCancel(r.Context())
 			defer cancel()
@@ -271,9 +280,15 @@ func sseResumeHook(manager *auth.SseManager, sseLog sseEventLog, log *slog.Logge
 			go func() {
 				defer close(followed)
 				err := sseLog.Follow(ctx, ddbstore.SseFollow{
-					Topics: topics,
-					Floor:  resume.Floor,
-					Ready:  func() bool { return manager != nil && manager.ConnectionCount() > 0 },
+					Topics:      topics,
+					Floor:       resume.Floor,
+					Replay:      resume.Replay,
+					LookBelow:   resume.LookBelow,
+					Deduplicate: dedup,
+					Ready:       func() bool { return manager != nil && manager.ConnectionCount() > 0 },
+					ReplayCut: func(last, floor string) {
+						rw.cut(last, sseReplayCutFrames(replayLimit, floor))
+					},
 				})
 				if err != nil {
 					loggerFrom(ctx, log).Warn("the SSE event log could not be followed; ending the stream so the client resumes",
@@ -282,7 +297,7 @@ func sseResumeHook(manager *auth.SseManager, sseLog sseEventLog, log *slog.Logge
 				}
 			}()
 
-			next.ServeHTTP(&resumeWriter{ResponseWriter: w, prelude: resumePrelude(resume)}, r.WithContext(ctx))
+			next.ServeHTTP(rw, r.WithContext(ctx))
 			cancel()
 			<-followed
 		})
@@ -308,8 +323,11 @@ func streamCursor(r *http.Request) string {
 // request at all, because Express parses it to an array and the reference's
 // typeof test fails. It must agree with the core's, because the hook follows
 // the topics this computes and the connection holds the topics the core
-// computes — TestTheStreamHookFollowsTheTopicsTheCoreGrants compares the two
-// on the wire.
+// computes. TestTheStreamHookFollowsTheTopicsTheCoreGrants is the guard: it
+// opens the stream end to end with each shape the parse distinguishes — one
+// list, a repeated parameter, an empty value, a topic the principal may not
+// hold — and fails when the topics the hook followed differ from the
+// connected frame's rawData.topics, which is the core's own answer.
 func streamRequestedTopics(values []string) []string {
 	if len(values) != 1 {
 		return nil
@@ -324,13 +342,23 @@ func streamRequestedTopics(values []string) []string {
 	return topics
 }
 
-// The two comment lines, byte for byte. An SSE comment is discarded by every
+// The comment lines, byte for byte. An SSE comment is discarded by every
 // parser; these are for a human reading the stream and for a client that
 // wants to tell a truncated replay from a complete one.
 const (
 	sseTruncatedComment    = ": replay truncated: events older than the retention are no longer held; resuming from the oldest one kept\n\n"
 	sseUnrecognisedComment = ": last event id not recognised; resuming from now\n\n"
+	// sseReplayCutComment takes the replay limit.
+	sseReplayCutComment = ": replay truncated: the replay reached %d events and the rest was skipped; resuming from now\n\n"
 )
+
+// sseReplayCutFrames is what follows the last replayed event when the replay
+// limit cuts a replay: the comment, and an id-only frame naming the floor the
+// stream continues from, so that the client's cursor moves past what was
+// skipped and a reconnect does not page through it again.
+func sseReplayCutFrames(limit int, floor string) []byte {
+	return []byte(fmt.Sprintf(sseReplayCutComment, limit) + "id: " + floor + "\n\n")
+}
 
 // resumePrelude is what follows the connected frame.
 func resumePrelude(resume ddbstore.SseResume) []byte {
@@ -353,13 +381,70 @@ func resumePrelude(resume ddbstore.SseResume) []byte {
 // first Write of a stream is the connected frame (sse.go, writeConnected);
 // anything else — the core's 503 when SSE is off, its 500 when the writer
 // cannot flush — is not text/event-stream and passes untouched.
+//
+// It also carries the replay limit's cut (cut, below), because the same holds
+// for it: the only way a line of the host's reaches the stream is through a
+// Write the core makes.
 type resumeWriter struct {
 	http.ResponseWriter
 	prelude []byte
 	written bool
+
+	// The cut, pending: set by the follow goroutine, written by the Serve
+	// goroutine — the only one that ever calls Write (sse.go, Serve: the
+	// connected frame, each queued frame and each heartbeat are all written
+	// from its loop) — so the mutex guards the hand-over and nothing else.
+	mu       sync.Mutex
+	cutAfter string
+	cutBytes []byte
+}
+
+// cut arranges for frames to be written right after the frame whose id is
+// last — the last event the replay delivered — and before anything newer.
+// The replay's frames are still in the connection's queue when the follow
+// loop decides to cut, so the bytes cannot be written now: they wait for the
+// first Write that is a heartbeat or a frame whose id sorts after last.
+func (w *resumeWriter) cut(last string, frames []byte) {
+	w.mu.Lock()
+	w.cutAfter, w.cutBytes = last, frames
+	w.mu.Unlock()
+}
+
+// cutDue reports whether the pending cut goes before p, and takes it.
+func (w *resumeWriter) cutDue(p []byte) []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cutBytes == nil {
+		return nil
+	}
+	if id, ok := frameID(p); ok && id <= w.cutAfter && len(id) == len(w.cutAfter) {
+		// A replayed frame still draining from the queue.
+		return nil
+	}
+	b := w.cutBytes
+	w.cutBytes = nil
+	return b
+}
+
+// frameID reads the id line a frame starts with. The core writes the id line
+// first on every event frame (sse.go, sseFrameBytes); a heartbeat has none.
+func frameID(p []byte) (string, bool) {
+	rest, ok := strings.CutPrefix(string(p), "id: ")
+	if !ok {
+		return "", false
+	}
+	id, _, ok := strings.Cut(rest, "\n")
+	return id, ok
 }
 
 func (w *resumeWriter) Write(p []byte) (int, error) {
+	if w.written {
+		if b := w.cutDue(p); b != nil {
+			if _, err := w.ResponseWriter.Write(b); err != nil {
+				return 0, err
+			}
+		}
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if err != nil || w.written {
 		return n, err
@@ -425,10 +510,31 @@ func logStreamSurface(cfg *config.Config, tw *toolsWiring, stream bool, log *slo
 			slog.String("distributor", config.DistributorDynamoDB),
 			slog.Int("pollIntervalMs", cfg.Tools.SSE.PollIntervalMs),
 			slog.Int("eventLogRetentionSeconds", cfg.Tools.SSE.EventLogRetentionSeconds),
-			slog.String("resume", "Last-Event-ID (or ?lastEventId=) replays the event log after it, within the retention (deviation sse-resume-replays-from-the-event-log)"))
+			slog.Int("replayLimit", cfg.Tools.SSE.ReplayLimit),
+			slog.String("resume", "Last-Event-ID (or ?lastEventId=) replays the event log after it, within the retention and up to replayLimit events (deviation sse-resume-replays-from-the-event-log)"))
+		// Who can open the stream is the posture's answer, and two of them
+		// have a consequence an operator would otherwise learn from a
+		// browser's console or from a user (docs/sse.md §2).
+		switch cfg.Tools.Auth {
+		case config.ToolsAuthAPIKey:
+			log.Info("the stream is for API-key clients: no browser EventSource can open it",
+				slog.String("path", "tools.auth"),
+				slog.String("effect", "EventSource cannot set a header, and its two credentials — ?token=, which the core copies into Authorization: Bearer, and the access-token cookie — are not API keys, so the guard refuses both; a service client sends X-Api-Key and must not also send ?token=, which would replace an Authorization: ApiKey header"),
+				slog.String("remedy", "for browser clients set tools.auth: session (docs/sse.md §2 has the table of which client reaches the stream under which posture and topology)"))
+		case config.ToolsAuthSession:
+			log.Warn("the stream answers any signed-in user, and anyone can sign up",
+				slog.String("path", "tools.auth"),
+				slog.String("problem", "every connection holds the global topic, which carries every tracked and bridged identity event as the whole telemetry record — email, IP address, user agent, session id — so any self-registered user watches every other user's logins live, and with a hand-written Last-Event-ID can page back through the event log's retention, replayLimit events per connection"),
+				slog.String("remedy", "set tools.auth: apiKey (the SAM template's default) unless end users are meant to see each other's logins; see docs/config-reference.md §17.6"))
+		}
 		return
 	}
+	// The auth function cannot see whether an SSE function is deployed: it
+	// publishes to the log either way. The template sets the distributor only
+	// with EnableSse, which deploys both; a ConfigFile that names it on a
+	// stack without the SSE function pays a write per topic per event that
+	// nothing reads (docs/config-reference.md §17.3.2).
 	log.Info("the SSE manager publishes to the event log",
 		slog.String("path", "tools.sse.distributor.type"),
-		slog.String("effect", "every broadcast is written to the event log and delivered by the SSE function to the connections it holds; GET "+mount+"/stream on this function still answers 404, and the stream is the SSE function's (docs/sse.md)"))
+		slog.String("effect", "every broadcast is written to the event log, for the SSE function to deliver to the connections it holds if one is deployed — this function cannot tell; GET "+mount+"/stream on this function still answers 404, and the stream is the SSE function's (docs/sse.md)"))
 }

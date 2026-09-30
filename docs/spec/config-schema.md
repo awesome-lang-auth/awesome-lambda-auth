@@ -255,6 +255,7 @@ Reference defaults from `src/router/tools.router.ts:120-128` unless noted.
 | `tools.sse.distributor` | block `{type: redis\|sns\|dynamodb\|none, ...connection}` | reference `sseOptions.distributor` instance unset → events fan out only within one process (§3.9) | `type` enum; connection per driver; credentials `[secret]`. **D9c:** `dynamodb` is the event log in the deployment's own table (`data-model.md` §1.5) and needs `stores.driver: dynamodb`; `redis` and `sns` are refused as not implemented in this product (RS-14) | `type`: `AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE`; the connection fields are file-only (secrets via store refs) |
 | `tools.sse.pollIntervalMs` | number | `[new]` `1_000` (D9c) — the reference has no event log to poll | integer 100–5000; read by the `dynamodb` distributor only; backs off to 5 s after 60 s of silence | `AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS` |
 | `tools.sse.eventLogRetentionSeconds` | number | `[new]` `86_400` (D9c) — the reference retains nothing (`sse-manager.ts` reads `Last-Event-ID` nowhere) | integer 1800–604800; the event log's TTL and the replay horizon | `AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS` |
+| `tools.sse.replayLimit` | number | `[new]` `100` (D9c) — the reference replays nothing | integer 1–10000; the most events one resume replays before the stream writes a truncation comment, moves the client's cursor to now and continues live; read by the `dynamodb` distributor only | `AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT` |
 
 ### 1.15 Webhooks (`tools.inboundWebhooks.*`, `tools.outboundWebhooks.*`)
 

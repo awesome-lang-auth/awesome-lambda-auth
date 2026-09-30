@@ -102,6 +102,7 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		{"tools.sse.distributor.type", c.Tools.SSE.Distributor.Type, "none"},
 		{"tools.sse.pollIntervalMs", c.Tools.SSE.PollIntervalMs, 1000},
 		{"tools.sse.eventLogRetentionSeconds", c.Tools.SSE.EventLogRetentionSeconds, 86_400},
+		{"tools.sse.replayLimit", c.Tools.SSE.ReplayLimit, 100},
 
 		// §1.15 webhooks
 		{"tools.inboundWebhooks.enabled", c.Tools.InboundWebhooks.Enabled, true},
