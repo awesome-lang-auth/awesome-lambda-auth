@@ -1763,7 +1763,8 @@ cookie — `lax`, the reference's own default and this product's. RS-18 therefor
 **refuses the console beside `cookies.sameSite: none`**, and the SAM Rule
 `AdminConsoleNeedsSameSiteCookies` refuses the same pair at changeset time. The
 product's CORS layer is kept off the admin mount for the same reason the
-reference never puts one there (`cmd/auth/app.go`, `corsExemptMounts`).
+reference never puts one there (`cmd/auth/app.go`, `corsExemptMounts`), and
+off a tools mount beside the api prefix by the same test (§17.6).
 
 **`admin.cookiePrefix`, and the empty string.** The core's field is a `*string`
 because the reference distinguishes an explicit empty prefix — the bare name
@@ -2426,6 +2427,19 @@ posture at all; a document deployed another way sets it.
 `cmd/auth/tools_test.go` `TestToolsAccessPostures` drives the console's
 credential (`202`), an anonymous caller (`401`), an ordinary user (`403`), and
 the refusal with no console mounted.
+
+**CORS follows the reference's geometry around the mount.** The reference's
+CORS layer is `router.use(...)` inside the auth router
+(`auth.router.ts:512-527`) and `createToolsRouter` sets no `Access-Control`
+header of its own, so a tools router mounted *beside* the api prefix — the
+shape `tools.router.ts:114` documents, and this product's default — never
+meets that layer, and the product's layer is kept off the mount as it is off
+the admin console (§16.2, `cmd/auth/app.go` `corsExemptMounts`); mounted
+*under* the prefix, as the Angular demo mounts it (`router.use('/tools', …)` on
+the router served at `/api/auth`, `ng-awesome-node-auth`
+`src/server/auth.routes.ts:98-99`), every request passes the auth router's
+layer first, so there the tools mount stays wrapped.
+`TestToolsMountFollowsTheReferenceCORSGeometry` pins both shapes.
 
 **Rate limiting.** `track` has no name in `rateLimit.scope` (§14.1), and that
 is a decision rather than an omission. The scope vocabulary is "the

@@ -484,8 +484,9 @@ func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adm
 	return handler
 }
 
-// corsExemptMounts names the mounts the CORS layer must not touch: today the
-// admin console, when it is mounted.
+// corsExemptMounts names the mounts the CORS layer must not touch: the admin
+// console when it is mounted, and the tools router when it is mounted beside
+// the api prefix.
 //
 // The reference's CORS layer is `router.use(cors(...))` INSIDE the auth router
 // (auth.router.ts:512-527); createAdminRouter is a separate Express router
@@ -497,14 +498,39 @@ func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adm
 // use a bearer. Exempting the mount rather than narrowing the layer to the api
 // prefix keeps every other path where it was (GET /healthz, and an
 // idProvider.jwksPath a document may place outside the prefix, whose discovery
-// document a browser client does fetch). The tools router is the reference's
-// other sibling router and will want the same exemption when its block lands.
+// document a browser client does fetch).
+//
+// The tools router is the reference's other sibling router and gets the same
+// answer by the same test, with one twist that is the reference's geometry
+// and not ours. createToolsRouter sets no Access-Control header either
+// (tools.router.ts, none anywhere in the file), and the mount it documents is
+// beside the auth router at app level — `app.use('/tools', createToolsRouter(
+// …))` (tools.router.ts:114) — where no CORS layer of the reference's ever
+// sees a request, so a tools mount beside the prefix, this product's default,
+// is exempt. The Angular demo mounts it the other way: `router.use('/tools',
+// …)` (ng-awesome-node-auth src/server/auth.routes.ts:98-99) on the same
+// router that mounts the auth router at '/' (:57-59) and is itself served at
+// /api/auth (src/server.ts:65), so every request enters the auth router first
+// and passes its CORS middleware before falling through to the tools router.
+// Under the prefix the reference therefore does apply CORS, so a
+// tools.basePath under http.apiPrefix stays inside the layer here as well.
+// The test is cfg.Tools.Enabled rather than HTTPConfig.ToolsMounted because
+// httpConfig carries no ToolsOptions — mountAuthSurface fills that field —
+// and toolsPath is the mount the adapter resolves (docs.go uses the same
+// pair). cmd/auth/tools_test.go TestToolsMountFollowsTheReferenceCORSGeometry
+// pins both shapes.
 func corsExemptMounts(cfg *config.Config) []string {
 	hc := httpConfig(cfg)
-	if !hc.AdminMounted() {
-		return nil
+	var mounts []string
+	if hc.AdminMounted() {
+		mounts = append(mounts, hc.AdminPath())
 	}
-	return []string{hc.AdminPath()}
+	if cfg.Tools.Enabled {
+		if mount := toolsPath(cfg); !strings.HasPrefix(mount, hc.Prefix()+"/") {
+			mounts = append(mounts, mount)
+		}
+	}
+	return mounts
 }
 
 // buildCore turns the validated configuration and the opened stores into the

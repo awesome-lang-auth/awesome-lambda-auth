@@ -558,6 +558,63 @@ func TestToolsAccessPostures(t *testing.T) {
 	})
 }
 
+// TestToolsMountFollowsTheReferenceCORSGeometry: the reference's CORS layer is
+// `router.use` inside the auth router (auth.router.ts:512-527) and
+// createToolsRouter sets no Access-Control header of its own, so where the
+// tools router sits decides whether a request to it ever meets that layer.
+// Beside the prefix — the mount tools.router.ts:114 documents and this
+// product's default — it never does, and the product's layer is kept off the
+// mount as it is off the admin console. Under the prefix — the Angular demo's
+// `router.use('/tools', …)` on the router served at /api/auth — every request
+// enters the auth router first, so there the reference does apply CORS and
+// this product keeps the mount wrapped (app.go corsExemptMounts).
+func TestToolsMountFollowsTheReferenceCORSGeometry(t *testing.T) {
+	t.Parallel()
+	const origin = "https://app.example.test"
+	withOrigin := jsonHeaders("origin", origin)
+
+	t.Run("beside the prefix, outside the layer", func(t *testing.T) {
+		t.Parallel()
+		app := newToolsApp(t, toolsEnv("AWESOME_AUTH_CORS_ORIGINS", origin), nil)
+
+		control := invoke(t, app, http.MethodGet, "/auth/me", withOrigin, nil, "")
+		if control.Headers["Access-Control-Allow-Origin"] != origin {
+			t.Fatalf("GET /auth/me to an allow-listed origin carries Access-Control-Allow-Origin %q, want %q; the layer is off and this test proves nothing",
+				control.Headers["Access-Control-Allow-Origin"], origin)
+		}
+		for _, path := range []string{"/tools/track/anything", "/tools/notify/anything", "/tools/telemetry", "/tools/openapi.json"} {
+			rec := invoke(t, app, http.MethodPost, path, withOrigin, nil, `{}`)
+			if v := rec.Headers["Access-Control-Allow-Origin"]; v != "" {
+				t.Errorf("POST %s carries Access-Control-Allow-Origin %q; the reference's tools router beside the prefix sets no CORS header", path, v)
+			}
+			if strings.Contains(rec.Headers["Vary"], "Origin") {
+				t.Errorf("POST %s carries Vary: Origin; the tools mount beside the prefix is outside the CORS layer", path)
+			}
+			pre := invoke(t, app, http.MethodOptions, path, jsonHeaders("origin", origin, "access-control-request-method", "POST"), nil, "")
+			if pre.StatusCode == http.StatusNoContent && pre.Headers["Access-Control-Allow-Origin"] != "" {
+				t.Errorf("OPTIONS %s was answered by the CORS layer's preflight; the tools router must see its own requests", path)
+			}
+		}
+	})
+
+	t.Run("under the prefix, inside the layer", func(t *testing.T) {
+		t.Parallel()
+		app := newToolsApp(t, toolsEnv("AWESOME_AUTH_CORS_ORIGINS", origin, "AWESOME_AUTH_TOOLS_BASE_PATH", "/auth/tools"), nil)
+
+		rec := invoke(t, app, http.MethodPost, "/auth/tools/track/anything", withOrigin, nil, `{}`)
+		if got := rec.Headers["Access-Control-Allow-Origin"]; got != origin {
+			t.Errorf("POST /auth/tools/track under the prefix carries Access-Control-Allow-Origin %q, want %q: the reference's auth router wraps a tools router mounted under it", got, origin)
+		}
+		if !strings.Contains(rec.Headers["Vary"], "Origin") {
+			t.Errorf("POST /auth/tools/track under the prefix carries no Vary: Origin")
+		}
+		pre := invoke(t, app, http.MethodOptions, "/auth/tools/track/anything", jsonHeaders("origin", origin, "access-control-request-method", "POST"), nil, "")
+		if pre.StatusCode != http.StatusNoContent || pre.Headers["Access-Control-Allow-Origin"] != origin {
+			t.Errorf("OPTIONS /auth/tools/track under the prefix = %d with Access-Control-Allow-Origin %q, want the layer's 204 for %q", pre.StatusCode, pre.Headers["Access-Control-Allow-Origin"], origin)
+		}
+	})
+}
+
 // TestToolsAccessRefusesAnUnsetPosture is the second lock on the door RS-16
 // closes: toolsAccess itself, handed an empty posture, returns an error and
 // never auth.ToolsPublic(). internal/config refuses the document first, so this
