@@ -390,11 +390,12 @@ func statedAllOnAlarms(t *testing.T) int {
 // the parameter that switches the resource it watches on. Each block that adds
 // an optional function adds its own line.
 var offByDefaultAlarmGates = map[string]string{
+	"WebhookQueueAlarmed":       "EnableWebhookQueue",    // D9b
 	"ScriptRunnerAlarmsEnabled": "EnableInboundWebhooks", // D9d
 }
 
 // TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled keeps the
-// table above honest: every declared gate is an !And that includes
+// table above honest: every declared gate is an !And whose first term is
 // AlarmsEnabled — so EnableAlarms still turns the whole set off in one place —
 // and reaches, through its !Condition terms, a parameter that defaults to off.
 func TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled(t *testing.T) {
@@ -406,8 +407,8 @@ func TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled(t *testing.T) 
 			t.Errorf("condition %s is not declared on one line", gate)
 			continue
 		}
-		if !strings.HasPrefix(expr, "!And") || !strings.Contains(expr, "!Condition AlarmsEnabled") {
-			t.Errorf("%s = %s; want an !And that includes !Condition AlarmsEnabled", gate, expr)
+		if !gatedOnAlarmsEnabled(tpl, gate) {
+			t.Errorf("%s = %s; want !And [!Condition AlarmsEnabled, !Condition <feature>]", gate, expr)
 		}
 		// On only when the switch says "true", not merely mentioning it.
 		if !conditionReaches(tpl, gate, "!Equals [!Ref "+param+", 'true']", 0) {
@@ -435,6 +436,18 @@ func conditionReaches(tpl *template, name, want string, depth int) bool {
 		}
 	}
 	return false
+}
+
+// gatedOnAlarmsEnabled accepts an alarm condition that is an !And over
+// AlarmsEnabled and the switch of the feature the alarm watches. An alarm on a
+// resource that exists only with a feature must be gated on that feature too —
+// CloudFormation refuses a reference to a resource whose condition is false —
+// and EnableAlarms must still turn it off, which the AlarmsEnabled term is.
+// It reads the one Conditions parser, load's tpl.conditions.
+func gatedOnAlarmsEnabled(tpl *template, condition string) bool {
+	// The first term, literally: a bare Contains would accept
+	// !And [!Not [!Condition AlarmsEnabled], …], which is the opposite.
+	return strings.HasPrefix(tpl.conditions[condition], "!And [!Condition AlarmsEnabled, !Condition ")
 }
 
 // TestEveryAlarmIsActionableAndGated: an alarm with no action is decoration, and
@@ -467,7 +480,7 @@ func TestEveryAlarmIsActionableAndGated(t *testing.T) {
 				"DynamoDB metrics at all, and an alarm that fires because nothing happened is an alarm "+
 				"somebody turns off", a.name)
 		}
-		if a.condition != "AlarmsEnabled" && !gatedOnAlarmsEnabled(t, a.condition) {
+		if a.condition != "AlarmsEnabled" && !gatedOnAlarmsEnabled(tpl, a.condition) {
 			t.Errorf("%s has Condition %q, want AlarmsEnabled — or a feature condition defined as "+
 				"!And [!Condition AlarmsEnabled, …] — so that EnableAlarms turns the whole set "+
 				"off in one place", a.name, a.condition)
@@ -538,42 +551,6 @@ func numericDefault(t *testing.T, tpl *template, name string) float64 {
 
 // ── D9b: the webhook queue ──────────────────────────────────────────────────
 
-// conditionDefinition returns the one-line definition of a named condition
-// under Conditions:, or "" when there is none. The reader above does not parse
-// that section; the conditions an alarm may be gated on are one-liners by
-// convention, and a multi-line one simply fails the check that needs it.
-func conditionDefinition(t *testing.T, name string) string {
-	t.Helper()
-	raw, err := os.ReadFile(templateFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", templateFile, err)
-	}
-	inConditions := false
-	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
-		if m := topLevelKey.FindStringSubmatch(line); m != nil {
-			inConditions = m[1] == "Conditions"
-			continue
-		}
-		if inConditions && strings.HasPrefix(line, "  "+name+":") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "  "+name+":"))
-		}
-	}
-	return ""
-}
-
-// gatedOnAlarmsEnabled accepts an alarm condition that is an !And over
-// AlarmsEnabled and the switch of the feature the alarm watches. An alarm on a
-// resource that exists only with a feature must be gated on that feature too —
-// CloudFormation refuses a reference to a resource whose condition is false —
-// and EnableAlarms must still turn it off, which the AlarmsEnabled term is.
-func gatedOnAlarmsEnabled(t *testing.T, condition string) bool {
-	t.Helper()
-	def := conditionDefinition(t, condition)
-	// The first term, literally: a bare Contains would accept
-	// !And [!Not [!Condition AlarmsEnabled], …], which is the opposite.
-	return strings.HasPrefix(def, "!And [!Condition AlarmsEnabled,")
-}
-
 // statement returns the text of the IAM statement with the given Sid inside a
 // resource body, up to the next statement or the end of the body.
 func statement(body, sid string) string {
@@ -625,7 +602,7 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 			t.Errorf("%s has Condition %q, want WebhookQueueEnabled: an empty parameter adds no resource and no cost", name, r.condition)
 		}
 	}
-	if def := conditionDefinition(t, "WebhookQueueEnabled"); !strings.Contains(def, "!Condition ToolsEnabled") || !strings.Contains(def, "EnableWebhookQueue") {
+	if def := tpl.conditions["WebhookQueueEnabled"]; !strings.Contains(def, "!Condition ToolsEnabled") || !strings.Contains(def, "EnableWebhookQueue") {
 		t.Errorf("WebhookQueueEnabled = %q, want it to need both EnableTools and EnableWebhookQueue", def)
 	}
 	if got := tpl.parameters["EnableWebhookQueue"].fields["Default"]; got != "'false'" {
@@ -755,7 +732,7 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 	if !ok {
 		t.Fatal("the dead-letter alarm is gone: a webhook that gave up is exactly the event nobody sees otherwise")
 	}
-	if alarm.condition != "WebhookQueueAlarmed" || !gatedOnAlarmsEnabled(t, alarm.condition) {
+	if alarm.condition != "WebhookQueueAlarmed" || !gatedOnAlarmsEnabled(tpl, alarm.condition) {
 		t.Errorf("WebhookDeadLetterAlarm Condition = %q, want WebhookQueueAlarmed over AlarmsEnabled", alarm.condition)
 	}
 	if !strings.Contains(alarm.body, "ApproximateNumberOfMessagesVisible") || !strings.Contains(alarm.body, "WebhookDLQ.QueueName") {

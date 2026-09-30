@@ -587,7 +587,7 @@ in `ConfigFile` for a stack that should not publish it.
 
 ## Observability
 
-Nine alarms (ten with the D9b webhook queue), an optional notification target, an optional budget and one rule
+Nine alarms by default (each optional function adds its own, gated on its switch: docs/cost-model.md §3.3), an optional notification target, an optional budget and one rule
 about log groups that every later block has to follow. The reasoning for each
 threshold is in the template beside the alarm; the money is in
 [docs/cost-model.md](../../docs/cost-model.md).
@@ -642,7 +642,7 @@ worker's other four metrics are left unalarmed on purpose
 | `-table-read-capacity` | DynamoDB `ConsumedReadCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | Where `sessions.checkOn: allcalls` shows up, and where a polling event stream will |
 | `-auth-log-ingestion` | Logs `IncomingBytes`, Sum | ≥ `LogIngestionAlarmBytes` (25 MiB) in 1 hour | A loop that logs per iteration. Retention bounds *storage*; nothing bounds *ingestion*, which is where the ~$0.50/GB is charged |
 | `-webhook-dead-letters` (D9b, only with `EnableWebhookQueue`) | SQS `ApproximateNumberOfMessagesVisible` on the webhook DLQ | ≥ 1 in 5 min | An outgoing webhook gave up: every attempt refused, the receive ceiling reached, about to expire, or a message the worker could not schedule. The message is in the DLQ for 14 days from the hand-off with a `DeadLetterReason`; nothing retries it (docs/config-reference.md §17.4) |
-| `-script-runner-duration` (D9d, `EnableInboundWebhooks=true` only) | Lambda `Duration`, Maximum, on the script runner | ≥ `ScriptRunnerDurationAlarmThresholdMs` (4 000) in one 5-min period | An inbound-webhook script that loops or awaits something slow: it bills the whole deadline, is refused `400` and redelivered. The tenth alarm metric of a stack that enables the runner, and gated on that switch, so a stack without it keeps nine ([inbound-webhooks.md](../../docs/inbound-webhooks.md)) |
+| `-script-runner-duration` (D9d, `EnableInboundWebhooks=true` only) | Lambda `Duration`, Maximum, on the script runner | ≥ `ScriptRunnerDurationAlarmThresholdMs` (4 000) in one 5-min period | An inbound-webhook script that loops or awaits something slow: it bills the whole deadline, is refused `400` and redelivered. Gated on that switch, so a stack without the runner does not have it (docs/cost-model.md §3.3) ([inbound-webhooks.md](../../docs/inbound-webhooks.md)) |
 
 All of them treat missing data as not breaching — an idle stack publishes no Lambda
 or DynamoDB metrics at all, and an alarm that fires because nothing happened is
@@ -776,7 +776,7 @@ at rest or billed per request:
   only grows. Ingestion is the line that scales with traffic — roughly **$0.30
   per million requests** at the two lines this binary writes per request, which
   is a quarter of the API Gateway charge for the same traffic.
-- The observability block — nine alarms (ten with `EnableWebhookQueue`), the SNS topic, the budget, the anomaly
+- The observability block — nine alarms by default (the optional functions add theirs, cost-model §3.3), the SNS topic, the budget, the anomaly
   monitor: **$0 at rest.** Nine alarm metrics fit inside CloudWatch's always-free
   ten, the topic and its subscription have no standing charge (and the first
   1 000 email notifications a month are free), the budget is the free second of

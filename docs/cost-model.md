@@ -44,19 +44,20 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | Lambda, HTTP API | 0.00 | Purely per-request |
 | CloudFront, if enabled | 0.00 | No hourly or monthly charge; the two policies are free |
 | CloudWatch Logs storage | ~0.00 | At 14-day retention and this traffic, a few MB |
-| **The nine alarms** | **0.00** | Nine alarm metrics against a free allowance of ten; ten with `EnableWebhookQueue` (§3.3), still free |
+| **The nine alarms** | **0.00** | Nine alarm metrics enabled by default, against a free allowance of ten; each optional function adds its own, gated on its switch and counted in §3.3 |
 | **SNS topic + subscription** | **0.00** | No charge at rest; first 1 000 email notifications a month are free |
 | **The budget** | **0.00** | First two budgets per account are free; this is the second |
 | **Cost anomaly detection** | **0.00** | Free |
 | S3 artifact bucket | cents | A few MB per deployed version |
 | KMS key, `EnableIdp=true` only | 1.00 | Billed whether or not it signs, **including its 7-day deletion window** |
 | Admin uploads bucket, `EnableAdminUploads=true` only | cents | S3 Standard storage for a handful of images, USD 0.023 per GB-month; an empty bucket is free. Requests are §2.6 |
-| Script runner, `EnableInboundWebhooks=true` only | 0.00 | A function, a role and a log group cost nothing at rest; its one alarm is the tenth alarm metric (§3.3), free inside the allowance |
+| Script runner, `EnableInboundWebhooks=true` only | 0.00 | A function, a role and a log group cost nothing at rest; its one alarm is counted with the other optional functions' in §3.3 |
 
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
 other alarms, and **USD 0.90 a month** in one that has already spent the free
-allowance — nine alarm metrics at USD 0.10 (ten, USD 1.00, with `EnableWebhookQueue`, §3.3).
+allowance — nine alarm metrics at USD 0.10; the optional functions' alarms are
+counted in §3.3.
 
 Two things are worth saying plainly about this table. The whole standing bill is
 Secrets Manager and KMS, which are the two resources that exist to keep a signing
@@ -374,7 +375,14 @@ throttles, duration, concurrency) at USD 0.10 a month past the free ten if it
 took the auth function's set; the webhook worker and the script runner take one
 each. The template counts the alarms **enabled by default** against the free
 ten, so an optional function's alarms are gated on its own switch and priced
-here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`).
+here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`): **nine
+alarms by default**, and one more for each optional function switched on —
+`WebhookDeadLetterAlarm` with `EnableWebhookQueue`, `ScriptRunnerDurationAlarm`
+with `EnableInboundWebhooks`. **All-on total: 11 alarm metrics**, one past the
+free ten: USD 0.10 a month in an account with no other alarms, USD 1.10 in one
+whose allowance is already spent. `TestTheAlarmSetStaysInsideTheFreeAllowance`
+asserts that sentence against the template, and fails unless the all-on total
+is the number written here.
 
 | | shape of its cost |
 |---|---|
@@ -398,7 +406,7 @@ ten is one request). Lambda at 128 MB is **USD 0.0000016667 per second**.
 | `WebhookWorkerFunction` | 0.00 | per invocation only |
 | `WebhookWorkerLogGroup` | ~0.00 | 14-day retention, a line or two per delivery |
 | the event source's empty receives | 0.00 / ~0.26 | Lambda long-polls the queue continuously; at 20-second long polls and the handful of pollers AWS runs for an idle source, that is in the order of 650 000 empty `ReceiveMessage` calls a month — inside the free million, USD ~0.26 in an account that has spent it. An estimate, not a measurement: check the queue's `NumberOfEmptyReceives` after a day |
-| `WebhookDeadLetterAlarm` | 0.00 / 0.10 | the tenth alarm metric — free in an account with no other alarms, USD 0.10 in one that has spent the allowance |
+| `WebhookDeadLetterAlarm` | 0.00 / 0.10 | one alarm metric, gated on the queue's switch — counted with the other optional functions' at the top of this section |
 
 **Per delivery attempt**, a receiver answering in about 200 ms:
 
@@ -465,18 +473,17 @@ it is dead-lettered as `expiring` (config reference §17.4); one never
 received within it — a backlog deeper than the worker drains in fourteen
 days, or a worker that cannot start — is deleted by SQS **silently**, with
 no redrive and no alarm. An alarm on the queue's
-`ApproximateAgeOfOldestMessage` would catch that and would cost USD 0.10 a
-month as the eleventh alarm metric; it is left out to keep the set inside the
-free ten.
+`ApproximateAgeOfOldestMessage` would catch that and would be one more alarm
+metric, USD 0.10 a month past the free ten; it is left out.
 
 **The alarm budget (rule 10 of the block).** The worker adds one alarm, not
 four: `WebhookDeadLetterAlarm` on the dead-letter queue's depth, because a
 webhook that gave up is exactly the event nothing else reports, and every other
 failure of the worker either ends in that queue (a crash loop is redriven into
 it) or only delays a delivery (the message waits). It is gated on the queue's
-switch as well as `EnableAlarms`, so the set is **nine alarms without the queue
-and ten with it** — still inside CloudWatch's free ten, and `template_test.go`'s
-count is unchanged. The worker's errors, throttles, duration and concurrency
+switch as well as `EnableAlarms`, so a stack without the queue does not have it
+and `template_test.go`'s default count is unchanged; the totals are at the top
+of this section. The worker's errors, throttles, duration and concurrency
 would be four more metrics, USD 0.40 a month past the allowance, and are left
 unalarmed on purpose; the Lambda console shows them for free.
 
@@ -485,18 +492,9 @@ unalarmed on purpose; the Lambda console shows them for free.
 **At rest: USD 0.00.** A Lambda function, an IAM role, an empty log group and a
 reserved-concurrency setting cost nothing until invoked — a reservation only
 carves environments out of the account's unreserved pool. Its one alarm,
-`ScriptRunnerDurationAlarm`, is the tenth alarm metric of a stack that enables
-it — inside the free ten on its own, **USD 0.10 a month** in an account that
-has already spent the allowance. With the switch off none of it exists.
-
-**The all-on count.** Nine alarms by default. This block adds one, gated on
-`EnableInboundWebhooks`; D9b's webhook queue adds one more, gated on its own
-switch (`WebhookDeadLetterAlarm`). **All-on total: 11 alarm metrics** — every
-optional function switched on — one past the free ten: **USD 0.10 a month** in
-an account with no other alarms, USD 1.10 in one whose allowance is already
-spent. `TestTheAlarmSetStaysInsideTheFreeAllowance` asserts that sentence
-against the template: it counts the alarms enabled by default against the free
-ten, and fails unless the all-on total is the number written here.
+`ScriptRunnerDurationAlarm`, is gated on the runner's switch and counted with
+the other optional functions' at the top of this section. With the switch off
+none of it exists.
 
 **Per inbound webhook whose row has a script**, on top of the webhook request's
 own platform floor (§2.1), at arm64 prices (USD 0.0000133334 per GB-second,
@@ -620,8 +618,8 @@ behind. **For this product the fastest spend alarm is not a spend alarm.**
 
 | | USD / month |
 |---|---|
-| Nine alarm metrics, standard resolution (ten with `EnableWebhookQueue`, §3.3) | 0.00 (free ten) / 0.90 beyond (1.00 with the queue) |
-| The script runner's duration alarm, `EnableInboundWebhooks=true` only | 0.00 (inside the free ten) / 0.10 beyond |
+| Nine alarm metrics enabled by default, standard resolution | 0.00 (free ten) / 0.90 beyond |
+| The optional functions' alarms, one each (§3.3: the dead-letter alarm with `EnableWebhookQueue`, the script runner's duration alarm with `EnableInboundWebhooks`) | 0.10 each past the free ten; all on, 11 metrics — 0.10 in an account with no other alarms |
 | SNS topic, one email subscription | 0.00 (first 1 000 notifications free; 2.00 per 100 000 after) |
 | One budget | 0.00 (second of two free per account) |
 | Cost anomaly detection | 0.00 |

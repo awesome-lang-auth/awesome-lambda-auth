@@ -223,7 +223,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the two seams left to later blocks (D9b fills the first when configured) ─
+// ── the seams later blocks fill (D9b and D9d, each when configured) ─────────
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries

@@ -2319,7 +2319,7 @@ the signature and the numbering are unchanged; only the transport is.
   never received within the webhook queue's fourteen days is lost without a
   trace** — a backlog deeper than the worker drains in that time, or a worker
   that cannot start: SQS deletes it and redrives nothing, and no alarm watches
-  the queue's age (it would be the eleventh alarm metric, past the free ten;
+  the queue's age (it would be one more alarm metric, USD 0.10 a month past the free ten;
   `docs/cost-model.md` §3.3). One alarm watches the DLQ's depth; nothing
   redelivers from it automatically — replaying a message is sending its body
   and attributes back to the webhook queue, and it will then carry the same

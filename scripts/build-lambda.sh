@@ -4,7 +4,7 @@
 #   ./scripts/build-lambda.sh                 # dist/auth-arm64.zip
 #   ARCH=amd64 ./scripts/build-lambda.sh      # dist/auth-amd64.zip
 #   OUT_DIR=/tmp/x ./scripts/build-lambda.sh
-#   LAMBDAS="auth sse webhook-worker" ./scripts/build-lambda.sh
+#   LAMBDAS="auth webhook-worker script-runner" ./scripts/build-lambda.sh
 #                                             # one dist/<name>-<arch>.zip per cmd/<name>
 #   CONFIG_FILE=./awesome-auth.json TEMPLATES_DIR=./templates ./scripts/build-lambda.sh
 #                                             # bake a config document and mail templates in
@@ -58,9 +58,9 @@ mkdir -p "${OUT_DIR}"
 # The default builds the auth function alone. It is no longer enough to deploy:
 # the template names every function's CodeUri whether or not its switch is on,
 # and deploy.sh refuses a missing one. So CI and the README name each function
-# in LAMBDAS (D9b: "auth webhook-worker"), and deploy.sh --build passes its own
-# list, read from the template. A name with no cmd/<name> directory refuses the
-# whole run rather than producing an empty archive.
+# in LAMBDAS ("auth webhook-worker script-runner"), and deploy.sh --build
+# passes its own list, read from the template. A name with no cmd/<name>
+# directory refuses the whole run rather than producing an empty archive.
 LAMBDAS="${LAMBDAS:-auth}"
 for name in ${LAMBDAS}; do
   [ -d "${REPO_ROOT}/cmd/${name}" ] || { echo "LAMBDAS names ${name}, but there is no cmd/${name}" >&2; exit 2; }
