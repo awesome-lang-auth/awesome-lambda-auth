@@ -23,7 +23,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 - [x] P4 OAuth — U: v0.6.0 · D: wired
 - [x] P5 IdP, JWKS, KMS, resource server — U: v0.6.0 · D: wired, con firma KMS e store dei codici OIDC
 - [x] P6 settings, UI, docs, admin — U: v0.7.0 (docs, ui/config), v0.8.0 (store seams), v0.9.0 (vendored UI), v0.10.0 (admin router) · D: `runtimeSettings` (D3), `docs` (D4), `ui` (D7), `admin` (D8)
-- [ ] P7 tools, event plane, SSE, rate limiting — U: v0.7.0 (rate-limiter slot), v0.11.0 (event plane, webhooks, SSE, tools) · D: `rateLimit` (D5), `tools` (D9a-d)
+- [x] P7 tools, event plane, SSE, rate limiting — U: v0.7.0 (rate-limiter slot), v0.11.0 (event plane, webhooks, SSE, tools) · D: `rateLimit` (D5), `tools` (D9a-d)
 
 ### Product items
 - [x] X1 Cognito migration
@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: `v0.11.0` tagliata; PR #92 (UserLookupStore, dettaglio utente fra tenant) mergiata il 2026-09-28 e in uscita come `v0.12.0` insieme alla deprecazione del server MCP; U26 (#93, rimozione delle shim) resta in attesa della `v1.0.0`. Prodotto: pinnato a `v0.11.0`; D3, D4, D5, D6, D7, D8, D9a, X1 e X4a mergiati, **nessun dominio più gated**. In corso: la PR di integrazione D8×D9a (posture `tools.auth: admin`, geometria CORS della mount tools) e la wave 2 (D9b, D9c, D9d). Deciso dal owner il 2026-09-30: bersaglio di parità congelato su `@awesome-lang-auth/node` 1.10.8, con un blocco di recupero C1 prima della `v1.0.0`.
+Upstream: `v0.12.0` tagliata il 2026-09-30 (UserLookupStore, server MCP deprecato); U26 (#93, rimozione delle shim) resta in attesa della `v1.0.0`. Prodotto: pinnato a `v0.11.0`; tutti i blocchi D3–D9d, X1 e X4a mergiati, **nessun dominio gated e P6 e P7 chiuse**. Prossimo: C1, l'allineamento di go e lambda a `@awesome-lang-auth/node` 1.10.8 (bersaglio di parità congelato dal owner il 2026-09-30), con il re-pin di lambda a `v0.12.0`; poi X2, X4b, X3 e la `v1.0.0`. Niente è ancora deployato.
 
 ## Blocks
 
@@ -167,3 +167,47 @@ Upstream dance: nessun bump; D9a gira su `v0.11.0`. Da segnalare: `APIKeyMiddlew
 Stack: tre parametri (`EnableTools`, `ToolsAuth` default `apiKey`, `ToolsBasePath`), due condizioni, un blocco env — **nessuna risorsa, nessuna azione IAM, $0,00/mese**; tutto inerte finché `EnableTools` è `false`. I webhook in uscita partono su una goroutine staccata che Lambda congela con la risposta: consegna best-effort e schedule 1/2/4 s quasi mai onorata fino al deliverer SQS di D9b. **Non ancora deployato.**
 Notes: 27 finding di review (tre lenti), 25 corretti e 2 declinati con motivo (il caso typed-body non condizionato è convenzione documentata con precedente; i commit intermedi rossi sono la forma squash-merged di ogni PR qui). I tre seam lasciati vuoti in `cmd/auth/tools.go`: `WebhookSender.Deliverer` → D9b, `DisableStream` + `WithSseDistributor` → D9c, `ScriptRunner` → D9d (§17.8). `OnError` dei webhook passa da `scrubbedWebhookError`, pinnato da `TestNoCredentialReachesTheLog/tools_fan-out`. Le consegne bridged portano l'`X-Correlation-Id` del chiamante. **Decisione del owner 2026-09-30:** il bersaglio di parità è congelato su `@awesome-lang-auth/node` 1.10.8; un blocco di recupero C1 allinea go e lambda alle release 1.10.1-1.10.8 prima della `v1.0.0` di go.
 Next: PR di integrazione D8×D9a (#12), poi wave 2 — D9b webhook su SQS+DLQ, D9c SSE su Function URL con event log DynamoDB, D9d script runner fuori processo
+
+### B12 — Integrazione D8 × D9a (product · main · 2026-09-30)
+Status: green
+Landed: `7cacd10` (PR #12, merge commit del owner)
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ in locale e su CI. build ✓ deploy – contract –
+Deviations: nuova `tools-admin-login-redirect-points-into-the-admin-mount` (causata dal core: con `admin.loginPath` impostato, la guardia admin del core risponde 302 verso un percorso costruito sulla mount admin anche per le rotte tools; si ritira quando il core risponde 401 fuori dal pannello, come fa node dalla 1.10.0). Ripristinata la riga d'indice di `templates-dir-only-seeds-absent-ids`, persa nel rebase manuale di D9a, e `TestDeviationsIndexIsComplete` ora esige una riga propria per ogni deviazione di prodotto.
+Decisions: porta su `main` il lavoro che esiste solo quando console admin e tools ci sono entrambi. **`tools.auth: admin` è cablata** sulla guardia admin del core (`auth.ToolsProtected(core.AdminGuard(base).Protect)`), la stessa che protegge `<admin>/api/*`, con il double-submit CSRF per chi arriva col cookie (la console non chiama mai `/tools/*`, quindi nessun client spedito si rompe) e un avviso a caricamento e a cold start se la console è `open`. **La mount tools segue la geometria CORS della reference**: fuori dallo strato CORS quando sta accanto al prefisso, avvolta quando sta sotto. `validateMounts` rifiuta anche una mount sopra il prefisso, che toglierebbe il CORS all'intero router auth. `toolsKnobGaps` sa che la console è il secondo consumatore di `stores.enable.apiKeys` e `.webhooks`. Numerazione RS-14..RS-18 sistemata negli spec.
+Upstream dance: nessun bump. Da segnalare: la guardia admin del core dovrebbe rispondere 401 su ogni rotta che non è il pannello.
+Stack: solo testi dei parametri SAM. **$0,00/mese.** **Non ancora deployato.**
+Notes: diciotto finding di review (tre lenti), diciassette corretti e uno rimandato a C1 (l'auto-init CSRF del router auth della reference sotto il prefisso).
+Next: wave 2
+
+### B13 — D9b webhook in uscita su SQS con DLQ (product · main · 2026-09-30)
+Status: green
+Landed: `a081d67` (PR #13, merge commit del owner)
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ in locale e su CI. build ✓ (auth e webhook-worker entro budget) deploy – contract – (un caso opt-in che verifica la firma su un ricevitore dichiarato)
+Deviations: nuove `queued-webhooks-are-delivered-at-least-once` e `queued-webhook-retries-reuse-the-delivery-id`; `outgoing-webhook-delivery-races-the-response` resta valida solo con `queueUrl` vuoto.
+Decisions: la manopola `tools.outboundWebhooks.queueUrl` sostituisce il deliverer in-process con uno SQS che mette in coda il tentativo già firmato dal core, byte per byte. **La risposta aspetta l'enqueue** (al massimo 2 s), altrimenti anche l'enqueue correrebbe contro il congelamento di Lambda; un messaggio troppo grande per la coda non trattiene la risposta. Un worker dedicato (`cmd/webhook-worker`, ruolo IAM esplicito con quattro permessi e nessuna policy gestita) consegna con il deliverer HTTP del core, applica la schedule della reference da `Retries()` e `RetryDelay()` della singola configurazione, e manda in DLQ con una ragione esplicita (`exhausted`, `receive-ceiling`, `expiring`, `malformed` e altre). Un ledger DynamoDB con lease rende idempotenti le ricezioni duplicate. L'id di consegna è uno per messaggio in coda, non per evento: un timeout del client dopo che SQS ha già salvato il messaggio produce un secondo id, ed è scritto.
+Upstream dance: nessuno; il seam `WebhookDeliverer` del core bastava.
+Stack: coda, DLQ, worker, log group, un allarme sulla DLQ, tutto dietro `EnableWebhookQueue` (default off). **$0,00/mese a riposo**; ~USD 4,60 per milione di tentativi; tetto mensile del worker ~USD 21,60 alla concorrenza di default. **Non ancora deployato.**
+Notes: trentatré finding di review, trenta corretti e tre declinati con motivo. Emerso qui: il gate del workspace non vedeva i test saltati (niente `-v`), corretto il 2026-09-30.
+Next: D9d
+
+### B14 — D9d runner degli script dei webhook in entrata (product · main · 2026-09-30)
+Status: green
+Landed: `e7e0083` (PR #14, merge commit del owner)
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ in locale e su CI. build ✓ (auth, webhook-worker, script-runner entro budget) deploy – contract – (un caso opt-in)
+Deviations: nuove `inbound-webhook-scripts-run-on-goja`, `inbound-webhook-scripts-are-awaited` e `admin-actions-list-omits-the-runner-manifest` (causata dal core); riscritta `inbound-webhooks-are-refused-without-a-runner` (RS-15 ristretta: rifiuta solo senza runner nominato); allargata `rate-limited-routes-answer-429` alla rotta in entrata.
+Decisions: gli script girano in una Lambda separata in Go con goja, il cui ruolo IAM è la sandbox (scrive solo il proprio log group). **Il binario auth non collega nessun motore JavaScript**, e un test lo verifica sul grafo delle dipendenze dell'artefatto Lambda. Lo script gira nel wrapper della reference, byte per byte. **Qui lo script viene atteso**: verificato con Node 24 che la reference non lo attende mai (la promessa del contesto `vm` non passa `instanceof Promise`), contro il suo stesso commento e il suo esempio documentato; bug da segnalare al owner. La scadenza dello script è tagliata sul tempo restante dell'invocazione auth, così non si arriva mai a un 5xx del gateway. La rotta in entrata non ha guardia nel core: il prodotto le mette davanti il limitatore di D5 e una concorrenza riservata al runner. I valori e gli errori delle azioni arrivano allo script solo come dati.
+Upstream dance: nessun bump. Da segnalare: il core non ha un seam per la lista delle azioni della console; il testo del core sul runner descrive la reference come se attendesse lo script.
+Stack: funzione runner, ruolo, log group, un allarme sulla durata, tutto dietro `EnableInboundWebhooks` (default off). **$0,00/mese a riposo**; ~USD 0,60 per milione di esecuzioni; tetto al giorno alla concorrenza di default scritto nel cost model. **Non ancora deployato.**
+Notes: ventidue finding di review, ventuno corretti e uno declinato con fonti (la condizione `aws:SourceAccount` sul ruolo). Allarmi: il test ora conta quelli accesi di default (nove) e verifica il totale con tutto acceso contro l'unica frase del cost model.
+Next: D9c
+
+### B15 — D9c SSE su Function URL con event log DynamoDB (product · main · 2026-09-30)
+Status: green
+Landed: `4330384` (PR #15, merge commit del owner); con esso P7 è chiusa
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ in locale e su CI. build ✓ deploy – contract – (capacità `sse` e `sse-resume`, girano contro uno stack vivo)
+Deviations: riscritta `tools-stream-is-not-mounted-on-api-gateway` (sempre 404 dietro API Gateway, servito dalla funzione SSE in segmenti da 15 minuti); nuove `sse-resume-replays-from-the-event-log` e `sse-event-ids-are-ulids`.
+Decisions: lo stream è servito dallo stesso artefatto auth avviato con `AWESOME_AUTH_ENTRYPOINT=stream` su una Function URL (`AuthType: NONE`), perché un secondo binario sarebbe stato una seconda copia non testabile della verifica dei token. L'event log in DynamoDB fa da distributore e rende reale la ripresa con `Last-Event-ID`: at-least-once, ordine per ULID, look-back anche sotto il cursore, **tetto al replay** (`tools.sse.replayLimit`, default 100). I frame sono quelli del core, e un evento su più topic passa dal manager del core come in processo. Il gate di percorso è il gestore più esterno e lascia passare solo GET. `UpdateItem` sulla tabella è concesso solo con la posture `apiKey` e solo sulle chiavi delle API key. **Un browser può aprire lo stream solo con `session` o `none` e con CloudFront acceso o la mount sotto il prefisso**; la tabella è in `docs/sse.md`. L'event log conserva IP, user agent e session id di ogni evento sotto `global` per la durata della retention: scritto.
+Upstream dance: nessuno. Da segnalare al client Angular: chiude lo stream al primo `error`, quindi perde lo stream a ogni fine segmento.
+Stack: funzione SSE, Function URL e permessi, log group, un allarme sulla concorrenza, origine e comportamento CloudFront opzionali, tutto dietro `EnableSse` (default off). **$0,00/mese a riposo**; USD 0,006 per ora-connessione a 128 MB; costi delle richieste rifiutate e dei poll con formula nel cost model. **Non ancora deployato.**
+Notes: trentanove finding di review, i gravi tutti corretti in codice, gli altri corretti o declinati con motivo. Allarmi a regime: nove di default, dodici con coda, runner e SSE accesi.
+Next: C1 (allineamento a node 1.10.8, `.tools`), poi X2, X4b, X3 e la `v1.0.0`
