@@ -51,6 +51,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | S3 artifact bucket | cents | A few MB per deployed version |
 | KMS key, `EnableIdp=true` only | 1.00 | Billed whether or not it signs, **including its 7-day deletion window** |
 | Admin uploads bucket, `EnableAdminUploads=true` only | cents | S3 Standard storage for a handful of images, USD 0.023 per GB-month; an empty bucket is free. Requests are §2.6 |
+| Script runner, `EnableInboundWebhooks=true` only | 0.00 | A function, a role and a log group cost nothing at rest; its one alarm is the tenth alarm metric (§3.3), free inside the allowance |
 
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
@@ -368,14 +369,17 @@ D9c's decision to record rather than this document's to make.
 ### 3.3 The other functions coming
 
 Each one brings **a log group that must be declared explicitly or it will never
-expire** — see §5 — and would bring four alarm metrics (errors, throttles,
-duration, concurrency) at USD 0.10 a month past the free ten if it took the auth
-function's set. The webhook worker does not; see below.
+expire** — see §5 — and alarms. It would bring four alarm metrics (errors,
+throttles, duration, concurrency) at USD 0.10 a month past the free ten if it
+took the auth function's set; the webhook worker and the script runner take one
+each. The template counts the alarms **enabled by default** against the free
+ten, so an optional function's alarms are gated on its own switch and priced
+here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`).
 
 | | shape of its cost |
 |---|---|
 | webhook worker | **Landed (D9b)**, below |
-| script runner | Per run, and the run is operator-initiated, so the exposure is a script that loops |
+| script runner | **Landed (D9d)**, below |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
 
 #### The webhook queue and its worker (D9b)
@@ -476,6 +480,56 @@ count is unchanged. The worker's errors, throttles, duration and concurrency
 would be four more metrics, USD 0.40 a month past the allowance, and are left
 unalarmed on purpose; the Lambda console shows them for free.
 
+#### The script runner (D9d), `EnableInboundWebhooks=true`
+
+**At rest: USD 0.00.** A Lambda function, an IAM role and an empty log group
+cost nothing until invoked. Its one alarm, `ScriptRunnerDurationAlarm`, is the
+tenth alarm metric of a stack that enables it — inside the free ten on its own,
+**USD 0.10 a month** in an account that has already spent the allowance. With
+the switch off none of it exists.
+
+**Per inbound webhook whose row has a script**, on top of the webhook request's
+own platform floor (§2.1), at arm64 prices (USD 0.0000133334 per GB-second,
+USD 0.20 per million requests; the durations are estimates from the engine's
+tests, not measurements — this block deployed nothing):
+
+```
+runner invocation          0.20 / million
+runner duration, 256 MB    0.07 / million at ~20 ms (a fresh goja runtime + a mapping script)
+auth function waiting      0.20 / million at ~30 ms of a 512 MB function held on the Invoke
+runner log line, ~250 B    0.13 / million
+                           ─────────────
+                           ~0.60 / million runs
+```
+
+The auth function **waits** on the runner — the Invoke is synchronous, because
+the core's route must answer the provider with the script's outcome — so every
+millisecond of a script is billed twice: once at 256 MB in the runner and once
+at 512 MB in the auth function holding the call. A row with no script costs
+nothing here: the runner is not invoked.
+
+**The exposure is a script that loops**, or awaits something slow. It runs to
+the deadline (`scriptTimeoutMs`, 5000 ms), is interrupted, and the webhook is
+refused `400` — so the provider redelivers it and the same deadline is billed
+again:
+
+```
+runner, 5 s at 256 MB           0.0000167  per delivery
+auth function, 5 s at 512 MB    0.0000333  per delivery
+                                ─────────
+                                ~0.00005   per delivery   (USD 50 per million)
+```
+
+A provider sending 10 000 events a day into a looping script is about
+**USD 0.50 a day** before its redeliveries, and every redelivery multiplies it
+— which is the incident `ScriptRunnerDurationAlarm` exists for: it fires at
+80 % of the deadline, on one five-minute period, because redeliveries arrive
+minutes to hours apart and "twice running" would rarely be true of them. The
+concurrency it can take is bounded by the auth function's own, whose alarms
+already cover it. A deadline raised to the 30 000 ms maximum makes the looping
+case six times worse; that is the price of the knob, and the reason the
+template ties `ScriptRunnerTimeout` and the alarm threshold to it.
+
 ---
 
 ## 4. What the incidents cost, which is the point
@@ -509,6 +563,7 @@ behind. **For this product the fastest spend alarm is not a spend alarm.**
 | | USD / month |
 |---|---|
 | Nine alarm metrics, standard resolution (ten with `EnableWebhookQueue`, §3.3) | 0.00 (free ten) / 0.90 beyond (1.00 with the queue) |
+| The script runner's duration alarm, `EnableInboundWebhooks=true` only | 0.00 (inside the free ten) / 0.10 beyond |
 | SNS topic, one email subscription | 0.00 (first 1 000 notifications free; 2.00 per 100 000 after) |
 | One budget | 0.00 (second of two free per account) |
 | Cost anomaly detection | 0.00 |
@@ -523,8 +578,9 @@ and nothing about that looks wrong until the storage line does.
 
 `infra/sam/template_test.go` enforces it: it reads the template, finds every
 function, and fails if any lacks a matching group, the retention reference, or
-the ordering. It also fails if the alarm set grows past ten, which is a
-deliberate tripwire — the eleventh alarm costs money and should be a decision
+the ordering. It also fails if the alarms **enabled by default** grow past ten
+(an optional function's alarms are gated on its own switch and priced in
+§3.3), which is a deliberate tripwire — the eleventh alarm costs money and should be a decision
 somebody makes rather than one that happens.
 
 ---
