@@ -37,6 +37,7 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 | `AWESOME_AUTH_CONTRACT_ADMIN_PATH` | Where the admin console is mounted, as an absolute path. Default `/admin`, the same default the reference's swagger base and this product's `admin.basePath` use. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` + `AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` | An account the console admits — the configured root user, or a user the operator promoted. **Opt-in and unset by default**, because the suite cannot mint an administrator. Both or neither: one without the other is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_TOOLS_PATH` | Where the tools router is mounted. Default `/tools`, the reference's own `swaggerBasePath` default, beside the api prefix; a deployment that followed the Angular demo and mounted it under the prefix at `<apiPrefix>/tools` sets this to `/auth/tools`. |
+| `AWESOME_AUTH_CONTRACT_WEBHOOK_RECEIVER_URL` + `AWESOME_AUTH_CONTRACT_WEBHOOK_LISTEN` (D9b) | A public URL the deployment can POST to, tunnelled to the address the suite listens on (default `:8787`). **Opt-in and unset by default**, because a Lambda cannot reach the machine running the suite; with it, `tools/outgoing-webhook-reaches-the-receiver-signed` subscribes through the admin API, logs in, and verifies the signed delivery. Needs the admin credential above too. See `cases_webhook_test.go`. |
 
 All of them are passed through `scripts/toolchain.sh` into the container.
 
