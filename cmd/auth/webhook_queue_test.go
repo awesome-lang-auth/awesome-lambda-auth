@@ -112,8 +112,19 @@ func TestQueuedWebhookIsEnqueuedBeforeTheResponseLeaves(t *testing.T) {
 	// context the attempt arrives with, and this is that context.
 	if ctx, ok := rec.contextOf(auth.EventAuthLoginSuccess); !ok {
 		t.Error("no login attempt reached the deliverer")
-	} else if got := queuedCorrelationID(ctx); got != correlation {
-		t.Errorf("the queued delivery would carry CorrelationId %q, want the login's %q", got, correlation)
+	} else {
+		if got := queuedCorrelationID(ctx); got != correlation {
+			t.Errorf("the queued delivery would carry CorrelationId %q, want the login's %q", got, correlation)
+		}
+		// And the deliverer built without an injection is wired to it. No I/O:
+		// the SQS client is built on its first call.
+		sqsd, ok := newWebhookQueue(app.Config, nil).inner.(*awsintegration.SQSWebhookDeliverer)
+		if !ok || sqsd.CorrelationID == nil {
+			t.Fatal("the production webhook queue is not an SQS deliverer with a CorrelationID")
+		}
+		if got := sqsd.CorrelationID(ctx); got != correlation {
+			t.Errorf("the production SQS deliverer reads CorrelationId %q, want the login's %q", got, correlation)
+		}
 	}
 
 	// No polling: the flush is the property under test.

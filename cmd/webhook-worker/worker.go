@@ -252,8 +252,8 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		// The ledger is unreachable. Retry on the queue's own visibility
 		// timeout; POSTing without a claim would give up the one guarantee
 		// the ledger exists for.
-		log.Warn("webhook delivery claim failed; the message will be retried", slog.String("error", err.Error()))
-		return w.handBack(ctx, rec, queueDefault, reasonLedgerUnavailable, 0, nil, log)
+		log.Warn("webhook delivery claim failed", slog.String("error", err.Error()))
+		return w.handBack(ctx, rec, queueDefault, reasonLedgerUnavailable, 0, nil, "webhook delivery could not be claimed; handing the message back to the queue", log)
 	}
 
 	switch claimed.Outcome {
@@ -270,12 +270,10 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		if wait < time.Second {
 			wait = time.Second
 		}
-		log.Info("webhook delivery is held by another invocation; retrying after its lease",
-			slog.Duration("after", wait))
 		// At the ceiling this copy is dead-lettered rather than redriven
 		// without a reason. The live claimant keeps its own copy; if it
 		// delivers, this DLQ copy is a duplicate the ledger shows as delivered.
-		return w.handBack(ctx, rec, wait, reasonBusyAtCeiling, 0, nil, log)
+		return w.handBack(ctx, rec, wait, reasonBusyAtCeiling, 0, nil, "webhook delivery is held by another invocation; retrying after its lease", log)
 	case ddbstore.WebhookClaimGranted:
 	default:
 		log.Error("webhook delivery claim returned an unknown outcome", slog.Int("outcome", int(claimed.Outcome)))
@@ -319,8 +317,7 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 		return w.deadLetter(ctx, rec, reasonExhausted, status, log)
 	}
 	wait := backoff(q.retryDelay, attemptNo)
-	log.Info("webhook delivery failed; retrying after the back-off", slog.Duration("after", wait))
-	return w.handBack(ctx, rec, wait, reasonReceiveCeiling, status, &claimed.Claim, log)
+	return w.handBack(ctx, rec, wait, reasonReceiveCeiling, status, &claimed.Claim, "webhook delivery failed; retrying after the back-off", log)
 }
 
 // handBack returns a record to the queue for another receive after wait —
@@ -328,8 +325,9 @@ func (w *worker) process(ctx context.Context, rec events.SQSMessage) bool {
 // give it one: on the receive the queue would redrive next (atCeiling names
 // what held it back) or when the message would expire first ("expiring"). In
 // those two cases it dead-letters the record itself, with the reason, and
-// settles a held claim as abandoned. It returns process's answer.
-func (w *worker) handBack(ctx context.Context, rec events.SQSMessage, wait time.Duration, atCeiling string, status int, claim *ddbstore.WebhookClaim, log *slog.Logger) bool {
+// settles a held claim as abandoned. retrying is the log line for the ordinary
+// case. It returns process's answer.
+func (w *worker) handBack(ctx context.Context, rec events.SQSMessage, wait time.Duration, atCeiling string, status int, claim *ddbstore.WebhookClaim, retrying string, log *slog.Logger) bool {
 	reason := ""
 	switch {
 	case w.maxReceives > 0 && receiveCount(rec) >= w.maxReceives:
@@ -350,9 +348,14 @@ func (w *worker) handBack(ctx context.Context, rec events.SQSMessage, wait time.
 	if claim != nil {
 		w.settle(ctx, *claim, ddbstore.WebhookDeliveryFailed, log)
 	}
-	if wait != queueDefault {
-		w.setVisibility(ctx, rec, wait, log)
+	// Logged here and not by the caller, so a record that is dead-lettered
+	// above never also says it is being retried.
+	if wait == queueDefault {
+		log.Info(retrying)
+		return false
 	}
+	log.Info(retrying, slog.Duration("after", wait))
+	w.setVisibility(ctx, rec, wait, log)
 	return false
 }
 
