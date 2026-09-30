@@ -98,6 +98,10 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		{"tools.sse.enabled", c.Tools.SSE.Enabled, false},
 		{"tools.sse.heartbeatIntervalMs", c.Tools.SSE.HeartbeatIntervalMs, 30_000},
 		{"tools.sse.deduplicate", c.Tools.SSE.Deduplicate, true},
+		// D9c: the event log's two knobs, [new] and so the product's numbers.
+		{"tools.sse.distributor.type", c.Tools.SSE.Distributor.Type, "none"},
+		{"tools.sse.pollIntervalMs", c.Tools.SSE.PollIntervalMs, 1000},
+		{"tools.sse.eventLogRetentionSeconds", c.Tools.SSE.EventLogRetentionSeconds, 86_400},
 
 		// §1.15 webhooks
 		{"tools.inboundWebhooks.enabled", c.Tools.InboundWebhooks.Enabled, true},

@@ -610,7 +610,32 @@ func validateTools(c *Config, d *diagnostics) {
 			"enable the admin surface (admin.enabled: true with an access policy), or choose tools.auth: session or apiKey")
 	}
 	absolutePath(d, "tools.basePath", c.Tools.BasePath)
-	enum(d, "tools.sse.distributor.type", c.Tools.SSE.Distributor.Type, DistributorNone, DistributorRedis, DistributorSNS)
+	enum(d, "tools.sse.distributor.type", c.Tools.SSE.Distributor.Type, DistributorNone, DistributorRedis, DistributorSNS, DistributorDynamoDB)
+	// D9c: the event log's two knobs, bounded where a value outside the range
+	// would quietly change what the log means rather than only what it costs.
+	//
+	// The poll interval's ceiling is the back-off's own: after a minute of
+	// silence the loop polls every five seconds, so a base above five would
+	// make an idle connection poll faster than a busy one. Its floor is a
+	// tenth of a second, below which the poll bill overtakes the connection's
+	// GB-seconds at 128 MB (docs/cost-model.md §3.1).
+	//
+	// The retention's floor is half an hour because a connection is a
+	// sequence of fifteen-minute segments: a client whose last event is a
+	// segment old reconnects with a cursor that old, and a retention shorter
+	// than a segment would answer an ordinary quiet reconnect with "replay
+	// truncated" when nothing was lost. The ceiling is a week, past which a
+	// replay is a backfill and not a resume.
+	if v := c.Tools.SSE.PollIntervalMs; v < 100 || v > 5000 {
+		d.errf("", "tools.sse.pollIntervalMs",
+			fmt.Sprintf("%d ms is outside the supported range 100-5000", v),
+			"use 1000, the default; the loop backs off to 5000 by itself after a minute of silence")
+	}
+	if v := c.Tools.SSE.EventLogRetentionSeconds; v < 1800 || v > 604_800 {
+		d.errf("", "tools.sse.eventLogRetentionSeconds",
+			fmt.Sprintf("%d s is outside the supported range 1800-604800", v),
+			"use 86400, the default: a day of replay, and at least two fifteen-minute connection segments")
+	}
 	switch c.Tools.SSE.Distributor.Type {
 	case DistributorRedis:
 		if c.Tools.SSE.Distributor.Endpoint == "" {

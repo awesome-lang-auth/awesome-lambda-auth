@@ -54,14 +54,25 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 // optimisation but the whole feature: every concurrent invocation is its own
 // process, so a manager with no distributor delivers to the connections of the
 // one environment that happened to serve the tracking request, which is almost
-// never the environment serving the stream. The core's NewSseManager takes a
-// distributor as an option and this build passes none — the transport is D9c's,
-// on a Function URL, where the stream itself can live — so a document that
-// writes `redis` or `sns` here has asked for cross-instance delivery and would
-// silently get single-instance delivery instead. That is exactly the shape of
-// failure the refuse-to-start table exists for: nothing errors, every request
-// answers, and an operator watching one stream miss events has no way to tell
-// from outside that the fan-out was never configured.
+// never the environment serving the stream.
+//
+// D9c narrowed the rule rather than retiring it. The product now ships one
+// distributor, `dynamodb` — the event log in the deployment's own table
+// (docs/spec/data-model.md §1.9), written by the auth function and polled by
+// the SSE function — and the rule refuses what is left:
+//
+//   - `redis` and `sns`, by name, as not implemented in this product. They stay
+//     in the enum because a family document may carry them, and accepting one
+//     silently would be exactly the failure above: a document that asked for
+//     cross-instance delivery getting single-instance delivery instead, with
+//     nothing erroring, every request answering, and an operator watching one
+//     stream miss events with no way to tell from outside.
+//   - `dynamodb` on a driver that is not DynamoDB. The log is a partition of
+//     the table; on the memory driver there is no table, and a per-process log
+//     would reach the connections of one execution environment, which is the
+//     case the rule was written for. RS-12 already refuses that driver in
+//     production, so this bites a development document only — which is where
+//     somebody would otherwise conclude the stream works.
 //
 // The rule fires only under tools.enabled, because with the block off the
 // distributor is dead configuration nothing reads, and an operator keeping a
@@ -73,13 +84,21 @@ func checkRS14ToolsSSEDistributor(c *Config, d *diagnostics) {
 	if !c.Tools.Enabled {
 		return
 	}
-	kind := c.Tools.SSE.Distributor.Type
-	if kind == "" || kind == DistributorNone {
+	switch kind := c.Tools.SSE.Distributor.Type; kind {
+	case "", DistributorNone:
 		return
+	case DistributorDynamoDB:
+		if c.Stores.Driver == StoreDriverDynamoDB {
+			return
+		}
+		d.errf(RuleToolsSSEDistributor, "tools.sse.distributor.type",
+			fmt.Sprintf("tools.sse.distributor.type is %q, but stores.driver is %q: the event log is a partition of the DynamoDB table, and without the table the stream manager would reach only the connections of its own execution environment, which on Lambda is almost nobody", kind, c.Stores.Driver),
+			"set stores.driver: "+StoreDriverDynamoDB+", or set tools.sse.distributor.type to none")
+	default:
+		d.errf(RuleToolsSSEDistributor, "tools.sse.distributor.type",
+			fmt.Sprintf("tools.sse.distributor.type is %q, which is not implemented in this product: the stream manager would reach only the connections of its own execution environment, which on Lambda is almost nobody, and nothing would say so", kind),
+			"set tools.sse.distributor.type to "+DistributorDynamoDB+" -- the event log in this deployment's own table, which the SSE function polls (docs/sse.md) -- or to none")
 	}
-	d.errf(RuleToolsSSEDistributor, "tools.sse.distributor.type",
-		fmt.Sprintf("tools.sse.distributor.type is %q, but this build ships no SSE distributor: the stream manager would reach only the connections of its own execution environment, which on Lambda is almost nobody, and nothing would say so", kind),
-		"set tools.sse.distributor.type to none until the SSE transport block (D9c) lands, or leave the whole distributor block out; on this runtime GET <tools>/stream is not mounted either, for the reason cmd/auth/tools.go gives")
 }
 
 // checkRS15ToolsInboundWebhooks: inbound webhooks are refused unless the
