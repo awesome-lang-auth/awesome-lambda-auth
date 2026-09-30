@@ -265,6 +265,8 @@ func envBindings() []envBinding {
 		// §1.15 webhooks
 		envBool("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS", "tools.inboundWebhooks.enabled", func(c *Config, v bool) { c.Tools.InboundWebhooks.Enabled = v }),
 		envInt("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS", "tools.inboundWebhooks.scriptTimeoutMs", func(c *Config, v int) { c.Tools.InboundWebhooks.ScriptTimeoutMs = v }),
+		// D9d: the script runner's function.
+		envString("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION", "tools.inboundWebhooks.scriptRunnerFunction", func(c *Config, v string) { c.Tools.InboundWebhooks.ScriptRunnerFunction = v }),
 		envString("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION", "tools.outboundWebhooks.payloadVersion", func(c *Config, v string) { c.Tools.OutboundWebhooks.PayloadVersion = v }),
 		envInt("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES", "tools.outboundWebhooks.defaults.maxRetries", func(c *Config, v int) { c.Tools.OutboundWebhooks.Defaults.MaxRetries = v }),
 		envInt("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_RETRY_DELAY_MS", "tools.outboundWebhooks.defaults.retryDelayMs", func(c *Config, v int) { c.Tools.OutboundWebhooks.Defaults.RetryDelayMs = v }),

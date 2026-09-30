@@ -275,15 +275,20 @@ func runtimeSettingsKnobGaps(cfg *config.Config) []knobGap {
 	rs := cfg.RuntimeSettings
 	var gaps []knobGap
 
-	if rs.EnabledWebhookActions != nil {
+	// D9d: read by the inbound route whenever it is mounted, which since the
+	// script runner landed is whenever tools.enabled and
+	// tools.inboundWebhooks.enabled are both on (RS-15 then guarantees a
+	// runner). Inert only with the route off.
+	inboundMounted := cfg.Tools.Enabled && cfg.Tools.InboundWebhooks.Enabled
+	if rs.EnabledWebhookActions != nil && !inboundMounted {
 		gaps = append(gaps, knobGap{
 			Path: "runtimeSettings.enabledWebhookActions",
-			Problem: "this is the global allowlist the inbound-webhook sandbox intersects with each webhook's own allowedActions " +
-				"(tools.router.ts:261-266), and this build never mounts that one route -- POST <tools>/webhook/{provider} is refused at " +
-				"cold start until a script runner exists (RS-15, deviation inbound-webhooks-are-refused-without-a-runner), whether or " +
-				"not the rest of the tools router is mounted -- so the list is stored and read by nothing",
-			Remedy: "leave it set -- it is seeded into the settings store and becomes live when the inbound-webhook runner lands (D9d), " +
-				"which retires RS-15; nothing in this build reads it today",
+			Problem: "this is the global allowlist the inbound-webhook route intersects with each webhook's own allowedActions " +
+				"(tools.router.ts:261-266) before handing the result to the script runner, and that route is not mounted here -- " +
+				"it needs tools.enabled and tools.inboundWebhooks.enabled, with a runner named in tools.inboundWebhooks.scriptRunnerFunction (RS-15) " +
+				"-- so the list is stored and read by nothing",
+			Remedy: "leave it set -- it is seeded into the settings store and becomes live the deploy that mounts the inbound route; " +
+				"see docs/inbound-webhooks.md for what an action is and how one is added",
 		})
 	}
 	if rs.LazyEmailVerificationGracePeriodDays != defaults.LazyEmailVerificationGracePeriodDays {

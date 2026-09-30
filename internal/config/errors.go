@@ -62,8 +62,11 @@ const (
 	// warnings because the failure each prevents is silent: a manager with no
 	// distributor reaches only its own execution environment, and a webhook
 	// with a script and no runner answers 400 to a provider that redelivers
-	// forever. Both retire on the day their transport lands, and the rule text
-	// names that day.
+	// forever. Both change on the day their transport lands, and the rule text
+	// names that day. D9d's did: RS-15 now refuses inbound webhooks only when
+	// no tools.inboundWebhooks.scriptRunnerFunction names the runner, which is
+	// the same failure with a remedy that can finally be written down, so it
+	// kept its number.
 	RuleToolsSSEDistributor  = "RS-14"
 	RuleToolsInboundWebhooks = "RS-15"
 

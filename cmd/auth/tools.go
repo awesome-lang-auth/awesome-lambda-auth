@@ -223,7 +223,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the two seams left to later blocks (D9b fills the first when configured) ─
+// ── the seams later blocks fill (D9b and D9d, each when configured) ─────────
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries
@@ -241,12 +241,14 @@ import (
 // (outgoing-webhook-delivery-races-the-response), and docs/cost-model.md
 // records what each costs.
 //
-// ScriptRunner is nil. The core runs no inbound-webhook script in process and
+// ScriptRunner is D9d's: awsintegration.LambdaScriptRunner, invoking
+// cmd/script-runner — a Lambda of its own whose IAM role is the sandbox —
+// whenever tools.inboundWebhooks.scriptRunnerFunction names it
+// (scriptrunner.go). The core runs no inbound-webhook script in process and
 // fails closed without a runner — 400, nothing tracked, and the provider
-// redelivers — so RS-15 refuses tools.inboundWebhooks.enabled until D9d brings
-// the runner: a Lambda of its own whose IAM role is the sandbox. The
-// scriptTimeoutMs knob is mapped onto ScriptTimeout now so that D9d's change is
-// one field.
+// redelivers — so RS-15 refuses tools.inboundWebhooks.enabled with no function
+// named. The scriptTimeoutMs knob is the core's ScriptTimeout, the deadline on
+// the whole invocation.
 
 // toolsWiring is what the tools block builds before the core exists: the bus
 // the core will publish on, the facade the router will call, and the handle
@@ -269,6 +271,10 @@ type toolsWiring struct {
 	// The stores that were wired, by name, for the cold-start log.
 	telemetry bool
 	webhooks  bool
+
+	// scriptRunner is D9d's InboundScriptRunner, or nil when the inbound route
+	// has nothing to run (scriptrunner.go, newScriptRunner).
+	scriptRunner auth.InboundScriptRunner
 
 	// queue is the SQS deliverer (D9b, webhook_queue.go), or nil when
 	// tools.outboundWebhooks.queueUrl is unset and the core's in-process
@@ -561,11 +567,12 @@ func toolsHTTPOptions(cfg *config.Config, tw *toolsWiring, core *auth.Auth, base
 		// allows a different one for a read replica, which this product has no
 		// knob for. Nil when the store is off, which unmounts the query route.
 		TelemetryStore: telemetryStoreOf(users, cfg),
-		// The inbound route's store, handed over so that D9d's change is the
-		// runner alone. With DisableWebhook set — which RS-15 guarantees on
-		// this build — the field is read by nothing.
+		// The inbound route's store and its runner (D9d). With DisableWebhook
+		// set the two are read by nothing; with it clear, RS-15 has
+		// guaranteed a runner is named, so a row with a script runs in the
+		// runner Lambda rather than failing closed.
 		InboundWebhooks: inboundWebhookStoreOf(users, cfg),
-		ScriptRunner:    nil, // D9d. See the file header.
+		ScriptRunner:    tw.scriptRunner,
 		ScriptTimeout:   time.Duration(cfg.Tools.InboundWebhooks.ScriptTimeoutMs) * time.Millisecond,
 		// WebhookMaxBytes at the core's default (express.json's 100 KB): the
 		// schema has no knob for it.

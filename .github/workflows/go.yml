@@ -62,11 +62,15 @@ jobs:
     # (a comment cannot sit inside the folded scalar). Job-level, so the build
     # and the size check read one list and a function cannot be built and not
     # checked.
+    # infra/sam TestCIBuildsEveryFunctionTheTemplateDeploys holds this list
+    # to the template's CodeUri lines.
     #   D9b: webhook-worker
+    #   D9d: script-runner
     env:
       LAMBDAS: >-
         auth
         webhook-worker
+        script-runner
     steps:
       - uses: actions/checkout@v5
 

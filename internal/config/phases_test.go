@@ -491,6 +491,15 @@ func TestToolsIsWired(t *testing.T) {
 			set(doc, "stores.enable.telemetry", true)
 			set(doc, "stores.enable.webhooks", true)
 		}, nil},
+		// D9d: inbound webhooks load once a runner is named (RS-15 narrowed).
+		{"inbound webhooks with a script runner", func(doc Document) {
+			set(doc, "tools.enabled", true)
+			set(doc, "tools.auth", "session")
+			set(doc, "tools.inboundWebhooks.enabled", true)
+			set(doc, "tools.inboundWebhooks.scriptRunnerFunction", "stack-script-runner")
+			set(doc, "stores.enable.telemetry", true)
+			set(doc, "stores.enable.webhooks", true)
+		}, nil},
 		{"the apiKey posture with its store", func(doc Document) {
 			set(doc, "tools.enabled", true)
 			set(doc, "tools.auth", "apiKey")

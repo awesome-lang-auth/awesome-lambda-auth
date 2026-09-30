@@ -180,9 +180,10 @@ telemetry, webhook and API-key stores, and the imported adapter mounts track,
 notify, the telemetry query and the router's own documentation pair beside the
 api prefix, behind the posture `tools.auth` names. It leaves two of its knobs
 *refused by rule* rather than by phase — a distributor (RS-14) and inbound
-webhooks (RS-15) — and two *reported* rather than honoured — the stream and the
-SSE manager — because the transports that carry them are D9b, D9c and D9d's;
-§17 says which is which and why.
+webhooks without a named script runner (RS-15) — and two *reported* rather
+than honoured — the stream and the SSE manager — because the transports that
+carry them are D9b and D9c's; D9d's script runner is wired (§17.5). §17 says
+which is which and why.
 
 **Every domain the schema accepts is wired now, and the phase gate is empty.**
 
@@ -947,10 +948,10 @@ them. Both are named, with their paths, in the cold-start log:
 
 - `enabledWebhookActions` is the global allowlist the inbound-webhook sandbox
   intersects with each webhook's own `allowedActions`. That sandbox belongs to
-  one route, `POST <tools>/webhook/{provider}`, which this build never mounts —
-  RS-15 refuses it until the script runner lands (D9d, §17.5), whether or not
-  the rest of the tools router is on — so the list is stored and read by
-  nothing.
+  one route, `POST <tools>/webhook/{provider}`, mounted with
+  `tools.enabled` and `tools.inboundWebhooks.enabled` and a script runner named
+  (RS-15, §17.5) — which is when the list is read, and the only time; with the
+  route off it is stored and read by nothing, and reported as such.
 - `lazyEmailVerificationGracePeriodDays` is read by nothing **here or in the
   reference**: the reference's admin UI displays it and its server never computes
   a verification deadline from it ([config-schema.md](spec/config-schema.md)
@@ -2023,8 +2024,9 @@ core publish its `identity.*` events at all.
 | `tools.sse.enabled` | boolean | `false` — builds the in-process manager, which nothing listens to yet, §17.3 | `AWESOME_AUTH_SSE_ENABLED` |
 | `tools.sse.heartbeatIntervalMs` / `.deduplicate` | int / boolean | `30000` / `true` — passed to the manager | `AWESOME_AUTH_TOOLS_SSE_HEARTBEAT_INTERVAL_MS`, `…_DEDUPLICATE` |
 | `tools.sse.distributor.*` | block | `type: none` — **anything else is refused (RS-14)**, §17.3 | — (file-only) |
-| `tools.inboundWebhooks.enabled` | boolean | `true` — **refused (RS-15); write `false`**, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS` |
-| `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — mapped onto the core's `ScriptTimeout` for D9d | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
+| `tools.inboundWebhooks.enabled` | boolean | `true` — **refused (RS-15) unless `scriptRunnerFunction` is set; otherwise write `false`**, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS` |
+| `tools.inboundWebhooks.scriptTimeoutMs` | int 100–30000 | `5000` — the core's `ScriptTimeout`: the deadline on one **whole** script run, cut to what the auth invocation has left; read only with the route mounted (reported as inert otherwise when changed), §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS` |
+| `tools.inboundWebhooks.scriptRunnerFunction` | Lambda name or ARN | empty — the script-runner function (D9d); the SAM template sets its own `ScriptRunnerFunction` under `EnableInboundWebhooks`, §17.5 | `AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION` |
 | `tools.outboundWebhooks.payloadVersion` | string | `"1"` — the `version` member of every delivered envelope | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_PAYLOAD_VERSION` |
 | `tools.outboundWebhooks.defaults.maxRetries` / `.retryDelayMs` | int | `3` / `1000` — applied to every subscription row that carries no value of its own, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_MAX_RETRIES`, `…_RETRY_DELAY_MS` |
 | `tools.outboundWebhooks.queueUrl` (D9b) | string | empty — the in-process deliverer; an SQS queue URL enqueues every delivery for the webhook worker, §17.4 | `AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL` |
@@ -2065,7 +2067,7 @@ resolved to the reference's open door; it says `session` here because it is
 the shortest document that loads, and §17.6 is why a deployed stack should say
 `apiKey`, as the SAM template does. `inboundWebhooks.enabled: false` because
 the default is `true` and RS-15
-refuses it until a script runner exists (§17.5); `telemetry` because
+refuses it unless `scriptRunnerFunction` names a script runner (§17.5); `telemetry` because
 `tools.telemetry.enabled` defaults to `true` and the query route has to have a
 store; `webhooks` because a bridge with nowhere to look up subscriptions
 delivers to nobody.
@@ -2098,6 +2100,13 @@ leave them, D9c makes them live — and any of `stores.enable.telemetry`,
 the block off; `webhooks` and `apiKeys` with the block off and no admin console
 mounted; `apiKeys` under a posture other than `apiKey` with no console mounted,
 since the console's routes are the other reader of those two stores).
+
+`inbound webhooks mounted` (D9d) names the route, the script runner it invokes,
+the deadline, and the two facts an operator must not have to infer: the
+sandbox is the runner's IAM role, and the route is unguarded, as the
+reference's is. `inbound webhooks not mounted` says the route answers `404`.
+`tools.inboundWebhooks.scriptRunnerFunction` named with the route off is
+reported as an inert knob.
 
 ### 17.2 The bridge: the core's own events reach the sinks
 
@@ -2310,7 +2319,7 @@ the signature and the numbering are unchanged; only the transport is.
   never received within the webhook queue's fourteen days is lost without a
   trace** — a backlog deeper than the worker drains in that time, or a worker
   that cannot start: SQS deletes it and redrives nothing, and no alarm watches
-  the queue's age (it would be the eleventh alarm metric, past the free ten;
+  the queue's age (it would be one more alarm metric, USD 0.10 a month past the free ten;
   `docs/cost-model.md` §3.3). One alarm watches the DLQ's depth; nothing
   redelivers from it automatically — replaying a message is sending its body
   and attributes back to the webhook queue, and it will then carry the same
@@ -2344,13 +2353,16 @@ The stack side is `EnableWebhookQueue` in the SAM template, with
 `EnableTools`; off, none of it exists and nothing of it is billed
 (`docs/cost-model.md` §3.3).
 
-### 17.5 Inbound webhooks are refused until a runner exists
+### 17.5 Inbound webhooks run in the script runner (D9d)
 
 `tools.inboundWebhooks.enabled` defaults to `true`, because the reference
 mounts `POST <tools>/webhook/{provider}` by default, and **a tools document
-that leaves it there is refused at cold start (RS-15)**. It has to say
-`tools.inboundWebhooks.enabled: false` to load. That is the registered
-deviation `inbound-webhooks-are-refused-without-a-runner`.
+that leaves it there without naming a script runner is refused at cold start
+(RS-15)**. It has to set `tools.inboundWebhooks.scriptRunnerFunction`, or say
+`tools.inboundWebhooks.enabled: false`. That is the registered deviation
+`inbound-webhooks-are-refused-without-a-runner`, narrowed by D9d in place: the
+id and the rule number are D9a's, because the failure they prevent is the same
+one.
 
 The reason is what the route does with a subscription row's `jsScript`. The
 reference runs it in an in-process `vm`; the imported core will not
@@ -2359,22 +2371,50 @@ action allowlist across an `InboundScriptRunner` seam it fails **closed**
 without: `400`, nothing tracked. Every webhook provider treats a non-2xx as
 undelivered and redelivers — for hours, some for days — so a deployment that
 came up with the route mounted and no runner would answer a retry storm from
-the first event. A row with no script is no better served: the alternative
-handler, `OnWebhook`, is a host callback this product has no configuration
-path into, so such a row would be acknowledged and dropped. Refusing, and
-naming the line to write, is the honest answer; silently overriding the
-default to `false` would be a document that says one thing and deploys
-another.
+the first event.
 
-`tools.inboundWebhooks.scriptTimeoutMs` is mapped onto the core's
-`ScriptTimeout` regardless, and the webhook store is already handed to the
-route as its `InboundWebhookStore`, so the day the runner lands the change is
-one field.
+The runner is `cmd/script-runner`, a Lambda of its own that the auth function
+invokes synchronously (`internal/integration/aws`, `LambdaScriptRunner`), and
+**its IAM role is the sandbox**: it writes its own log group and nothing else.
+The auth function links no JavaScript engine at all
+(`TestTheAuthBinaryLinksNoJavaScriptEngine`); the runner embeds goja. The SAM
+template creates the function, its role, its log group, its one alarm and the
+`lambda:InvokeFunction` grant under `EnableInboundWebhooks`, and sets this knob
+to it; a deployment that runs the function elsewhere names that one here.
 
-**What D9d brings:** the runner as a Lambda of its own whose IAM role *is* the
-sandbox — the script gets the permissions the role has and no others — invoked
-across the seam with the timeout this knob sets. RS-15 and the deviation
-retire together.
+| Knob | Effect |
+|---|---|
+| `scriptRunnerFunction` | the function invoked; empty with the route on is RS-15. Named with the route off, it is reported as an inert knob |
+| `scriptTimeoutMs` | the core's `ScriptTimeout`: the deadline on the **whole** run, not the reference's synchronous part. A run that reaches it is refused `400` and redelivered. The auth function waits on the run, so the invoker cuts it to the auth invocation's remaining time less a second (the core drops that deadline; `App.Handle` records it); keep the function's `Timeout` above it, and the SAM template's `ScriptRunnerTimeout` at this in seconds plus one — the template caps it at 28 000. Read only with the route mounted; changed with the route off, it is reported as an inert knob |
+| `runtimeSettings.enabledWebhookActions` (§11) | the global half of the action allowlist, intersected with each row's `allowedActions`; read only with the route mounted |
+
+What a script sees and what each outcome does — a result is tracked, a script
+that decided nothing **or threw** is acknowledged, a run that could not be
+completed is refused and redelivered — is the operator runbook,
+[inbound-webhooks.md](inbound-webhooks.md), with the engine decision, what an
+action is, and the two edits (manifest and IAM) that add one. The runner's
+manifest ships **empty**, so no action is callable on this build, and
+`GET <admin>/api/actions` answers `[]` whatever the manifest holds
+(`admin-actions-list-omits-the-runner-manifest`). A row with no script is
+acknowledged and tracks nothing — the reference with no `onWebhook`, which is a
+host callback this product has no configuration path into. The engine's
+differences from V8 are the registered deviation
+`inbound-webhook-scripts-run-on-goja`, and the one behaviour that differs from what the
+reference's code *means* rather than what it does — this runner awaits the
+script, the reference's cross-realm `instanceof` skips the await — is
+`inbound-webhook-scripts-are-awaited`. Costs are
+[cost-model.md](cost-model.md) §3.3.
+
+**Who can make it run.** The route has no guard and checks no signature, as
+the reference's does not, so a caller that names a provider with a stored
+script runs it, at the caller's rate. The SAM template caps the runs in flight
+with `ScriptRunnerReservedConcurrency` (5 by default, free), and with
+`rateLimit.enabled` the route shares the `rateLimit` budget (§14) per client
+address and provider, answering the registered `429` before the runner is
+invoked (`rate-limited-routes-answer-429`) — it has no name in
+`rateLimit.scope`, like the console's two limited routes, and follows
+`rateLimit.enabled` alone. A provider that sends more than `rateLimit.max` per
+window from one address is refused and redelivers.
 
 ### 17.6 The four postures, priced
 
@@ -2593,7 +2633,7 @@ through it and not through any route:
 |---|---|---|
 | D9b (landed) | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field, behind `tools.outboundWebhooks.queueUrl`; `outgoing-webhook-delivery-races-the-response` stays for the default, unqueued configuration (§17.4) |
 | D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
-| D9d | `InboundScriptRunner` as its own Lambda | `ScriptRunner: nil`, one field; retires RS-15 and `inbound-webhooks-are-refused-without-a-runner` |
+| D9d | `InboundScriptRunner` as its own Lambda — **landed** | `ScriptRunner` is `LambdaScriptRunner` when `scriptRunnerFunction` is named; RS-15 and `inbound-webhooks-are-refused-without-a-runner` are narrowed to a route with no runner rather than retired (§17.5) |
 
 ## 18. Two worked postures
 

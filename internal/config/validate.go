@@ -630,6 +630,14 @@ func validateTools(c *Config, d *diagnostics) {
 			fmt.Sprintf("%d ms is outside the supported range 100-30000", t),
 			"the reference hardcodes 5000; stay near it")
 	}
+	// D9d. Shape only: whether the function exists, and whether this
+	// function's role may invoke it, is something only the first webhook can
+	// find out, and the answer then is the core's 400 and a redelivery.
+	if fn := c.Tools.InboundWebhooks.ScriptRunnerFunction; fn != "" && (strings.TrimSpace(fn) != fn || strings.ContainsAny(fn, " \t\r\n")) {
+		d.errf("", "tools.inboundWebhooks.scriptRunnerFunction",
+			fmt.Sprintf("%q contains whitespace, which no Lambda function name or ARN does", fn),
+			"write the function's name or ARN exactly, as the SAM template's ScriptRunnerFunction does")
+	}
 	if r := c.Tools.OutboundWebhooks.Defaults.MaxRetries; r < 0 || r > 10 {
 		d.errf("", "tools.outboundWebhooks.defaults.maxRetries",
 			fmt.Sprintf("%d is outside the supported range 0-10", r),

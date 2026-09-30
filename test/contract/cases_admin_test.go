@@ -349,7 +349,8 @@ func init() {
 }
 
 // PUT and PATCH are the two methods this file adds to the client: the settings
-// routes are the only PUT and PATCH on any surface the suite covers.
+// routes are the only PUT on any surface the suite covers, and the only PATCH
+// besides the webhook row cases_tools_inbound_test.go writes.
 func (c *Client) PUT(t *testing.T, path string, b body, opts ...reqOpt) *Resp {
 	t.Helper()
 	return c.do(t, http.MethodPut, path, b, opts)

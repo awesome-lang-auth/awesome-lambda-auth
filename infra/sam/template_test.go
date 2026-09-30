@@ -22,6 +22,7 @@ package sam
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -54,6 +55,10 @@ type template struct {
 	parameters map[string]entry
 	resources  map[string]*resource
 	order      []string
+	// conditions holds every condition written on one line, name to
+	// expression. A multi-line condition is absent, and every assertion that
+	// reads one says which it needs, so a miss fails rather than passes.
+	conditions map[string]string
 }
 
 var (
@@ -62,6 +67,8 @@ var (
 	blockField  = regexp.MustCompile(`^    ([A-Za-z0-9]+):\s*(.*)$`)
 	propField   = regexp.MustCompile(`^      ([A-Za-z0-9]+):\s*(.*)$`)
 	listItem    = regexp.MustCompile(`^      - (.+)$`)
+	// conditionLine is a one-line condition: `  Name: !Expr ...`.
+	conditionLine = regexp.MustCompile(`^  ([A-Za-z0-9]+):\s*(!.+)$`)
 )
 
 func skip(line string) bool {
@@ -81,7 +88,7 @@ func load(t *testing.T) *template {
 	}
 	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
 
-	tpl := &template{parameters: map[string]entry{}, resources: map[string]*resource{}}
+	tpl := &template{parameters: map[string]entry{}, resources: map[string]*resource{}, conditions: map[string]string{}}
 	section := ""
 	var current *resource
 	var currentParam *entry
@@ -98,6 +105,10 @@ func load(t *testing.T) *template {
 			continue
 		}
 		switch section {
+		case "Conditions":
+			if m := conditionLine.FindStringSubmatch(line); m != nil {
+				tpl.conditions[m[1]] = strings.TrimSpace(m[2])
+			}
 		case "Parameters":
 			if m := blockName.FindStringSubmatch(line); m != nil {
 				tpl.parameters[m[1]] = entry{name: m[1], fields: map[string]string{}}
@@ -296,6 +307,22 @@ const freeAlarmMetrics = 10
 // quartet is four alarm metrics and this product has four more functions coming
 // — and the point is that it fails while somebody is in a position to decide,
 // rather than showing up as a line on a bill.
+//
+// ── D9d: the count is of the alarms enabled by default ──────────────────────
+//
+// The count is of the alarms a stack gets **with every parameter at its
+// default**: those whose Condition is AlarmsEnabled alone, plus any gated on a
+// feature switch this file cannot show to be off by default. An alarm that
+// belongs to an optional function is gated on that function's own switch as
+// well (it has to be: an alarm on a function that does not exist cannot Ref
+// it); when its gate is declared in offByDefaultAlarmGates — which
+// TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled verifies is an
+// !And over AlarmsEnabled and a parameter that defaults to off — it is left out
+// of the count and priced in docs/cost-model.md §3.3 instead. An undeclared
+// gate is counted, so a gate nobody declared can make the count too high but
+// never too low. The all-on total — every optional function switched on — is
+// asserted against the number docs/cost-model.md §3.3 states, so an optional
+// alarm cannot leave the count without its price being written down.
 func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	t.Parallel()
 	tpl := load(t)
@@ -304,14 +331,123 @@ func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	if len(alarms) == 0 {
 		t.Fatal("the template declares no alarms at all")
 	}
-	if len(alarms) > freeAlarmMetrics {
-		t.Errorf("the template declares %d alarms, past CloudWatch's free %d.\n\n"+
-			"That is about USD %.2f a month, which may well be the right call — the per-function set is "+
-			"four alarm metrics and this product has more functions coming. If it is: raise the number "+
+	byDefault, optional := 0, map[string][]string{}
+	for _, a := range alarms {
+		if param, ok := offByDefaultAlarmGates[a.condition]; ok {
+			optional[param] = append(optional[param], a.name)
+			continue
+		}
+		byDefault++
+	}
+	if byDefault > freeAlarmMetrics {
+		t.Errorf("the template enables %d alarms by default, past CloudWatch's free %d.\n\n"+
+			"That is about USD %.2f a month, which may well be the right call. If it is: raise the number "+
 			"here and update the alarm costs in docs/cost-model.md and infra/sam/README.md in the same "+
 			"commit, so the stack's monthly cost stays written down somewhere true.",
-			len(alarms), freeAlarmMetrics, float64(len(alarms)-freeAlarmMetrics)*0.10)
+			byDefault, freeAlarmMetrics, float64(byDefault-freeAlarmMetrics)*0.10)
 	}
+	for param, names := range optional {
+		t.Logf("%s adds %d alarm(s) when on: %v (docs/cost-model.md §3.3)", param, len(names), names)
+	}
+	// The all-on total is asserted, not logged: it must be the number
+	// docs/cost-model.md §3.3 states, so that declaring a gate above is a
+	// priced decision somebody wrote down rather than an alarm that
+	// disappeared from the count. A block that adds an optional alarm changes
+	// the template and that sentence in the same commit, or this fails.
+	allOn := len(alarms)
+	stated := statedAllOnAlarms(t)
+	if allOn != stated {
+		extra := 0.0
+		if allOn > freeAlarmMetrics {
+			extra = float64(allOn-freeAlarmMetrics) * 0.10
+		}
+		t.Errorf("with every optional function switched on the template declares %d alarm metrics (%d by default), "+
+			"and docs/cost-model.md §3.3 states %d. Update its \"All-on total\" line — %d is USD %.2f a month past the "+
+			"free %d in an account with no other alarms — or the gate that changed the count.",
+			allOn, byDefault, stated, allOn, extra, freeAlarmMetrics)
+	}
+}
+
+// allOnAlarmsLine is the sentence in docs/cost-model.md §3.3 that states the
+// all-on alarm total.
+var allOnAlarmsLine = regexp.MustCompile(`\*\*All-on total: (\d+) alarm metrics\*\*`)
+
+func statedAllOnAlarms(t *testing.T) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "cost-model.md"))
+	if err != nil {
+		t.Fatalf("read docs/cost-model.md: %v", err)
+	}
+	m := allOnAlarmsLine.FindAllStringSubmatch(string(raw), -1)
+	if len(m) != 1 {
+		t.Fatalf("docs/cost-model.md states the all-on alarm total %d times, want once as **All-on total: N alarm metrics**", len(m))
+	}
+	n, _ := strconv.Atoi(m[0][1])
+	return n
+}
+
+// offByDefaultAlarmGates maps each alarm condition other than AlarmsEnabled to
+// the parameter that switches the resource it watches on. Each block that adds
+// an optional function adds its own line.
+var offByDefaultAlarmGates = map[string]string{
+	"WebhookQueueAlarmed":       "EnableWebhookQueue",    // D9b
+	"ScriptRunnerAlarmsEnabled": "EnableInboundWebhooks", // D9d
+}
+
+// TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled keeps the
+// table above honest: every declared gate is an !And whose first term is
+// AlarmsEnabled — so EnableAlarms still turns the whole set off in one place —
+// and reaches, through its !Condition terms, a parameter that defaults to off.
+func TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	for gate, param := range offByDefaultAlarmGates {
+		expr, ok := tpl.conditions[gate]
+		if !ok {
+			t.Errorf("condition %s is not declared on one line", gate)
+			continue
+		}
+		if !gatedOnAlarmsEnabled(tpl, gate) {
+			t.Errorf("%s = %s; want !And [!Condition AlarmsEnabled, !Condition <feature>]", gate, expr)
+		}
+		// On only when the switch says "true", not merely mentioning it.
+		if !conditionReaches(tpl, gate, "!Equals [!Ref "+param+", 'true']", 0) {
+			t.Errorf("%s does not reach !Equals [!Ref %s, 'true'], so the parameter does not switch the alarm on and only on", gate, param)
+		}
+		if d := literal(tpl.parameters[param].fields["Default"]); d != "false" {
+			t.Errorf("%s defaults to %q; an alarm gate that is on by default must be counted, not declared here", param, d)
+		}
+	}
+}
+
+// conditionReaches reports whether a condition's expression, or one of the
+// conditions it names, mentions want.
+func conditionReaches(tpl *template, name, want string, depth int) bool {
+	expr, ok := tpl.conditions[name]
+	if !ok || depth > 5 {
+		return false
+	}
+	if strings.Contains(expr, want) {
+		return true
+	}
+	for _, m := range regexp.MustCompile(`!Condition ([A-Za-z0-9]+)`).FindAllStringSubmatch(expr, -1) {
+		if conditionReaches(tpl, m[1], want, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// gatedOnAlarmsEnabled accepts an alarm condition that is an !And over
+// AlarmsEnabled and the switch of the feature the alarm watches. An alarm on a
+// resource that exists only with a feature must be gated on that feature too —
+// CloudFormation refuses a reference to a resource whose condition is false —
+// and EnableAlarms must still turn it off, which the AlarmsEnabled term is.
+// It reads the one Conditions parser, load's tpl.conditions.
+func gatedOnAlarmsEnabled(tpl *template, condition string) bool {
+	// The first term, literally: a bare Contains would accept
+	// !And [!Not [!Condition AlarmsEnabled], …], which is the opposite.
+	return strings.HasPrefix(tpl.conditions[condition], "!And [!Condition AlarmsEnabled, !Condition ")
 }
 
 // TestEveryAlarmIsActionableAndGated: an alarm with no action is decoration, and
@@ -344,7 +480,7 @@ func TestEveryAlarmIsActionableAndGated(t *testing.T) {
 				"DynamoDB metrics at all, and an alarm that fires because nothing happened is an alarm "+
 				"somebody turns off", a.name)
 		}
-		if a.condition != "AlarmsEnabled" && !gatedOnAlarmsEnabled(t, a.condition) {
+		if a.condition != "AlarmsEnabled" && !gatedOnAlarmsEnabled(tpl, a.condition) {
 			t.Errorf("%s has Condition %q, want AlarmsEnabled — or a feature condition defined as "+
 				"!And [!Condition AlarmsEnabled, …] — so that EnableAlarms turns the whole set "+
 				"off in one place", a.name, a.condition)
@@ -415,42 +551,6 @@ func numericDefault(t *testing.T, tpl *template, name string) float64 {
 
 // ── D9b: the webhook queue ──────────────────────────────────────────────────
 
-// conditionDefinition returns the one-line definition of a named condition
-// under Conditions:, or "" when there is none. The reader above does not parse
-// that section; the conditions an alarm may be gated on are one-liners by
-// convention, and a multi-line one simply fails the check that needs it.
-func conditionDefinition(t *testing.T, name string) string {
-	t.Helper()
-	raw, err := os.ReadFile(templateFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", templateFile, err)
-	}
-	inConditions := false
-	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
-		if m := topLevelKey.FindStringSubmatch(line); m != nil {
-			inConditions = m[1] == "Conditions"
-			continue
-		}
-		if inConditions && strings.HasPrefix(line, "  "+name+":") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "  "+name+":"))
-		}
-	}
-	return ""
-}
-
-// gatedOnAlarmsEnabled accepts an alarm condition that is an !And over
-// AlarmsEnabled and the switch of the feature the alarm watches. An alarm on a
-// resource that exists only with a feature must be gated on that feature too —
-// CloudFormation refuses a reference to a resource whose condition is false —
-// and EnableAlarms must still turn it off, which the AlarmsEnabled term is.
-func gatedOnAlarmsEnabled(t *testing.T, condition string) bool {
-	t.Helper()
-	def := conditionDefinition(t, condition)
-	// The first term, literally: a bare Contains would accept
-	// !And [!Not [!Condition AlarmsEnabled], …], which is the opposite.
-	return strings.HasPrefix(def, "!And [!Condition AlarmsEnabled,")
-}
-
 // statement returns the text of the IAM statement with the given Sid inside a
 // resource body, up to the next statement or the end of the body.
 func statement(body, sid string) string {
@@ -502,7 +602,7 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 			t.Errorf("%s has Condition %q, want WebhookQueueEnabled: an empty parameter adds no resource and no cost", name, r.condition)
 		}
 	}
-	if def := conditionDefinition(t, "WebhookQueueEnabled"); !strings.Contains(def, "!Condition ToolsEnabled") || !strings.Contains(def, "EnableWebhookQueue") {
+	if def := tpl.conditions["WebhookQueueEnabled"]; !strings.Contains(def, "!Condition ToolsEnabled") || !strings.Contains(def, "EnableWebhookQueue") {
 		t.Errorf("WebhookQueueEnabled = %q, want it to need both EnableTools and EnableWebhookQueue", def)
 	}
 	if got := tpl.parameters["EnableWebhookQueue"].fields["Default"]; got != "'false'" {
@@ -632,7 +732,7 @@ func TestTheWebhookQueueIsConditionalEncryptedAndConsistent(t *testing.T) {
 	if !ok {
 		t.Fatal("the dead-letter alarm is gone: a webhook that gave up is exactly the event nobody sees otherwise")
 	}
-	if alarm.condition != "WebhookQueueAlarmed" || !gatedOnAlarmsEnabled(t, alarm.condition) {
+	if alarm.condition != "WebhookQueueAlarmed" || !gatedOnAlarmsEnabled(tpl, alarm.condition) {
 		t.Errorf("WebhookDeadLetterAlarm Condition = %q, want WebhookQueueAlarmed over AlarmsEnabled", alarm.condition)
 	}
 	if !strings.Contains(alarm.body, "ApproximateNumberOfMessagesVisible") || !strings.Contains(alarm.body, "WebhookDLQ.QueueName") {

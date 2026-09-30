@@ -126,6 +126,16 @@ type Options struct {
 	// auth.WebhookDeliverer and not awsintegration.SQSAPI, for the reason
 	// IDPKeySource is not KMSAPI.
 	WebhookDeliverer auth.WebhookDeliverer
+
+	// ScriptRunner (D9d) injects the inbound-webhook script runner, for the
+	// reason Mail and SMS are injectable: a composition that runs scripts in
+	// another Lambda has to be provable without one. Nil builds the real
+	// invoker (awsintegration.NewLambdaScriptRunner), lazily. Injecting it
+	// switches nothing on — whether a runner is wired at all is a question
+	// about tools.inboundWebhooks (scriptrunner.go, newScriptRunner). It is the
+	// core's auth.InboundScriptRunner and not awsintegration.LambdaAPI, for the
+	// reason IDPKeySource is not KMSAPI.
+	ScriptRunner auth.InboundScriptRunner
 }
 
 // App is one cold start's worth of state.
@@ -319,6 +329,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// D9d: the inbound-webhook script runner, onto the wiring the router is
+	// built from. No I/O; the Lambda client is built on the first webhook.
+	if tools != nil {
+		if tools.scriptRunner, err = newScriptRunner(cfg, opts.ScriptRunner); err != nil {
+			return nil, err
+		}
+	}
 
 	core, err := buildCore(ctx, cfg, opts, users, sessions, deliver, tools, log)
 	if err != nil {
@@ -380,13 +397,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
 	logToolsSurface(cfg, tools, log)
+	logScriptRunnerSurface(cfg, tools, log) // D9d
 
 	// The middleware chain is one function, assembleHandler, so that the test
 	// harness (admin_test.go newAdminSurface) builds the very chain New builds
 	// and a header this binary adds -- or must not add -- is seen where it is
 	// asserted. The console's login limiter is built here for the reason the
 	// other two are: it counts with the shared counter.
-	handler := assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log))
+	// D9d: the inbound-webhook limiter rides in the same slot, inside the
+	// login's; each matches its own route and passes everything else through
+	// (scriptrunner.go, newInboundWebhookLimiter).
+	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, log), newInboundWebhookLimiter(cfg, counter, log)
+	handler := assembleHandler(cfg, log, mux, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
 
 	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools}
 	if tools != nil {
@@ -590,6 +612,13 @@ func (a *App) Handle(ctx context.Context, payload json.RawMessage) (json.RawMess
 	if lc, ok := lambdacontext.FromContext(ctx); ok && lc.AwsRequestID != "" {
 		log = log.With(slog.String("requestId", lc.AwsRequestID))
 	}
+	// D9d: the invocation's deadline as a value, because the core runs the
+	// inbound-webhook script under context.WithoutCancel, which drops the
+	// deadline and keeps values; the script-runner invoker reads it back so
+	// that a script deadline longer than this function's Timeout ends in the
+	// core's 400 rather than in Lambda killing this invocation mid-Invoke
+	// (internal/integration/aws, WithInvocationDeadline).
+	ctx = awsintegration.WithInvocationDeadline(ctx)
 	resp, err := a.adapter.Handle(withLogger(ctx, log), payload)
 	// D9b: the enqueues this request started finish before the runtime gets the
 	// response and freezes the environment (webhook_queue.go). A no-op without
@@ -1285,6 +1314,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, adminKnobGaps(cfg)...)
 	gaps = append(gaps, toolsKnobGaps(cfg)...)
 	gaps = append(gaps, webhookQueueKnobGaps(cfg)...) // D9b
+	gaps = append(gaps, scriptRunnerKnobGaps(cfg)...) // D9d
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

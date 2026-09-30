@@ -100,6 +100,9 @@ Metadata:
           - LogIngestionAlarmBytes
       - Label: {default: Budget}
         Parameters: [BudgetLimitUsd, BudgetTimeUnit, EnableCostAnomalyDetection]
+      # D9d
+      - Label: {default: Inbound webhooks (script runner)}
+        Parameters: [EnableInboundWebhooks, InboundScriptTimeoutMs, ScriptRunnerTimeout, ScriptRunnerReservedConcurrency, ScriptRunnerDurationAlarmThresholdMs]
 
 Parameters:
 
@@ -811,6 +814,91 @@ Parameters:
       the total: every message enqueued is eventually received and attempted,
       so the bill follows arrivals (docs/cost-model.md §3.3).
 
+  # --- D9d: the inbound-webhook script runner --------------------------
+  #
+  # POST <ToolsBasePath>/webhook/{provider} runs the stored row's jsScript.
+  # The auth core runs no JavaScript in process, by the owner's decision, so
+  # the script runs in ScriptRunnerFunction — a Lambda of its own whose IAM
+  # role writes its own log group and NOTHING else. That role is the sandbox
+  # (docs/inbound-webhooks.md). Off by default: with EnableInboundWebhooks
+  # "false" there is no function, no role, no log group, no alarm and no IAM
+  # statement, and the route is not mounted — which costs nothing.
+  EnableInboundWebhooks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      "true" mounts POST <ToolsBasePath>/webhook/{provider} and creates the
+      script-runner function its mapping scripts run in, invoked synchronously
+      by the auth function. Requires EnableTools. The route has no guard and
+      verifies no provider signature, exactly as the reference's does not: ANY
+      caller that names a provider with a stored script runs that script, at a
+      rate the caller chooses. What caps that is ScriptRunnerReservedConcurrency
+      (and the rateLimit block, per address and provider); see
+      docs/cost-model.md §3.3. Scripts can call no action on this build — the
+      runner's manifest ships empty — and an action added to it needs its IAM
+      granted to ScriptRunnerRole.
+  # 28000, not the configuration's 30000: the auth function waits on the
+  # runner, its Timeout tops out at 29 s (the HTTP API's integration limit),
+  # and it needs a second after the Invoke to track and answer. The auth
+  # function also cuts the deadline to its own remaining time at run time
+  # (internal/integration/aws, WithInvocationDeadline), so a value above
+  # Timeout degrades to a 400 rather than a killed invocation.
+  InboundScriptTimeoutMs:
+    Type: Number
+    Default: 5000
+    MinValue: 100
+    MaxValue: 28000
+    Description: >-
+      AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS — the deadline on
+      one whole script run, the reference's own 5000 by default. A run that
+      reaches it is refused 400 and the provider redelivers. **Raise
+      ScriptRunnerTimeout with it** (this in seconds, plus one), **and keep
+      it at least a second below Timeout × 1000**: the auth function waits on
+      the run, and past its own remaining time the run is cut short and
+      refused 400 anyway.
+  ScriptRunnerTimeout:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      The runner function's Timeout, in seconds: InboundScriptTimeoutMs / 1000
+      + 1, so the function outlives the deadline it enforces and a looping
+      script ends with the runner's own error rather than Lambda's kill.
+      CloudFormation cannot do the arithmetic; infra/sam/template_test.go
+      asserts the defaults and the maxima stay related.
+  ScriptRunnerReservedConcurrency:
+    Type: String
+    Default: '5'
+    AllowedPattern: '^$|^[0-9]{1,5}$'
+    ConstraintDescription: >-
+      ScriptRunnerReservedConcurrency must be a whole number of execution
+      environments, or empty for no reservation. 0 is a real value and means
+      "throttle every run", which refuses every webhook with a script.
+    Description: >-
+      The most script runs in flight at once, account-wide. Free — a
+      reservation only carves this many environments out of the account's
+      unreserved pool — and the one hard cap on what a stranger calling the
+      unauthenticated inbound route can spend: each in-flight run holds this
+      function and an auth environment waiting on it. A run over the cap is
+      throttled, refused 400, and redelivered by the provider. Empty reserves
+      nothing and leaves the runner drawing on the account pool uncapped.
+      Lambda refuses a reservation that would leave the account's unreserved
+      pool below its minimum (100 on a standard quota), so an account on a
+      low quota — a new one often starts at 10 — fails the deploy with this
+      set; set it empty there, or raise the quota.
+  ScriptRunnerDurationAlarmThresholdMs:
+    Type: Number
+    Default: 4000
+    MinValue: 1
+    MaxValue: 30000
+    Description: >-
+      Alarm when a script run takes this long. 80% of the default
+      InboundScriptTimeoutMs: the exposure of this function is a script that
+      loops, which bills the whole deadline on every delivery and every
+      redelivery. Lower it with InboundScriptTimeoutMs.
+
   # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
   # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
@@ -872,9 +960,13 @@ Parameters:
     Default: 10
     MinValue: 1
     MaxValue: 29
+    # D9d: the auth function waits on the inbound-webhook script runner, so
+    # this is also the ceiling on InboundScriptTimeoutMs.
     Description: >-
       Seconds. Not the 15-minute default: nothing in the auth router should
       take longer than an API Gateway integration is willing to wait (29s).
+      With EnableInboundWebhooks, keep it above InboundScriptTimeoutMs / 1000
+      plus a second: the auth function waits on every script run.
 
   # Concurrency. This is the only HARD stop in the stack, and it is off by
   # default — see the AlarmEmail note below for why nothing else here is one.
@@ -1147,10 +1239,10 @@ Parameters:
   # DynamoDB MaxRead/MaxWriteRequestUnits ceilings. Everything here is how you
   # find out in ten minutes instead of at the end of the month.
   #
-  # Costs. Nine standard-resolution alarm metrics (ten with EnableWebhookQueue,
-  # D9b), against a CloudWatch
-  # always-free allowance of ten — so in an account with no other alarms this
-  # section is free, and USD 0.90/month (1.00 with the queue) in one that has already spent the
+  # Costs. Nine standard-resolution alarm metrics by default (each optional
+  # function adds its own, gated on its switch: docs/cost-model.md §3.3),
+  # against a CloudWatch always-free allowance of ten — so in an account with no
+  # other alarms this section is free, and USD 0.90/month in one that has already spent the
   # allowance. The SNS topic and its subscription cost nothing at rest and are
   # not created at all unless AlarmEmail is set. The budget is the second budget
   # in an account that has the AWS-provided zero-spend one, and the first two per
@@ -1174,7 +1266,7 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      Create the nine CloudWatch alarms (ten with EnableWebhookQueue). On by default: they are within the
+      Create the nine CloudWatch alarms (plus one per optional function switched on, docs/cost-model.md §3.3). On by default: they are within the
       always-free ten alarm metrics, and an unmonitored serverless stack is the
       failure mode this section exists to prevent. Turn them off only in an
       account whose free allowance is already spent and where 0.90 USD/month is
@@ -1346,6 +1438,13 @@ Conditions:
   # The dead-letter alarm follows both switches: EnableAlarms turns the whole
   # set off in one place, and there is no queue to watch without the other.
   WebhookQueueAlarmed: !And [!Condition AlarmsEnabled, !Condition WebhookQueueEnabled]
+  # D9d. The runner exists only with the tools block, which mounts the route;
+  # the Rule InboundWebhooksNeedTheToolsBlock refuses the other combination
+  # rather than letting it deploy a function nothing invokes. Its one alarm is
+  # gated on the same switch, so a stack without the runner pays for no alarm.
+  InboundWebhooksEnabled: !And [!Condition ToolsEnabled, !Equals [!Ref EnableInboundWebhooks, 'true']]
+  ScriptRunnerAlarmsEnabled: !And [!Condition AlarmsEnabled, !Condition InboundWebhooksEnabled]
+  HasScriptRunnerReservation: !Not [!Equals [!Ref ScriptRunnerReservedConcurrency, '']]
 
   IdpEnabled: !Equals [!Ref EnableIdp, 'true']
   HasIdpIssuer: !Not [!Equals [!Ref IdpIssuer, '']]
@@ -1662,6 +1761,16 @@ Rules:
           EnableCostAnomalyDetection is "true", so set AlarmEmail or AlarmTopicArn.
           A cost anomaly subscription requires a subscriber, and one that notified
           nothing would be a detector whose output nobody ever sees.
+
+  # D9d. Parameter-only: the route and the runner are both this template's.
+  InboundWebhooksNeedTheToolsBlock:
+    RuleCondition: !Equals [!Ref EnableInboundWebhooks, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref EnableTools, 'true']
+        AssertDescription: >-
+          EnableInboundWebhooks is "true", so set EnableTools to "true" as well.
+          The inbound route is part of the tools router; without it the script
+          runner would be a function nothing ever invokes.
 
 Resources:
 
@@ -2185,15 +2294,19 @@ Resources:
           # parameter decides and a ConfigFile document cannot override it —
           # nor, with the block on, AWESOME_AUTH_TOOLS_AUTH: the environment
           # layer wins over the document (see the parameters). Inbound
-          # webhooks are written off explicitly
-          # because the schema defaults them ON, as the reference does, and
-          # RS-15 refuses that until the script runner (D9d) exists: the
-          # config layer will not silently override a default, so the
-          # template says the line the document would have to say.
+          # webhooks are always written explicitly under the block, because
+          # the schema defaults them ON, as the reference does, and RS-15
+          # refuses that unless a script runner is named: the config layer
+          # will not silently override a default, so the template says the
+          # line the document would have to say — EnableInboundWebhooks, and
+          # with it "true" the runner this stack creates (D9d).
           AWESOME_AUTH_TOOLS_ENABLED: !Ref EnableTools
           AWESOME_AUTH_TOOLS_AUTH: !If [ToolsEnabled, !Ref ToolsAuth, !Ref 'AWS::NoValue']
           AWESOME_AUTH_TOOLS_BASE_PATH: !If [ToolsEnabled, !Ref ToolsBasePath, !Ref 'AWS::NoValue']
-          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, 'false', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS: !If [ToolsEnabled, !Ref EnableInboundWebhooks, !Ref 'AWS::NoValue']
+          # D9d: the runner and the deadline on one run, only with the route.
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION: !If [InboundWebhooksEnabled, !Ref ScriptRunnerFunction, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS: !If [InboundWebhooksEnabled, !Ref InboundScriptTimeoutMs, !Ref 'AWS::NoValue']
           # The two stores the block's defaults require, and the third the
           # apiKey posture verifies against. All three are partitions of the
           # one table; no new resource and no new IAM action.
@@ -2698,6 +2811,24 @@ Resources:
                 Resource: !GetAtt WebhookQueue.Arn
           - !Ref 'AWS::NoValue'
 
+        # -----------------------------------------------------------------
+        # D9d: invoking the script runner, and nothing else in Lambda. One
+        # action on one function ARN — not lambda:*, not a wildcard ARN, and
+        # not lambda:InvokeAsync: the call is synchronous by contract
+        # (internal/integration/aws/lambda_invoke.go). Absent while
+        # EnableInboundWebhooks is "false".
+        # -----------------------------------------------------------------
+        - !If
+          - InboundWebhooksEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeScriptRunner
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ScriptRunnerFunction.Arn
+          - !Ref 'AWS::NoValue'
+
       Events:
         Root:
           Type: HttpApi
@@ -2890,6 +3021,105 @@ Resources:
               - ReportBatchItemFailures
             ScalingConfig:
               MaximumConcurrency: !Ref WebhookWorkerMaxConcurrency
+
+  # ---------------------------------------------------------------------
+  # D9d: the inbound-webhook script runner
+  #
+  # cmd/script-runner, invoked synchronously by the auth function across the
+  # core's InboundScriptRunner seam. It holds the JavaScript engine the auth
+  # function must never link (goja), and it is where administrator-authored
+  # script runs — so what the script can reach is exactly what THIS role
+  # grants, and it grants writing this function's own log group and nothing
+  # else: no table, no secret, no key, no other function, no network-facing
+  # AWS API. That is the sandbox; the engine only guarantees that a script has
+  # no primitive (require, fetch, process, timers) to reach anything with.
+  #
+  # An action in the runner's manifest (internal/scriptrunner, Shipped) is the
+  # one door out, and adding one means adding its IAM to ScriptRunnerRole in
+  # the same change. The manifest ships empty, so the role below is complete.
+  #
+  # An explicit role rather than SAM's generated one: the generated role
+  # attaches AWSLambdaBasicExecutionRole, which grants logs:CreateLogGroup and
+  # the two write actions on "*" — every log group in the account.
+  # CreateLogGroup is not needed at all, because the group is this stack's.
+  #
+  # 256 MB: a mapping script is small and short, goja's working set is a few
+  # MB, and memory buys CPU on Lambda, which a script that loops would only
+  # spend faster. No Events and no Function URL: the only caller is the auth
+  # function. That does NOT bound the rate: the inbound route is
+  # unauthenticated, so anyone who names a provider with a stored script
+  # decides how many runs happen, and each in-flight run holds this function
+  # and an auth environment waiting on it, both from the account's pool. The
+  # hard cap is ScriptRunnerReservedConcurrency (5 by default, free); the
+  # rateLimit block adds a per-address, per-provider budget in front of the
+  # route (cmd/auth ratelimit.go, newInboundWebhookLimiter). The cost is
+  # duration — alarmed below — times a rate the caller chooses, up to the cap
+  # (docs/cost-model.md §3.3).
+  # ---------------------------------------------------------------------
+
+  ScriptRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: InboundWebhooksEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-script-runner'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ScriptRunnerRole:
+    Type: AWS::IAM::Role
+    Condition: InboundWebhooksEnabled
+    Properties:
+      Description: The script runner's sandbox. Writes its own log group and nothing else.
+      # No aws:SourceAccount / aws:SourceArn condition, like the auth
+      # function's role: Lambda's documentation for execution roles names no
+      # such key on the service's AssumeRole, and a condition on a key the
+      # request does not carry fails closed — every run AccessDenied, every
+      # webhook a 400 — which no test here can see and no deploy of this
+      # block has checked. The role is assumable only by a function this
+      # stack attaches it to, which requires iam:PassRole on it.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-log-group
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The log group's Arn attribute ends in ':*', which covers its
+              # log streams and nothing outside the group.
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ScriptRunnerLogGroup.Arn
+
+  ScriptRunnerFunction:
+    Type: AWS::Serverless::Function
+    Condition: InboundWebhooksEnabled
+    DependsOn: ScriptRunnerLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-script-runner'
+      Description: !Sub 'awesome-lambda-auth inbound-webhook script runner for ${AWS::StackName}'
+      # Built by scripts/build-lambda.sh with LAMBDAS naming script-runner.
+      # `cloudformation package` uploads it whether or not the Condition
+      # holds, which is why scripts/deploy.sh checks every CodeUri.
+      CodeUri: ../../dist/script-runner-lambda.zip
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: !Ref ScriptRunnerTimeout
+      ReservedConcurrentExecutions: !If [HasScriptRunnerReservation, !Ref ScriptRunnerReservedConcurrency, !Ref 'AWS::NoValue']
+      Role: !GetAtt ScriptRunnerRole.Arn
+      Environment:
+        Variables:
+          # The one variable it reads: the sandbox console writes outside
+          # production and is silent in it, the reference's NODE_ENV rule.
+          AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT: !Ref DeploymentEnvironment
 
   # ---------------------------------------------------------------------
   # Admin uploads
@@ -3163,7 +3393,7 @@ Resources:
   # Observability
   # =====================================================================
   #
-  # Nine alarms (ten with EnableWebhookQueue), one optional topic to send them to, one optional budget and one
+  # Nine alarms by default (plus one per optional function switched on), one optional topic to send them to, one optional budget and one
   # optional anomaly monitor. Each alarm below states the incident it catches and
   # why its threshold is that number, because an alarm whose threshold nobody can
   # justify is an alarm somebody eventually silences.
@@ -3405,6 +3635,51 @@ Resources:
         - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
         - !Ref 'AWS::NoValue'
 
+  # ── D9d: the script runner ──────────────────────────────────────────
+  #
+  # One alarm, not the quartet, and gated on the runner's own switch as well
+  # as EnableAlarms, so a stack without the runner does not have it
+  # (infra/sam/template_test.go counts the alarms enabled by default and
+  # names the gated ones; docs/cost-model.md §3.3 states the all-on total).
+  #
+  # Duration is the one that catches this function's failure mode. The
+  # exposure is a script that loops: every delivery bills the whole deadline,
+  # and the core refuses the run so the provider redelivers and bills it
+  # again. Errors would fire on the same incident a period later and on
+  # nothing else worth waking for — a script that throws is not an error by
+  # contract. Concurrency is capped by ScriptRunnerReservedConcurrency, not
+  # alarmed: a run over the cap is throttled, refused 400 and redelivered,
+  # and the auth function's own concurrency and duration alarms see the
+  # flood, since every run holds an auth environment waiting on it.
+  #
+  # One period, not two: a provider redelivers on its own schedule, minutes
+  # to hours apart, so a looping script is one slow datapoint per window and
+  # "twice running" would almost never be true of it.
+  ScriptRunnerDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ScriptRunnerAlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-script-runner-duration'
+      AlarmDescription: >-
+        An inbound-webhook script ran close to its deadline. The usual cause is a
+        script that loops or awaits something slow; each such run bills the whole
+        deadline, is refused 400, and the provider redelivers it. Find the
+        provider in the script-runner log group and fix or clear its jsScript.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ScriptRunnerFunction}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ScriptRunnerDurationAlarmThresholdMs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
   # ── the table ───────────────────────────────────────────────────────
   #
   # Throttles and consumed capacity, read and write kept apart in both pairs. The
@@ -3575,9 +3850,9 @@ Resources:
   # deeper than the worker drains in that time, or a worker that cannot start —
   # is deleted by SQS without a redrive, silently (docs/config-reference.md
   # §17.4). An alarm on the queue's ApproximateAgeOfOldestMessage would catch
-  # it and would be the eleventh metric, past the free ten; it is left out on
-  # purpose. Gated on its own switch as well as EnableAlarms, so a stack
-  # without the queue has nine alarms and a stack with it has ten.
+  # it and would be one more metric, USD 0.10 a month past the free ten; it is
+  # left out on purpose. Gated on its own switch as well as EnableAlarms, so a
+  # stack without the queue does not have it (docs/cost-model.md §3.3).
   #
   # Maximum over five minutes, threshold 1: the normal depth is zero. An idle
   # DLQ publishes nothing, which is not breaching.

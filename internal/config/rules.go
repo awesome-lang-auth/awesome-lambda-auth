@@ -82,8 +82,8 @@ func checkRS14ToolsSSEDistributor(c *Config, d *diagnostics) {
 		"set tools.sse.distributor.type to none until the SSE transport block (D9c) lands, or leave the whole distributor block out; on this runtime GET <tools>/stream is not mounted either, for the reason cmd/auth/tools.go gives")
 }
 
-// checkRS15ToolsInboundWebhooks: inbound webhooks are refused until something
-// exists that can run their mapping scripts.
+// checkRS15ToolsInboundWebhooks: inbound webhooks are refused unless the
+// document names the function that runs their mapping scripts.
 //
 // The core's inbound route resolves the provider's WebhookConfig and, when it
 // carries a jsScript, hands script, body and action allowlist across an
@@ -94,27 +94,34 @@ func checkRS14ToolsSSEDistributor(c *Config, d *diagnostics) {
 // because every webhook provider treats a non-2xx as "not delivered" and
 // redelivers — for hours, some of them for days — so a deployment that came up
 // with the route mounted and no runner would be answering 400 to a provider's
-// retry storm from the first event onwards. And a configuration whose rows
-// carry no script is no better served: the alternative handler, OnWebhook, is a
-// host callback this product has no configuration path into, so a scriptless
-// row would be acknowledged and dropped.
+// retry storm from the first event onwards.
 //
-// The runner is D9d's — a Lambda of its own whose IAM role is the sandbox —
-// and until it lands the honest answer to `tools.inboundWebhooks.enabled: true`
-// is to refuse. The knob defaults to true because the reference mounts the
-// route by default (tools.router.ts:120-128), which means a document that
-// enables the tools block and says nothing about inbound webhooks is refused
-// here, and has to write `tools.inboundWebhooks.enabled: false` to load. That
-// is deliberate and the remedy says so: a default that is silently overridden
-// to false would be a document that lies about what it configures, which is
-// the failure the phase mechanism this rule descends from exists to prevent.
+// D9a wrote this rule as a blanket refusal, because no runner existed. D9d
+// brings one — cmd/script-runner, a Lambda whose IAM role is the sandbox,
+// reached through tools.inboundWebhooks.scriptRunnerFunction — and the rule is
+// narrowed in place rather than retired and renumbered: the failure it
+// prevents is the same one, the number is the one an operator already searches
+// for, and what changes is only the remedy, which can now name the knob that
+// satisfies it. A row with no script is served the reference's way once the
+// route is mounted: with no OnWebhook — a host callback this product has no
+// configuration path into — it is acknowledged and nothing is tracked, which
+// is what the reference answers a provider with no script and no callback.
+//
+// The knob defaults to true because the reference mounts the route by default
+// (tools.router.ts:120-128), which means a document that enables the tools
+// block and says nothing about inbound webhooks is refused here unless it names
+// a runner, and has to write `tools.inboundWebhooks.enabled: false` otherwise.
+// That is deliberate and the remedy says so: a default that is silently
+// overridden to false would be a document that lies about what it configures,
+// which is the failure the phase mechanism this rule descends from exists to
+// prevent.
 func checkRS15ToolsInboundWebhooks(c *Config, d *diagnostics) {
-	if !c.Tools.Enabled || !c.Tools.InboundWebhooks.Enabled {
+	if !c.Tools.Enabled || !c.Tools.InboundWebhooks.Enabled || c.Tools.InboundWebhooks.ScriptRunnerFunction != "" {
 		return
 	}
 	d.errf(RuleToolsInboundWebhooks, "tools.inboundWebhooks.enabled",
-		"inbound webhooks are enabled, but this build ships no script runner: a provider whose row carries a mapping script would be answered 400 on every delivery and would redeliver until it gave up, and a row without one would be acknowledged and dropped",
-		"set tools.inboundWebhooks.enabled: false until the script-runner block (D9d) lands; the default is true because the reference mounts the route by default, so the document has to say so explicitly")
+		"inbound webhooks are enabled and no script runner is named: a provider whose row carries a mapping script would be answered 400 on every delivery and would redeliver until it gave up, because the auth core runs no script in process",
+		"set tools.inboundWebhooks.scriptRunnerFunction to the script-runner Lambda (the SAM template's EnableInboundWebhooks does), or set tools.inboundWebhooks.enabled: false; the default is true because the reference mounts the route by default, so the document has to say one or the other")
 }
 
 // checkRS17FirstUserRandomIDs: the first-user policy does not elect the first

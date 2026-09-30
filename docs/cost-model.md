@@ -44,18 +44,20 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 | Lambda, HTTP API | 0.00 | Purely per-request |
 | CloudFront, if enabled | 0.00 | No hourly or monthly charge; the two policies are free |
 | CloudWatch Logs storage | ~0.00 | At 14-day retention and this traffic, a few MB |
-| **The nine alarms** | **0.00** | Nine alarm metrics against a free allowance of ten; ten with `EnableWebhookQueue` (§3.3), still free |
+| **The nine alarms** | **0.00** | Nine alarm metrics enabled by default, against a free allowance of ten; each optional function adds its own, gated on its switch and counted in §3.3 |
 | **SNS topic + subscription** | **0.00** | No charge at rest; first 1 000 email notifications a month are free |
 | **The budget** | **0.00** | First two budgets per account are free; this is the second |
 | **Cost anomaly detection** | **0.00** | Free |
 | S3 artifact bucket | cents | A few MB per deployed version |
 | KMS key, `EnableIdp=true` only | 1.00 | Billed whether or not it signs, **including its 7-day deletion window** |
 | Admin uploads bucket, `EnableAdminUploads=true` only | cents | S3 Standard storage for a handful of images, USD 0.023 per GB-month; an empty bucket is free. Requests are §2.6 |
+| Script runner, `EnableInboundWebhooks=true` only | 0.00 | A function, a role and a log group cost nothing at rest; its one alarm is counted with the other optional functions' in §3.3 |
 
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
 other alarms, and **USD 0.90 a month** in one that has already spent the free
-allowance — nine alarm metrics at USD 0.10 (ten, USD 1.00, with `EnableWebhookQueue`, §3.3).
+allowance — nine alarm metrics at USD 0.10; the optional functions' alarms are
+counted in §3.3.
 
 Two things are worth saying plainly about this table. The whole standing bill is
 Secrets Manager and KMS, which are the two resources that exist to keep a signing
@@ -368,14 +370,24 @@ D9c's decision to record rather than this document's to make.
 ### 3.3 The other functions coming
 
 Each one brings **a log group that must be declared explicitly or it will never
-expire** — see §5 — and would bring four alarm metrics (errors, throttles,
-duration, concurrency) at USD 0.10 a month past the free ten if it took the auth
-function's set. The webhook worker does not; see below.
+expire** — see §5 — and alarms. It would bring four alarm metrics (errors,
+throttles, duration, concurrency) at USD 0.10 a month past the free ten if it
+took the auth function's set; the webhook worker and the script runner take one
+each. The template counts the alarms **enabled by default** against the free
+ten, so an optional function's alarms are gated on its own switch and priced
+here instead (`infra/sam/template_test.go`, `offByDefaultAlarmGates`): **nine
+alarms by default**, and one more for each optional function switched on —
+`WebhookDeadLetterAlarm` with `EnableWebhookQueue`, `ScriptRunnerDurationAlarm`
+with `EnableInboundWebhooks`. **All-on total: 11 alarm metrics**, one past the
+free ten: USD 0.10 a month in an account with no other alarms, USD 1.10 in one
+whose allowance is already spent. `TestTheAlarmSetStaysInsideTheFreeAllowance`
+asserts that sentence against the template, and fails unless the all-on total
+is the number written here.
 
 | | shape of its cost |
 |---|---|
 | webhook worker | **Landed (D9b)**, below |
-| script runner | Per run, and the run is operator-initiated, so the exposure is a script that loops |
+| script runner | **Landed (D9d)**, below. Per run, and the run is **caller-initiated** — the inbound route is unauthenticated — so the exposure is a stranger's rate times a script that loops, capped by a reservation |
 | migrate job | One-off, bounded by the size of the directory being migrated; reads dominate |
 
 #### The webhook queue and its worker (D9b)
@@ -394,7 +406,7 @@ ten is one request). Lambda at 128 MB is **USD 0.0000016667 per second**.
 | `WebhookWorkerFunction` | 0.00 | per invocation only |
 | `WebhookWorkerLogGroup` | ~0.00 | 14-day retention, a line or two per delivery |
 | the event source's empty receives | 0.00 / ~0.26 | Lambda long-polls the queue continuously; at 20-second long polls and the handful of pollers AWS runs for an idle source, that is in the order of 650 000 empty `ReceiveMessage` calls a month — inside the free million, USD ~0.26 in an account that has spent it. An estimate, not a measurement: check the queue's `NumberOfEmptyReceives` after a day |
-| `WebhookDeadLetterAlarm` | 0.00 / 0.10 | the tenth alarm metric — free in an account with no other alarms, USD 0.10 in one that has spent the allowance |
+| `WebhookDeadLetterAlarm` | 0.00 / 0.10 | one alarm metric, gated on the queue's switch — counted with the other optional functions' at the top of this section |
 
 **Per delivery attempt**, a receiver answering in about 200 ms:
 
@@ -461,20 +473,118 @@ it is dead-lettered as `expiring` (config reference §17.4); one never
 received within it — a backlog deeper than the worker drains in fourteen
 days, or a worker that cannot start — is deleted by SQS **silently**, with
 no redrive and no alarm. An alarm on the queue's
-`ApproximateAgeOfOldestMessage` would catch that and would cost USD 0.10 a
-month as the eleventh alarm metric; it is left out to keep the set inside the
-free ten.
+`ApproximateAgeOfOldestMessage` would catch that and would be one more alarm
+metric, USD 0.10 a month past the free ten; it is left out.
 
 **The alarm budget (rule 10 of the block).** The worker adds one alarm, not
 four: `WebhookDeadLetterAlarm` on the dead-letter queue's depth, because a
 webhook that gave up is exactly the event nothing else reports, and every other
 failure of the worker either ends in that queue (a crash loop is redriven into
 it) or only delays a delivery (the message waits). It is gated on the queue's
-switch as well as `EnableAlarms`, so the set is **nine alarms without the queue
-and ten with it** — still inside CloudWatch's free ten, and `template_test.go`'s
-count is unchanged. The worker's errors, throttles, duration and concurrency
+switch as well as `EnableAlarms`, so a stack without the queue does not have it
+and `template_test.go`'s default count is unchanged; the totals are at the top
+of this section. The worker's errors, throttles, duration and concurrency
 would be four more metrics, USD 0.40 a month past the allowance, and are left
 unalarmed on purpose; the Lambda console shows them for free.
+
+#### The script runner (D9d), `EnableInboundWebhooks=true`
+
+**At rest: USD 0.00.** A Lambda function, an IAM role, an empty log group and a
+reserved-concurrency setting cost nothing until invoked — a reservation only
+carves environments out of the account's unreserved pool. Its one alarm,
+`ScriptRunnerDurationAlarm`, is gated on the runner's switch and counted with
+the other optional functions' at the top of this section. With the switch off
+none of it exists.
+
+**Per inbound webhook whose row has a script**, on top of the webhook request's
+own platform floor (§2.1), at arm64 prices (USD 0.0000133334 per GB-second,
+USD 0.20 per million requests; the durations are estimates from the engine's
+tests, not measurements — this block deployed nothing):
+
+```
+runner invocation          0.20 / million
+runner duration, 256 MB    0.07 / million at ~20 ms (a fresh goja runtime + a mapping script)
+auth function waiting      0.20 / million at ~30 ms of a 512 MB function held on the Invoke
+runner log line, ~250 B    0.13 / million
+                           ─────────────
+                           ~0.60 / million runs
+```
+
+The auth function **waits** on the runner — the Invoke is synchronous, because
+the core's route must answer the provider with the script's outcome — so every
+millisecond of a script is billed twice: once at 256 MB in the runner and once
+at 512 MB in the auth function holding the call. A row with no script costs
+nothing here: the runner is not invoked.
+
+**Who decides how many runs there are: anyone.** The run is
+**caller-initiated**, not operator-initiated. `POST <tools>/webhook/{provider}`
+has no guard and checks no provider signature, in the reference and here, so
+whoever can reach it and names a provider whose row has a script — and provider
+names are guessable: `stripe`, `github` — runs that script, with a body they
+wrote, at a rate they choose. Each in-flight run holds two execution
+environments, the runner's and the auth function's waiting on it, both from the
+account's unreserved pool unless something reserves them. What bounds it:
+
+- **`ScriptRunnerReservedConcurrency`, 5 by default — the hard cap.** At most
+  that many runs are in flight account-wide; a run over it is throttled, the
+  auth function answers `400` at once and the provider redelivers later. It is
+  the only bound on the spend, and it bounds the auth environments held on the
+  runner too, since each waits only as long as its run. An empty value reserves
+  nothing and leaves the runner drawing on the account's pool, uncapped.
+- **The `rateLimit` block, per address and provider.** With `rateLimit.enabled`
+  (the default) the route shares `rateLimit.max` per `rateLimit.windowSeconds` —
+  ten a minute — per client address and provider, and answers the registered
+  `429` beyond it before the runner is invoked (`rate-limited-routes-answer-429`).
+  It stops one address from keeping the cap full; it does not stop many. A
+  legitimate provider sending more than that from one address in one window is
+  refused and redelivers — late, not lost.
+- **In front of both**, the levers this template does not pull: API Gateway
+  route throttling, or a WAF rule on the path.
+
+The ceiling at the default reservation, sustained for a day, is therefore:
+
+```
+a script the body drives to the 5 s deadline   5 runs in flight × (5 s at 256 MB + 5 s at 512 MB)
+                                                ≈ 0.00005 USD per run, 1 run/s  ≈ USD 4.50 / day
+a fast script, ~20 ms                           5 in flight ÷ 20 ms ≈ 250 runs/s × 0.60 / million
+                                                ≈ USD 13 / day, plus each request's API Gateway floor (§2.1)
+```
+
+— a bound someone chose and wrote down, rather than the account's whole
+concurrency pool times the same arithmetic.
+
+**The exposure is a script that loops**, or awaits something slow. It runs to
+the deadline (`scriptTimeoutMs`, 5000 ms), is interrupted, and the webhook is
+refused `400` — so the provider redelivers it and the same deadline is billed
+again:
+
+```
+runner, 5 s at 256 MB           0.0000167  per delivery
+auth function, 5 s at 512 MB    0.0000333  per delivery
+                                ─────────
+                                ~0.00005   per delivery   (USD 50 per million)
+```
+
+A provider sending 10 000 events a day into a looping script is about
+**USD 0.50 a day** before its redeliveries, and every redelivery multiplies it
+— which is the incident `ScriptRunnerDurationAlarm` exists for: it fires at
+80 % of the deadline, on one five-minute period, because a provider's own
+redeliveries arrive minutes to hours apart and "twice running" would rarely be
+true of them. A stranger's requests are not so spaced, and they are the
+reservation's to cap.
+
+**A raised deadline.** Every second added to `InboundScriptTimeoutMs` adds a
+second to the looping case, on both functions: 28 000 ms, the template's
+maximum, makes it five to six times worse. The maximum is 28 000 and not the
+configuration's 30 000 because the auth function waits on the run: its own
+`Timeout` tops out at 29 s, and it keeps a second after the Invoke to track and
+answer. Past the auth function's remaining time the invoker cuts the run short
+(`internal/integration/aws`, `WithInvocationDeadline`), so a deadline longer
+than `Timeout` bills `Timeout` less a second on both functions and answers the
+core's `400`, never Lambda killing the auth function mid-Invoke.
+`infra/sam/script_runner_test.go` relates `Timeout`, `ScriptRunnerTimeout` and
+the alarm threshold to the deadline at the defaults and at the maxima;
+CloudFormation cannot relate the values a deployment picks.
 
 ---
 
@@ -508,7 +618,8 @@ behind. **For this product the fastest spend alarm is not a spend alarm.**
 
 | | USD / month |
 |---|---|
-| Nine alarm metrics, standard resolution (ten with `EnableWebhookQueue`, §3.3) | 0.00 (free ten) / 0.90 beyond (1.00 with the queue) |
+| Nine alarm metrics enabled by default, standard resolution | 0.00 (free ten) / 0.90 beyond |
+| The optional functions' alarms, one each (§3.3: the dead-letter alarm with `EnableWebhookQueue`, the script runner's duration alarm with `EnableInboundWebhooks`) | 0.10 each past the free ten; all on, 11 metrics — 0.10 in an account with no other alarms |
 | SNS topic, one email subscription | 0.00 (first 1 000 notifications free; 2.00 per 100 000 after) |
 | One budget | 0.00 (second of two free per account) |
 | Cost anomaly detection | 0.00 |
@@ -523,8 +634,9 @@ and nothing about that looks wrong until the storage line does.
 
 `infra/sam/template_test.go` enforces it: it reads the template, finds every
 function, and fails if any lacks a matching group, the retention reference, or
-the ordering. It also fails if the alarm set grows past ten, which is a
-deliberate tripwire — the eleventh alarm costs money and should be a decision
+the ordering. It also fails if the alarms **enabled by default** grow past ten
+(an optional function's alarms are gated on its own switch and priced in
+§3.3), which is a deliberate tripwire — the eleventh alarm costs money and should be a decision
 somebody makes rather than one that happens.
 
 ---

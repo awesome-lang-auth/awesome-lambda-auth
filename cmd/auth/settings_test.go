@@ -344,6 +344,21 @@ func TestRuntimeSettingsKnobGaps(t *testing.T) {
 		t.Error("unwiredKnobs reported runtimeSettings.require2fa, which POST /2fa/disable does honour")
 	}
 
+	// D9d: with the inbound route mounted the allowlist has its reader, and
+	// reporting it would send an operator to remove the list the route
+	// intersects with every webhook's allowedActions.
+	mounted := settingsCfg(func(c *config.Config) {
+		c.RuntimeSettings.EnabledWebhookActions = []string{"user.created"}
+		c.Tools.Enabled = true
+		c.Tools.InboundWebhooks.Enabled = true
+		c.Tools.InboundWebhooks.ScriptRunnerFunction = "stack-script-runner"
+	})
+	for _, g := range unwiredKnobs(mounted) {
+		if g.Path == "runtimeSettings.enabledWebhookActions" {
+			t.Error("unwiredKnobs reported runtimeSettings.enabledWebhookActions with the inbound route mounted")
+		}
+	}
+
 	// Undeclared keys are not reported: the warning is about what the operator
 	// set, and a line about a default nobody wrote is noise.
 	for _, g := range unwiredKnobs(settingsCfg(nil)) {
