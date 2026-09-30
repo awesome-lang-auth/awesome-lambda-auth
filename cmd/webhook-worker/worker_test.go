@@ -397,8 +397,8 @@ func TestWorkerDeadLettersAMessageAboutToExpire(t *testing.T) {
 		age      time.Duration
 		expiring bool
 	}{
-		"young":                         {time.Minute, false},
-		"a day from expiry":             {retention - 25*time.Hour, false},
+		"young":                          {time.Minute, false},
+		"a day from expiry":              {retention - 25*time.Hour, false},
 		"inside the margin after a wait": {retention - expiryMargin, true},
 	} {
 		_, msg := coreAttempts(t, rcv.url(), 3, 1000)
