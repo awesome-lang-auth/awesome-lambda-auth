@@ -307,16 +307,20 @@ const freeAlarmMetrics = 10
 // — and the point is that it fails while somebody is in a position to decide,
 // rather than showing up as a line on a bill.
 //
-// The count is of the alarms a stack gets **by default** — those whose
-// Condition is AlarmsEnabled alone, on with EnableAlarms' default. An alarm
-// that belongs to an optional function is gated on that function's own switch
-// as well (it has to be: an alarm on a function that does not exist cannot
-// Ref it), and it is counted separately, priced in docs/cost-model.md §3.3, and
-// must be declared in offByDefaultAlarmGates so that a gate nobody can see
-// the default of cannot hide an alarm from this count. The rule was changed
-// to this by D9d, the first optional function with an alarm; it keeps the
-// original promise — the stack as deployed with no parameters stays free —
-// and states what each switch adds instead of forbidding it.
+// ── D9d: the count is of the alarms enabled by default ──────────────────────
+//
+// The count is of the alarms a stack gets **with every parameter at its
+// default**: those whose Condition is AlarmsEnabled alone, plus any gated on a
+// feature switch this file cannot show to be off by default. An alarm that
+// belongs to an optional function is gated on that function's own switch as
+// well (it has to be: an alarm on a function that does not exist cannot Ref
+// it); when its gate is declared in offByDefaultAlarmGates — which
+// TestOptionalAlarmGatesAreOffByDefaultAndIncludeAlarmsEnabled verifies is an
+// !And over AlarmsEnabled and a parameter that defaults to off — it is left out
+// of the count and priced in docs/cost-model.md §3.3 instead. An undeclared
+// gate is counted, so a gate nobody declared can make the count too high but
+// never too low. The all-on total — every optional function switched on — is
+// logged, with what it costs past the free ten.
 func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	t.Parallel()
 	tpl := load(t)
@@ -327,17 +331,11 @@ func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	}
 	byDefault, optional := 0, map[string][]string{}
 	for _, a := range alarms {
-		if a.condition == "AlarmsEnabled" {
-			byDefault++
+		if param, ok := offByDefaultAlarmGates[a.condition]; ok {
+			optional[param] = append(optional[param], a.name)
 			continue
 		}
-		param, ok := offByDefaultAlarmGates[a.condition]
-		if !ok {
-			t.Errorf("%s is gated on %q, which offByDefaultAlarmGates does not declare; declare the parameter "+
-				"that switches it, or gate it on AlarmsEnabled alone and count it", a.name, a.condition)
-			continue
-		}
-		optional[param] = append(optional[param], a.name)
+		byDefault++
 	}
 	if byDefault > freeAlarmMetrics {
 		t.Errorf("the template enables %d alarms by default, past CloudWatch's free %d.\n\n"+
@@ -349,6 +347,13 @@ func TestTheAlarmSetStaysInsideTheFreeAllowance(t *testing.T) {
 	for param, names := range optional {
 		t.Logf("%s adds %d alarm(s) when on: %v (docs/cost-model.md §3.3)", param, len(names), names)
 	}
+	allOn := len(alarms)
+	extra := 0.0
+	if allOn > freeAlarmMetrics {
+		extra = float64(allOn-freeAlarmMetrics) * 0.10
+	}
+	t.Logf("all-on total: %d alarm metrics with every optional function switched on, %d by default; "+
+		"USD %.2f a month past the free %d in an account with no other alarms", allOn, byDefault, extra, freeAlarmMetrics)
 }
 
 // offByDefaultAlarmGates maps each alarm condition other than AlarmsEnabled to

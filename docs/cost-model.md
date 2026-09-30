@@ -488,6 +488,14 @@ tenth alarm metric of a stack that enables it — inside the free ten on its own
 **USD 0.10 a month** in an account that has already spent the allowance. With
 the switch off none of it exists.
 
+**The all-on count.** Nine alarms by default. This block adds one, gated on
+`EnableInboundWebhooks`; D9b's webhook queue adds one more, gated on its own
+switch (`WebhookDeadLetterAlarm`). With both on the stack has **eleven** alarm
+metrics, one past the free ten: **USD 0.10 a month** in an account with no other
+alarms, USD 1.10 in one whose allowance is already spent.
+`TestTheAlarmSetStaysInsideTheFreeAllowance` logs the all-on total of the tree
+it runs on and fails only on the default count.
+
 **Per inbound webhook whose row has a script**, on top of the webhook request's
 own platform floor (§2.1), at arm64 prices (USD 0.0000133334 per GB-second,
 USD 0.20 per million requests; the durations are estimates from the engine's
