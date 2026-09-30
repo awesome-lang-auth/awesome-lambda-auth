@@ -419,13 +419,6 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logScriptRunnerSurface(cfg, tools, log) // D9d
 	logStreamSurface(cfg, tools, stream, log)
 
-	// D9c: the SSE function's Function URL answers the stream and nothing
-	// else, before any route is reached (stream.go, streamOnly).
-	var routes http.Handler = mux
-	if stream {
-		routes = streamOnly(cfg, mux)
-	}
-
 	// The middleware chain is one function, assembleHandler, so that the test
 	// harness (admin_test.go newAdminSurface) builds the very chain New builds
 	// and a header this binary adds -- or must not add -- is seen where it is
@@ -435,7 +428,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// login's; each matches its own route and passes everything else through
 	// (scriptrunner.go, newInboundWebhookLimiter).
 	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, log), newInboundWebhookLimiter(cfg, counter, log)
-	handler := assembleHandler(cfg, log, routes, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
+	handler := assembleHandler(cfg, log, mux, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
+
+	// D9c: the SSE function's Function URL answers GET <tools>/stream and
+	// nothing else, and the gate is the outermost handler (stream.go,
+	// streamOnly): a refused request never reaches the CORS layer, which would
+	// answer a preflight 204 for a route this function does not serve, nor the
+	// access log, whose line is the largest part of what an anonymous request
+	// costs on a URL nothing throttles, nor the console's login limiter, which
+	// spends the shared counter.
+	if stream {
+		handler = streamOnly(cfg, handler)
+	}
 
 	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools, stream: stream}
 	if tools != nil {

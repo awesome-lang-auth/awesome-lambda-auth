@@ -56,12 +56,13 @@ import (
 // The Function URL is a second front door onto the same handler, and an
 // AuthType: NONE URL (docs/config-reference.md §17.3 argues the choice) is
 // internet-facing with no API Gateway in front of it. So the stream role
-// answers GET, HEAD and OPTIONS on exactly <tools>/stream and 404 to every
-// other request, before any route is reached (streamOnly) — without that gate
-// the URL would be an unmetered path to POST <prefix>/login, the admin
-// console and the rest. And the tools router it mounts has every other feature
-// switched off (streamToolsOptions), so even the tools mount answers the
-// stream alone.
+// answers GET on exactly <tools>/stream and 404 to every other request —
+// HEAD and OPTIONS included — from its outermost handler, before the CORS
+// layer, the access log, the console's login limiter or any route (streamOnly)
+// — without that gate the URL would be an unmetered path to POST
+// <prefix>/login, the admin console and the rest. And the tools router it
+// mounts has every other feature switched off (streamToolsOptions), so even
+// the tools mount answers the stream alone.
 //
 // ── the route is the core's, and so is everything in front of it ─────────────
 //
@@ -190,23 +191,29 @@ func streamToolsOptions(cfg *config.Config, tw *toolsWiring, opts auth.ToolsOpti
 	return opts, nil
 }
 
-// streamOnly is the SSE function's gate: GET, HEAD and OPTIONS on
-// <tools>/stream reach the mux, and every other request is net/http's own 404,
-// which is what the mux answers for a path it does not know. See the file
-// header for why the gate exists at all.
+// streamOnly is the SSE function's gate, and the outermost handler it has
+// (app.go): GET on <tools>/stream reaches the middleware chain and the mux,
+// and every other request is net/http's own 404, which is what the mux answers
+// for a path it does not know. See the file header for why the gate exists at
+// all.
+//
+// GET alone. HEAD is refused because the core serves it as a stream (Express
+// routes HEAD to a GET handler, tools_stream.go) and the streaming writer has
+// no body suppression, so an authenticated HEAD would hold an execution
+// environment for a whole segment writing bytes a HEAD response may not carry.
+// OPTIONS is refused because EventSource never sends a preflight — it is a
+// simple request, withCredentials or not — so the only OPTIONS this URL ever
+// sees is one it has no reason to answer, and answering it would put the CORS
+// layer's 204, with the allow-list's headers, in front of a public URL for
+// every path of the composition. A 404 costs a browser nothing.
 func streamOnly(cfg *config.Config, next http.Handler) http.Handler {
 	path := toolsPath(cfg) + auth.ToolsStreamPath
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != path {
+		if r.URL.Path != path || r.Method != http.MethodGet {
 			http.NotFound(w, r)
 			return
 		}
-		switch r.Method {
-		case http.MethodGet, http.MethodHead, http.MethodOptions:
-			next.ServeHTTP(w, r)
-		default:
-			http.NotFound(w, r)
-		}
+		next.ServeHTTP(w, r)
 	})
 }
 

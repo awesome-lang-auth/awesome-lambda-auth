@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
+	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	auth "github.com/nik2208/awesome-go-auth"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
@@ -49,6 +52,13 @@ func sseEnv(table, endpoint string, kv ...string) map[string]string {
 // functions.
 func sseTable(t *testing.T) (StoreFactory, string, string) {
 	t.Helper()
+	return sseTableWith(t, nil)
+}
+
+// sseTableWith is sseTable with the store's DynamoDB client wrapped, so a test
+// can observe what the composition reads.
+func sseTableWith(t *testing.T, wrap func(ddbstore.API) ddbstore.API) (StoreFactory, string, string) {
+	t.Helper()
 	endpoint, ok := localDynamoDBEndpoint()
 	if !ok {
 		t.Skip("DYNAMODB_ENDPOINT is not set; start DynamoDB Local and set it to run the SSE function end to end")
@@ -68,7 +78,11 @@ func sseTable(t *testing.T) (StoreFactory, string, string) {
 	if err := ddbstore.CreateTable(ctx, client, table); err != nil {
 		t.Skipf("cannot create %s at %s (%v); start DynamoDB Local with: docker run -d --name ddblocal -p 8000:8000 amazon/dynamodb-local", table, endpoint, err)
 	}
-	store, err := ddbstore.New(client, ddbstore.Options{TableName: table, Logger: discardLogger()})
+	var api ddbstore.API = client
+	if wrap != nil {
+		api = wrap(client)
+	}
+	store, err := ddbstore.New(api, ddbstore.Options{TableName: table, Logger: discardLogger()})
 	if err != nil {
 		t.Fatalf("ddbstore.New: %v", err)
 	}
@@ -294,33 +308,110 @@ func TestTheSSEFunctionStreamsWhatTheAuthFunctionPublishes(t *testing.T) {
 	stop()
 }
 
-// TestTheSSEFunctionAnswersTheStreamAlone: the Function URL is a second front
-// door, and it opens onto one route.
-func TestTheSSEFunctionAnswersTheStreamAlone(t *testing.T) {
-	factory, table, endpoint := sseTable(t)
-	streamApp := newSseApp(t, sseEnv(table, endpoint, EntrypointEnv, entrypointStream), factory)
+// sseQueryCounter counts the Queries that read an SSE event partition: the
+// observable trace of the event log being followed.
+type sseQueryCounter struct {
+	ddbstore.API
+	mu sync.Mutex
+	n  int
+}
 
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/auth/login"},
-		{http.MethodPost, "/auth/register"},
-		{http.MethodGet, "/healthz"},
-		{http.MethodPost, "/tools/track/x"},
-		{http.MethodPost, "/tools/notify/global"},
-		{http.MethodGet, "/tools/telemetry"},
-		{http.MethodPost, "/tools/stream"},
-		{http.MethodGet, "/tools/stream/"},
-	} {
-		rec := httptest.NewRecorder()
-		streamApp.Handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}")))
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s on the SSE function = %d, want 404", tc.method, tc.path, rec.Code)
-		}
+func (c *sseQueryCounter) Query(ctx context.Context, in *awsddb.QueryInput, optFns ...func(*awsddb.Options)) (*awsddb.QueryOutput, error) {
+	if pk, ok := in.ExpressionAttributeValues[":pk"].(*ddbtypes.AttributeValueMemberS); ok && strings.HasPrefix(pk.Value, "SSE#") {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
 	}
-	// And the stream itself is guarded: no credential, no stream.
-	rec := httptest.NewRecorder()
-	streamApp.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tools/stream", nil))
-	if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
-		t.Errorf("GET /tools/stream with no credential = %d, want the guard's refusal", rec.Code)
+	return c.API.Query(ctx, in, optFns...)
+}
+
+func (c *sseQueryCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// TestTheSSEFunctionAnswersTheStreamAlone: the Function URL is a second front
+// door, and it opens onto one route and one method, from its outermost
+// handler — so no CORS preflight is answered for anything, the stream's own
+// path included, and a refused request never follows the event log.
+func TestTheSSEFunctionAnswersTheStreamAlone(t *testing.T) {
+	const origin = "https://app.example.test"
+	for _, posture := range []struct {
+		name string
+		kv   []string
+	}{
+		{"session", nil},
+		{"apiKey", []string{"AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"}},
+		// The tools mount under the api prefix is inside the CORS layer
+		// (corsExemptMounts), which is the geometry where a gate that ran
+		// after it would answer a preflight on the stream's own path.
+		{"session, tools under the prefix", []string{"AWESOME_AUTH_TOOLS_BASE_PATH", "/auth/tools"}},
+	} {
+		t.Run(posture.name, func(t *testing.T) {
+			counter := &sseQueryCounter{}
+			factory, table, endpoint := sseTableWith(t, func(api ddbstore.API) ddbstore.API { counter.API = api; return counter })
+			kv := append([]string{EntrypointEnv, entrypointStream, "AWESOME_AUTH_CORS_ORIGINS", origin}, posture.kv...)
+			streamApp := newSseApp(t, sseEnv(table, endpoint, kv...), factory)
+			tools := toolsPath(streamApp.Config)
+
+			for _, tc := range []struct{ method, path string }{
+				{http.MethodPost, "/auth/login"},
+				{http.MethodOptions, "/auth/login"},
+				{http.MethodPost, "/auth/register"},
+				{http.MethodGet, "/healthz"},
+				{http.MethodPost, tools + "/track/x"},
+				{http.MethodPost, tools + "/notify/global"},
+				{http.MethodGet, tools + "/telemetry"},
+				{http.MethodPost, tools + "/stream"},
+				{http.MethodHead, tools + "/stream"},
+				{http.MethodOptions, tools + "/stream"},
+				{http.MethodGet, tools + "/stream/"},
+			} {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+				req.Header.Set("Origin", origin)
+				req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+				streamApp.Handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusNotFound {
+					t.Errorf("%s %s on the SSE function = %d, want 404", tc.method, tc.path, rec.Code)
+				}
+				if v := rec.Header().Get("Access-Control-Allow-Origin"); v != "" {
+					t.Errorf("%s %s on the SSE function carries Access-Control-Allow-Origin %q: the CORS layer ran before the gate", tc.method, tc.path, v)
+				}
+			}
+			// And the stream itself is guarded: no credential, no stream —
+			// and no read of the event log, because the hook that follows it
+			// sits inside the guard.
+			rec := httptest.NewRecorder()
+			streamApp.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tools+"/stream", nil))
+			if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
+				t.Errorf("GET %s/stream with no credential = %d, want the guard's refusal", tools, rec.Code)
+			}
+			if n := counter.count(); n != 0 {
+				t.Errorf("%d event-log Queries for requests the SSE function refused: the hook ran outside the guard", n)
+			}
+
+			// The control: an admitted stream does read the log, so the zero
+			// above is the guard's doing and not a counter that sees nothing.
+			if posture.name != "session" {
+				return
+			}
+			authApp := newSseApp(t, sseEnv(table, endpoint, "AWESOME_AUTH_CORS_ORIGINS", origin), factory)
+			token := registerAndToken(t, authApp, "sse-gate-"+randomSuffix(t)+"@example.test").accessToken
+			_, frames, stop := openStream(t, streamApp, "token="+token, nil)
+			if f := nextFrame(t, frames, "the connected frame"); f.event != "connected" {
+				t.Fatalf("first frame = %+v", f)
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for counter.count() == 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if counter.count() == 0 {
+				t.Error("an admitted stream read nothing from the event log: the counter cannot see the reads it guards against")
+			}
+			stop()
+		})
 	}
 }
 
