@@ -727,9 +727,9 @@ Parameters:
       AWESOME_AUTH_TOOLS_AUTH — who may reach the guarded tools routes. The
       default, "apiKey", is the core's API-key guard over the API-key store,
       which this parameter also switches on, for a caller that is a service;
-      keys are minted through the admin API (D8), and until one exists the
-      guard admits nobody, which is safe. Any active key passes — no scope is
-      required — and a refusal is the core's bare text/plain 401. "session" is
+      keys are minted through the admin console (EnableAdminConsole), and
+      until one exists the guard admits nobody, which is safe. Any active key
+      passes — no scope is required — and a refusal is the core's bare text/plain 401. "session" is
       the adapter's own session middleware, and its price has to be read
       before it is chosen: POST <ApiPrefix>/register is always mounted, so any
       self-registered user holds a session, and a session reads the
@@ -742,7 +742,12 @@ Parameters:
       through this template at all: this variable is set whenever EnableTools
       is "true", and the environment layer overrides ConfigFile, so a
       document's tools.auth is never in force on a stack deployed from here.
-      "admin" arrives with the admin console (D8).
+      "admin" — the admin console's own guard over the tools routes — is not
+      offered either: it is only valid beside a mounted console (the loader
+      refuses it without admin.enabled), this template does not tie the
+      parameter to EnableAdminConsole, and so a stack from here names its
+      tools guard with apiKey or session alone; the posture is for a
+      document deployed another way (docs/config-reference.md §17.6).
   ToolsBasePath:
     Type: String
     Default: /tools

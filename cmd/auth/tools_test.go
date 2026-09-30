@@ -42,8 +42,8 @@ func toolsEnv(kv ...string) map[string]string {
 }
 
 // toolsBundle is the memory bundle with the tools stores held by the test, so a
-// subscription can be added and a telemetry row read without going through a
-// route that does not exist in this build (the admin API is D8's).
+// subscription can be added and a telemetry row read directly, without mounting
+// the admin console and driving its routes.
 type toolsBundle struct {
 	bundle memoryStoreBundle
 }
@@ -413,8 +413,9 @@ func TestToolsDocsPairCarriesTheDocsPolicy(t *testing.T) {
 
 // TestToolsAccessPostures resolves each spelling of tools.auth against a live
 // composition. `none` is the reference's default and answers anyone; `apiKey`
-// answers only a key minted against the deployment's store; `admin` is refused
-// at cold start by name until D8's guard exists.
+// answers only a key minted against the deployment's store; `admin` puts the
+// routes behind the console's own guard, so the console's credential passes
+// and an ordinary user's session is refused with the console's own answer.
 func TestToolsAccessPostures(t *testing.T) {
 	t.Parallel()
 
@@ -439,7 +440,7 @@ func TestToolsAccessPostures(t *testing.T) {
 		if anonymous.StatusCode != http.StatusUnauthorized {
 			t.Errorf("anonymous track under apiKey = %d, want 401", anonymous.StatusCode)
 		}
-		// Minted the way the admin API will mint one, against the same store
+		// Minted the way the admin console's key route mints one, against the same store
 		// the guard verifies against. Cost 4 is bcrypt's floor: the test pays
 		// for one hash and the guard for one verify.
 		raw, _, err := auth.NewAPIKeyService(4).Create(context.Background(), bundle.bundle.apiKeys, "ops", "svc", nil, nil, nil)
@@ -456,24 +457,74 @@ func TestToolsAccessPostures(t *testing.T) {
 		}
 	})
 
-	t.Run("admin is refused until the console exists", func(t *testing.T) {
+	t.Run("admin puts the tools routes behind the console's guard", func(t *testing.T) {
 		t.Parallel()
-		_, err := New(context.Background(), Options{
-			// admin.enabled is what validate.go demands for the posture; it is
-			// still phase-gated here, so the document has to be allowed through
-			// the gate by the environment the loader reads. That is not
-			// possible from Options, so the refusal this test can reach is the
-			// loader's own — which is the right one to assert: an admin posture
-			// cannot come up on this build by any route.
-			Getenv: envFunc(toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "admin")),
-			Logger: discardLogger(),
-			Stores: memoryStores,
-		})
-		if err == nil {
-			t.Fatal("tools.auth: admin came up with no admin console")
+		// The legacy form of the console's guard: the bootstrap secret alone,
+		// which RS-6 accepts as the access decision, so the guard admits the
+		// bearer of the secret and nobody else. Long enough for RS-6's floor.
+		const secret = "tools-admin-bootstrap-secret-0123456789abcdef"
+		app := newToolsApp(t, toolsEnv(
+			"AWESOME_AUTH_TOOLS_AUTH", "admin",
+			"AWESOME_AUTH_ADMIN_ENABLED", "true",
+			"AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET", secret,
+		), nil)
+
+		anonymous := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(), nil, `{}`)
+		if anonymous.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("anonymous track under admin = %d, want 401", anonymous.StatusCode)
 		}
-		if !strings.Contains(err.Error(), "tools.auth") {
-			t.Errorf("the refusal does not name the knob: %v", err)
+		// The refusal is the console's envelope, not the auth router's: the
+		// guard in front of the routes is the admin guard itself.
+		if body := decodeBody(t, anonymous); body["error"] != "Unauthorized" || body["code"] != nil {
+			t.Errorf("anonymous track under admin answered %s, want the console's {\"error\":\"Unauthorized\"}", anonymous.Body)
+		}
+
+		admitted := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders("authorization", "Bearer "+secret), nil, `{}`)
+		if admitted.StatusCode != http.StatusAccepted {
+			t.Errorf("track with the console's secret under admin = %d %s, want 202", admitted.StatusCode, admitted.Body)
+		}
+
+		// A session `session` would admit is not a console credential: an
+		// ordinary user's access token is recognised as a signed-in user the
+		// guard does not admit, and answered the console's 403 — the
+		// reference's shape for a user the policy refuses — never 202.
+		reg := invoke(t, app, http.MethodPost, "/auth/register",
+			jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("tools-admin-posture@example.test"))
+		if reg.StatusCode != http.StatusCreated {
+			t.Fatalf("register = %d %s", reg.StatusCode, reg.Body)
+		}
+		token, _ := decodeBody(t, reg)["accessToken"].(string)
+		user := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders("authorization", "Bearer "+token), nil, `{}`)
+		if user.StatusCode != http.StatusForbidden {
+			t.Errorf("track with an ordinary user's token under admin = %d %s, want 403", user.StatusCode, user.Body)
+		}
+		if body := decodeBody(t, user); body["error"] != "Forbidden" || body["code"] != nil {
+			t.Errorf("an ordinary user's track under admin answered %s, want the console's {\"error\":\"Forbidden\"}", user.Body)
+		}
+	})
+
+	t.Run("admin under a policy refuses a signed-in user the console would refuse", func(t *testing.T) {
+		t.Parallel()
+		app := newToolsApp(t, toolsEnv(
+			"AWESOME_AUTH_TOOLS_AUTH", "admin",
+			"AWESOME_AUTH_ADMIN_ENABLED", "true",
+			"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+		), nil)
+
+		reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody("not-an-admin@example.test"))
+		if reg.StatusCode != http.StatusCreated {
+			t.Fatalf("register = %d %s", reg.StatusCode, reg.Body)
+		}
+		var cookies []string
+		for _, c := range reg.Cookies {
+			cookies = append(cookies, strings.SplitN(c, ";", 2)[0])
+		}
+		if len(cookies) == 0 {
+			t.Fatal("a cookie registration set no cookie, so this case proves nothing")
+		}
+		rec := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders(), cookies, `{}`)
+		if rec.StatusCode != http.StatusForbidden {
+			t.Errorf("track with a non-admin session under admin/is-admin-flag = %d %s, want the console's 403 for a signed-in user the policy refuses, never 202", rec.StatusCode, rec.Body)
 		}
 	})
 
@@ -492,18 +543,17 @@ func TestToolsAccessPostures(t *testing.T) {
 		}
 	})
 
-	t.Run("checkToolsSupport names D8", func(t *testing.T) {
+	t.Run("admin without a mounted console is refused by toolsAccess itself", func(t *testing.T) {
 		t.Parallel()
+		// The loader never lets this Config through (tools.auth: admin requires
+		// admin.enabled, and RS-6 requires a decision); toolsAccess is the lock
+		// for a Config that bypassed it.
 		cfg := config.Defaults()
 		cfg.Tools.Enabled = true
 		cfg.Tools.Auth = config.ToolsAuthAdmin
-		err := checkToolsSupport(cfg)
-		if err == nil || !strings.Contains(err.Error(), "D8") {
-			t.Errorf("checkToolsSupport(admin) = %v, want a refusal naming the block that brings the guard", err)
-		}
-		cfg.Tools.Auth = config.ToolsAuthSession
-		if err := checkToolsSupport(cfg); err != nil {
-			t.Errorf("checkToolsSupport(session) = %v, want nil", err)
+		_, err := toolsAccess(cfg, nil, httpConfig(cfg), newMemoryStoreBundle())
+		if err == nil || !strings.Contains(err.Error(), "admin console is not mounted") {
+			t.Errorf("toolsAccess(admin, console off) = %v, want a refusal naming the missing console", err)
 		}
 	})
 }

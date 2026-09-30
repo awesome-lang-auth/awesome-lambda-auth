@@ -273,12 +273,6 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := checkUISupport(cfg); err != nil {
 		return nil, err
 	}
-	// Before the stores too, and for the same reason: the one tools posture
-	// this build cannot build needs no store to be recognised. See
-	// checkToolsSupport.
-	if err := checkToolsSupport(cfg); err != nil {
-		return nil, err
-	}
 
 	users, sessions, err := newStores(ctx, cfg, log)
 	if err != nil {

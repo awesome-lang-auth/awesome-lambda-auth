@@ -214,9 +214,11 @@ import (
 // Track fans that attribution out to the telemetry store, to that user's
 // stream and to every matching outgoing webhook, which the deployment then
 // POSTs to a third party in its own name and under its own signature. `admin`
-// puts the routes behind the admin console's guard, which D8 builds; until it
-// lands the posture is refused at cold start rather than silently degraded,
-// and internal/config already refuses it without admin.enabled.
+// puts the routes behind the admin console's own guard — core.AdminGuard over
+// HTTPConfig.Admin, the value the adapter guards <admin>/api/* with — so the
+// callers are exactly the console's and a self-registered session is refused;
+// internal/config refuses the posture without admin.enabled, and the console's
+// own rules (RS-6, RS-18) come with it (toolsAccess).
 //
 // ── the two seams left empty on purpose ──────────────────────────────────────
 //
@@ -280,24 +282,6 @@ type webhookStoreProvider interface {
 
 type apiKeyStoreProvider interface {
 	APIKeys() auth.APIKeyStore
-}
-
-// checkToolsSupport refuses, before any store is opened, the one tools posture
-// this build cannot build: `admin`, whose guard is the admin console's and
-// arrives with D8. internal/config has already refused the posture without
-// admin.enabled; this is the refusal for the build that has the knob and not
-// the console. When D8 lands, this function is where its guard's Protect is
-// handed to toolsAccess and the refusal is deleted.
-func checkToolsSupport(cfg *config.Config) error {
-	if !cfg.Tools.Enabled {
-		return nil
-	}
-	if cfg.Tools.Auth == config.ToolsAuthAdmin {
-		return fmt.Errorf(
-			"config: refusing to start: tools.auth is %q, but this build mounts no admin console and so has no admin guard to put the tools routes behind (it lands with D8) -- choose tools.auth: session or apiKey until then",
-			config.ToolsAuthAdmin)
-	}
-	return nil
 }
 
 // newToolsWiring builds the bus and the facade, or returns nil when the block
@@ -625,11 +609,11 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		// schema has no vocabulary for them — which means that EVERY active key
 		// in the store passes, including one an administrator minted with a
 		// narrow scope for some other purpose: nil is "no requirement" to the
-		// core's hasScopes, not "no scope". Today the tools guard is the store's
-		// only consumer in this product, so every key is a tools key by
-		// construction; the config reference says so (§17.6) so that it stays a
-		// stated fact on the day D8 gives the store a second consumer. The
-		// refusal it writes is the core's bare 401 and is registered
+		// core's hasScopes, not "no scope". The admin console is the store's
+		// other consumer — its <admin>/api/api-keys routes mint and revoke the
+		// rows — so a key an administrator minted there for some narrower
+		// purpose is a tools key here all the same; the config reference says
+		// so (§17.6) so that it stays a stated fact. The refusal it writes is the core's bare 401 and is registered
 		// (tools-api-key-refusal-is-the-cores-bare-401). The store is
 		// guaranteed by checkStoreRequirements and driverStores; the assertion
 		// is the refusal for a driver that lacks it.
@@ -642,9 +626,33 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		return auth.ToolsProtected(auth.APIKeyMiddleware(provider.APIKeys(), nil)), nil
 
 	case config.ToolsAuthAdmin:
-		// Unreachable: checkToolsSupport refused it before any store was
-		// opened. Kept as a branch so that D8's guard has a named place to go.
-		return nil, fmt.Errorf("config: refusing to start: tools.auth %q has no guard in this build", config.ToolsAuthAdmin)
+		// The admin console's own guard over the tools routes: the same value
+		// the adapter builds for <admin>/api/* out of HTTPConfig.Admin — the
+		// policy admin.accessPolicy compiled to (admin.go, adminAccessPolicy),
+		// or the legacy bearer secret — so whoever the console admits reaches
+		// track, notify and the telemetry query, and nobody else does; a
+		// self-registered session that `session` would admit is refused here.
+		// The guard holds no per-request state and its own comment says a
+		// second value is fine (core admin.go, AdminGuard: "safe to call once
+		// per mount and share"). Its refusal is the console's, 401
+		// {"error":"Unauthorized"} (403 for a signed-in user the policy does
+		// not admit), not the auth router's envelope.
+		//
+		// No double-submit is layered over it, because the reference puts none
+		// on its admin guard (core admin.go, "What is not wrapped around it").
+		// What stands between a cross-site form post and POST <tools>/track
+		// under this posture is the cookie's SameSite attribute, which RS-18
+		// holds off `none` whenever the console is enabled under a session
+		// policy — and internal/config requires admin.enabled for this posture.
+		// The assertion below is for a Config that bypassed the loader: RS-6
+		// makes an enabled console with no access decision unreachable through
+		// it.
+		if !base.AdminMounted() {
+			return nil, fmt.Errorf(
+				"config: refusing to start: tools.auth is %q, but the admin console is not mounted (admin.enabled with admin.accessPolicy or admin.bootstrapSecret), so there is no guard to put the tools routes behind",
+				config.ToolsAuthAdmin)
+		}
+		return auth.ToolsProtected(core.AdminGuard(base).Protect), nil
 
 	case config.ToolsAuthNone:
 		// The reference's default, and here only ever the literal: the

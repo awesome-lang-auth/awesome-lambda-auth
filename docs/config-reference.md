@@ -2318,16 +2318,17 @@ SAM template's default**. The guard is the core's `APIKeyMiddleware`:
 `X-Api-Key: ak_…` or `Authorization: ApiKey ak_…`, looked up by prefix and
 verified by bcrypt against the API-key store, with the key's own IP allowlist
 and expiry honoured. It requires `stores.enable.apiKeys` (`STORE`), and keys
-are minted through the admin API (D8) — until that lands, a posture nobody
-holds a key for is a guard nobody can pass, which is safe and is also a surface
-that answers `401` to everyone. Two things about it are the core's and are
-stated rather than assumed. **It requires no scope**: the schema has no
-vocabulary for one, so *every* active key in the store passes — including one
-an administrator minted with a narrow scope for another purpose — because
-`nil` is "no requirement" to the core's scope check, not "no scope". Today the
-tools guard is the store's only consumer in this product, so every key is a
-tools key by construction; on the day D8 gives the store a second consumer,
-this is the sentence to remember. **And its refusal is a bare `text/plain 401
+are minted through the admin console's `<admin>/api/api-keys` routes (§16) —
+on a deployment with the posture and no console, a store nobody can write to
+is a guard nobody can pass, which is safe and is also a surface that answers
+`401` to everyone. Two things about it are the core's and are stated rather
+than assumed. **It requires no scope**: the schema has no vocabulary for one,
+so *every* active key in the store passes — including one an administrator
+minted with a narrow scope for another purpose — because `nil` is "no
+requirement" to the core's scope check, not "no scope". The console is the
+store's other consumer, so a key minted there for any purpose is a tools key
+here all the same; this is the sentence to remember when minting one. **And
+its refusal is a bare `text/plain 401
 unauthorized`** for every reason alike — no key, an unknown, revoked or expired
 one, a caller outside the IP allowlist — where the reference answers an
 `{error, code}` envelope with five distinct codes and a `403` for a blocked IP.
@@ -2403,9 +2404,28 @@ the configured seam and never from `X-Forwarded-For`
 (`tools-track-ip-comes-from-the-configured-seam`), so an anonymous caller can
 forge the *who* and not the *where from*.
 
-**`admin`** — the tools routes behind the admin console's own guard. The guard
-is D8's; on this build the posture is **refused at cold start** naming that
-block, and `internal/config` refuses it without `admin.enabled` in any build.
+**`admin`** — the tools routes behind the admin console's own guard: the value
+the adapter guards `<admin>/api/*` with, built from `admin.accessPolicy` (§16.1)
+or, in the legacy form, from `admin.bootstrapSecret` (`cmd/auth/tools.go`,
+`toolsAccess`). A caller is whoever the console would admit — the root user or a
+flagged user under `is-admin-flag`, a role or permission holder under the two
+RBAC spellings, the bearer of the secret under the legacy guard — and nobody
+else: a self-registered session that `session` would admit is refused here. The
+refusal is the console's, `401 {"error":"Unauthorized"}` (`403` for a signed-in
+user the policy does not admit), not the auth router's envelope.
+`internal/config` refuses the posture without `admin.enabled`, and the
+console's own rules come with it: RS-6 demands an access decision, and RS-18
+refuses a session policy beside `cookies.sameSite: none` — which matters here,
+because the guard performs no double-submit (the reference's admin guard
+performs none), so the cookie's `SameSite` attribute is what stands between a
+cross-site form post and `POST <tools>/track` under this posture. The SAM
+template's `ToolsAuth` parameter does not offer the value (`apiKey` and
+`session` only), and because that variable overrides `ConfigFile` whenever
+`EnableTools` is on, a stack deployed from the template cannot reach this
+posture at all; a document deployed another way sets it.
+`cmd/auth/tools_test.go` `TestToolsAccessPostures` drives the console's
+credential (`202`), an anonymous caller (`401`), an ordinary user (`403`), and
+the refusal with no console mounted.
 
 **Rate limiting.** `track` has no name in `rateLimit.scope` (§14.1), and that
 is a decision rather than an omission. The scope vocabulary is "the
