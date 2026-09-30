@@ -54,6 +54,14 @@ func main() {
 		return // unreachable: fatal exits. Present so the nil deref below cannot compile away.
 	}
 
+	// D9c: the SSE function is this composition with the Function URL
+	// response-streaming contract instead of JSON in, JSON out (stream.go).
+	if app.Streams() {
+		log.Debug("starting streaming lambda handler", slog.String("component", "cmd/auth"), slog.String("entrypoint", entrypointStream))
+		lambda.StartHandlerFunc(app.StreamHandler())
+		return
+	}
+
 	log.Debug("starting lambda handler", slog.String("component", "cmd/auth"))
 	lambda.Start(app.Handle)
 }

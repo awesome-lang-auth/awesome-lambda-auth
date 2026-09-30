@@ -280,6 +280,12 @@ type toolsWiring struct {
 	// tools.outboundWebhooks.queueUrl is unset and the core's in-process
 	// deliverer is in force. App.Handle flushes it.
 	queue *webhookQueue
+
+	// sseLog is the event log the SSE manager distributes through (D9c), nil
+	// unless tools.sse.distributor.type is dynamodb. The auth function only
+	// publishes into it; the SSE function's stream hook follows it for its
+	// one connection (stream.go).
+	sseLog sseEventLog
 }
 
 // telemetryStoreProvider, webhookStoreProvider and apiKeyStoreProvider are what
@@ -405,10 +411,33 @@ func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStor
 			// WithSseHeartbeat(0); validate.go accepts any integer here.
 			auth.WithSseHeartbeat(time.Duration(cfg.Tools.SSE.HeartbeatIntervalMs) * time.Millisecond),
 			auth.WithSseDeduplicate(cfg.Tools.SSE.Deduplicate),
-			// No WithSseDistributor. RS-14 has refused any document that named
-			// one, and the in-process manager reaches the connections of this
-			// execution environment alone — which, with the stream unmounted,
-			// is none. D9c adds the distributor here.
+		}
+		// ── D9c: the event log is the distributor ──────────────────────────
+		//
+		// With tools.sse.distributor.type: dynamodb the manager distributes
+		// through the event log (docs/spec/data-model.md §1.9), in both
+		// functions. Here, in the auth function, that makes every Broadcast a
+		// write to the log and nothing else — the core does not deliver
+		// locally once a distributor is attached (sse.go), and this function
+		// holds no connection to deliver to. In the SSE function the same
+		// manager serves the one connection its environment holds, fed by the
+		// hook in stream.go following the log. With any other type the
+		// manager is the in-process one and reaches nobody on this runtime;
+		// RS-14 has refused the two types this product does not implement.
+		//
+		// Found structurally on the user store, like every other store this
+		// block consumes; RS-14 guarantees the dynamodb driver, and the
+		// refusal below is for a Config that bypassed the loader.
+		if cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB {
+			provider, ok := users.(sseLogProvider)
+			if !ok {
+				return nil, fmt.Errorf(
+					"config: refusing to start: tools.sse.distributor.type is %q, but the %s driver does not provide the SSE event log in this build",
+					config.DistributorDynamoDB, cfg.Stores.Driver)
+			}
+			sseLog := provider.SseLog(sseLogOptions(cfg))
+			opts.SSEOptions = append(opts.SSEOptions, auth.WithSseDistributor(sseLog))
+			tw.sseLog = sseLog
 		}
 	}
 
@@ -894,7 +923,10 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 			slog.String("problem", "POST "+mount+"/track attributes an event to any user named in the body and fans it out to that user's stream and to every matching outgoing webhook, signed in this deployment's name; POST "+mount+"/notify broadcasts to any topic; GET "+mount+"/telemetry reads every event"),
 			slog.String("remedy", "set tools.auth to apiKey, session, or admin beside a console under a policy other than open, unless the routes are deliberately public, for example behind a private network path"))
 	}
-	if cfg.Tools.SSE.Enabled {
+	// D9c: with the event log as the distributor the manager does reach
+	// somebody — the SSE function's connections — and logStreamSurface
+	// (stream.go) says so instead.
+	if cfg.Tools.SSE.Enabled && cfg.Tools.SSE.Distributor.Type != config.DistributorDynamoDB {
 		log.Info("the SSE manager reaches no connection on this runtime",
 			slog.String("path", "tools.sse.enabled"),
 			slog.String("effect", "the manager is built and Track and Notify broadcast into it, but the stream is not mounted and there is no distributor, so nothing is listening until D9c"))
@@ -960,15 +992,19 @@ func toolsKnobGaps(cfg *config.Config) []knobGap {
 			"set tools.auth: "+config.ToolsAuthAPIKey+" to put the tools routes behind it, or admin.enabled: true to mint keys through the console")
 	}
 	mount := toolsPath(cfg)
-	if cfg.Tools.Stream.Enabled {
+	// D9c: with the event log as the distributor both knobs are live — the
+	// SSE function serves the stream, and this function's manager writes the
+	// log it follows — so neither is a gap. Without it, both still are.
+	streamed := cfg.Tools.SSE.Distributor.Type == config.DistributorDynamoDB
+	if cfg.Tools.Stream.Enabled && !streamed {
 		gaps = append(gaps, knobGap{
 			Path: "tools.stream.enabled",
 			Problem: "GET " + mount + "/stream is not mounted on this runtime and answers 404: API Gateway buffers the response and cuts it at 29 seconds, " +
 				"which would turn a Server-Sent Events stream into a reconnect loop that bills a held-open invocation per client (deviation tools-stream-is-not-mounted-on-api-gateway)",
-			Remedy: "leave it set; the stream lands on a Lambda Function URL with response streaming in D9c, and this knob becomes live then",
+			Remedy: "the stream lands on a Lambda Function URL with response streaming: set tools.sse.enabled and tools.sse.distributor.type: dynamodb and deploy the SSE function (the template's EnableSse), which serves it (docs/sse.md)",
 		})
 	}
-	if cfg.Tools.SSE.Enabled {
+	if cfg.Tools.SSE.Enabled && !streamed {
 		gaps = append(gaps, knobGap{
 			Path:    "tools.sse.enabled",
 			Problem: "the SSE manager is built, but with the stream unmounted and no distributor it holds no connection, so every broadcast reaches nobody",
