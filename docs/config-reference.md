@@ -1999,55 +1999,6 @@ values the reference hard-codes — and their defaults are those values, so a
 document that leaves them alone reports nothing. `ui.uploadDir` in its
 filesystem spelling is the third report (§15.4).
 
-## 17. Two worked postures
-
-**Mail through SES, templates from the artifact.** Every key that is not
-`email.*` here is load-bearing: `stores.enable.templates` needs a driver that
-backs a template store (§5.3), and the `stores` block has to name that driver,
-because the default is `memory` and rule RS-12 refuses it in production.
-
-```json
-{
-  "schemaVersion": 1,
-  "deployment": {"environment": "development", "publicUrl": "https://auth.example.com"},
-  "email": {
-    "siteUrls": ["https://app.example.com"],
-    "mailer": {"endpoint": "https://unused.invalid", "from": "no-reply@example.com", "fromName": "Example"},
-    "templatesDir": "/var/task/templates"
-  },
-  "stores": {"driver": "memory", "enable": {"users": true, "sessions": true, "tokens": true, "templates": true}}
-}
-```
-
-For production today, drop `templatesDir` and `stores.enable.templates`, keep
-`stores.driver: dynamodb`, and the built-in `en`/`it` templates render.
-
-**Every credential posted to a receiver you own.** A production document: no
-mailer block at all, so nothing is sent through SES or SNS, and the
-email-changed notice and the account-linking mail are not sent either. The
-`stores` block is what makes it a production document rather than a refusal —
-the default driver is `memory`, which RS-12 forbids in production.
-
-```json
-{
-  "schemaVersion": 1,
-  "deployment": {"environment": "production", "publicUrl": "https://auth.example.com"},
-  "email": {
-    "siteUrls": ["https://app.example.com"],
-    "deliveryWebhook": {
-      "url": "https://hooks.example.com/auth-delivery",
-      "timeoutMs": 2000,
-      "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}
-    }
-  },
-  "stores": {
-    "driver": "dynamodb",
-    "connection": {"tableName": "awesome-auth", "region": "eu-west-1"},
-    "enable": {"users": true, "sessions": true, "tokens": true}
-  }
-}
-```
-
 ## 17. `tools.*`, knob by knob
 
 The tools surface: `POST <tools>/track/{eventName}`, `POST <tools>/notify/{target}`,
@@ -2487,3 +2438,52 @@ through it and not through any route:
 | D9b | `WebhookDeliverer` on SQS with a DLQ | `WebhookSender.Deliverer`, one field; retires `outgoing-webhook-delivery-races-the-response` |
 | D9c | `GET <tools>/stream` on a Function URL, `WithSseDistributor` | `DisableStream: true`, one field, plus the option; retires RS-14 and `tools-stream-is-not-mounted-on-api-gateway` |
 | D9d | `InboundScriptRunner` as its own Lambda | `ScriptRunner: nil`, one field; retires RS-15 and `inbound-webhooks-are-refused-without-a-runner` |
+
+## 18. Two worked postures
+
+**Mail through SES, templates from the artifact.** Every key that is not
+`email.*` here is load-bearing: `stores.enable.templates` needs a driver that
+backs a template store (§5.3), and the `stores` block has to name that driver,
+because the default is `memory` and rule RS-12 refuses it in production.
+
+```json
+{
+  "schemaVersion": 1,
+  "deployment": {"environment": "development", "publicUrl": "https://auth.example.com"},
+  "email": {
+    "siteUrls": ["https://app.example.com"],
+    "mailer": {"endpoint": "https://unused.invalid", "from": "no-reply@example.com", "fromName": "Example"},
+    "templatesDir": "/var/task/templates"
+  },
+  "stores": {"driver": "memory", "enable": {"users": true, "sessions": true, "tokens": true, "templates": true}}
+}
+```
+
+For production today, drop `templatesDir` and `stores.enable.templates`, keep
+`stores.driver: dynamodb`, and the built-in `en`/`it` templates render.
+
+**Every credential posted to a receiver you own.** A production document: no
+mailer block at all, so nothing is sent through SES or SNS, and the
+email-changed notice and the account-linking mail are not sent either. The
+`stores` block is what makes it a production document rather than a refusal —
+the default driver is `memory`, which RS-12 forbids in production.
+
+```json
+{
+  "schemaVersion": 1,
+  "deployment": {"environment": "production", "publicUrl": "https://auth.example.com"},
+  "email": {
+    "siteUrls": ["https://app.example.com"],
+    "deliveryWebhook": {
+      "url": "https://hooks.example.com/auth-delivery",
+      "timeoutMs": 2000,
+      "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}
+    }
+  },
+  "stores": {
+    "driver": "dynamodb",
+    "connection": {"tableName": "awesome-auth", "region": "eu-west-1"},
+    "enable": {"users": true, "sessions": true, "tokens": true}
+  }
+}
+```
