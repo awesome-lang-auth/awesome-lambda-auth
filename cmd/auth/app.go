@@ -126,6 +126,16 @@ type Options struct {
 	// auth.WebhookDeliverer and not awsintegration.SQSAPI, for the reason
 	// IDPKeySource is not KMSAPI.
 	WebhookDeliverer auth.WebhookDeliverer
+
+	// ScriptRunner (D9d) injects the inbound-webhook script runner, for the
+	// reason Mail and SMS are injectable: a composition that runs scripts in
+	// another Lambda has to be provable without one. Nil builds the real
+	// invoker (awsintegration.NewLambdaScriptRunner), lazily. Injecting it
+	// switches nothing on — whether a runner is wired at all is a question
+	// about tools.inboundWebhooks (scriptrunner.go, newScriptRunner). It is the
+	// core's auth.InboundScriptRunner and not awsintegration.LambdaAPI, for the
+	// reason IDPKeySource is not KMSAPI.
+	ScriptRunner auth.InboundScriptRunner
 }
 
 // App is one cold start's worth of state.
@@ -319,6 +329,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// D9d: the inbound-webhook script runner, onto the wiring the router is
+	// built from. No I/O; the Lambda client is built on the first webhook.
+	if tools != nil {
+		if tools.scriptRunner, err = newScriptRunner(cfg, opts.ScriptRunner); err != nil {
+			return nil, err
+		}
+	}
 
 	core, err := buildCore(ctx, cfg, opts, users, sessions, deliver, tools, log)
 	if err != nil {
@@ -380,6 +397,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
 	logToolsSurface(cfg, tools, log)
+	logScriptRunnerSurface(cfg, tools, log) // D9d
 
 	// The middleware chain is one function, assembleHandler, so that the test
 	// harness (admin_test.go newAdminSurface) builds the very chain New builds
@@ -1285,6 +1303,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, adminKnobGaps(cfg)...)
 	gaps = append(gaps, toolsKnobGaps(cfg)...)
 	gaps = append(gaps, webhookQueueKnobGaps(cfg)...) // D9b
+	gaps = append(gaps, scriptRunnerKnobGaps(cfg)...) // D9d
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

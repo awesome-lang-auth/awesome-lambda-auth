@@ -501,28 +501,77 @@ func WireDeviations() []WireDeviation {
 				"WebhookAttempt.DeliveryID)",
 		},
 		// ── end D9b ──
+		// D9d: the three entries of the inbound-webhook runner.
 		{
 			ID:      "inbound-webhooks-are-refused-without-a-runner",
-			Surface: "POST <tools>/webhook/{provider}, and the tools.inboundWebhooks.enabled knob behind it",
-			Behaviour: "A tools block with tools.inboundWebhooks.enabled left at its default of true is refused at cold start " +
-				"(RS-15), and the document has to write tools.inboundWebhooks.enabled: false to load. With it off the " +
-				"route is not mounted and answers 404. tools.inboundWebhooks.scriptTimeoutMs is mapped onto the core's " +
-				"ScriptTimeout regardless, so the day the runner lands the knob is already live.",
+			Surface: "POST <tools>/webhook/{provider}, and the tools.inboundWebhooks.enabled and .scriptRunnerFunction knobs behind it",
+			Behaviour: "A tools block with tools.inboundWebhooks.enabled on -- its default -- and no tools.inboundWebhooks.scriptRunnerFunction " +
+				"naming the script-runner Lambda is refused at cold start (RS-15); the document has to name the runner or write " +
+				"tools.inboundWebhooks.enabled: false to load. With it off the route is not mounted and answers 404. With a runner named, " +
+				"a row's jsScript runs in that Lambda (inbound-webhook-scripts-run-on-goja), and a row with no script is acknowledged and " +
+				"tracks nothing, because OnWebhook is a host callback this product has no configuration path into.",
 			Reference: "The route is mounted by default whenever a webhook store answering findByProvider or an onWebhook " +
 				"callback exists (tools.router.ts:250), and a row's jsScript runs in an in-process vm with a five-second " +
-				"timeout on its synchronous prefix (:269-292).",
+				"timeout on its synchronous prefix (:269-292). There is nothing to name.",
 			Why: "The core runs no script in process -- inbound-webhook-script-runs-out-of-process -- and fails closed " +
 				"without an InboundScriptRunner: 400, nothing tracked. That is right for the core and wrong as a deployed " +
 				"outcome, because every webhook provider treats a non-2xx as undelivered and redelivers, for hours and " +
 				"some for days, so a deployment that came up with the route mounted and no runner would answer a retry " +
-				"storm from the first event onwards. A row with no script is no better served: the alternative handler, " +
-				"OnWebhook, is a host callback this product has no configuration path into, so it would be acknowledged " +
-				"and dropped. The runner is D9d's, a Lambda of its own whose IAM role is the sandbox, and until it lands " +
-				"the honest answer is a refusal that names the line to write. The default is not silently overridden to " +
-				"false because a document that says one thing and deploys another is the failure the phase mechanism " +
-				"this rule descends from exists to prevent. internal/config/rules_test.go pins the refusal; D9d retires " +
-				"RS-15 and this entry together.",
-			Spec: "docs/spec/config-schema.md §1.15; docs/config-reference.md §17.5; upstream tools_webhook.go",
+				"storm from the first event onwards. D9a wrote this as a blanket refusal because no runner existed; D9d " +
+				"brings cmd/script-runner and narrows the rule to the configuration that still has none, keeping the id and " +
+				"the RS number because the failure is the same one. The default is not silently overridden to false because " +
+				"a document that says one thing and deploys another is the failure the phase mechanism this rule descends " +
+				"from exists to prevent. internal/config/rules_test.go pins both halves of the refusal and cmd/auth's " +
+				"TestRS15AcceptsANamedRunner the acceptance.",
+			Spec: "docs/spec/config-schema.md §1.15; docs/config-reference.md §17.5; docs/inbound-webhooks.md; upstream tools_webhook.go",
+		},
+		{
+			ID:      "inbound-webhook-scripts-run-on-goja",
+			Surface: "every inbound webhook whose stored WebhookConfig carries a jsScript",
+			Behaviour: "The script runs in cmd/script-runner, a Lambda of its own invoked synchronously by the auth function, on the goja " +
+				"engine: a fresh runtime per run holding exactly body, actions, result and console, the script wrapped in the " +
+				"reference's own async IIFE. What a client can observe differently: (1) the deadline -- " +
+				"tools.inboundWebhooks.scriptTimeoutMs, 5000 by default -- bounds the WHOLE run, and a script that reaches it is " +
+				"interrupted and the webhook refused 400, so the provider redelivers; (2) a promise nothing in the sandbox can settle " +
+				"is reported at once as no result and acknowledged; (3) goja has no Intl, WebAssembly or SharedArrayBuffer, so a " +
+				"script using them throws and is acknowledged with nothing tracked; (4) result.data is kept only when it is a JSON " +
+				"object, and userId and tenantId only when they are strings; (5) `actions` holds the runner's compiled manifest, " +
+				"which ships empty, intersected with the core's resolved allowlist -- so on this build every action call is a " +
+				"TypeError; (6) an action can reach only what the runner's IAM role grants, which is its own log group and nothing else.",
+			Reference: "node:vm in the API process (tools.router.ts:269-305): the same four variables and the same wrapper, but " +
+				"{ timeout: 5_000 } bounds only the synchronous prefix, so a synchronous loop is caught, logged and acknowledged, " +
+				"while a script awaiting a hanging promise holds the request open for as long as the socket lives; V8's Intl is " +
+				"there; result.data and the identifiers are passed to track as they are; actions are whatever the host decorated " +
+				"with @webhookAction (webhook-action.ts:104-115), running with the API process's own credentials.",
+			Why: "The owner decided on 2026-09-12 that no JavaScript engine enters the auth function, which holds the signing keys, " +
+				"the session store and the password hashes; the runner is a separate function and its IAM role is the sandbox. goja " +
+				"rather than a Node.js runner because it keeps one language, one pinned build image and byte-reproducible artifacts, " +
+				"and its differences are few and pinned (internal/scriptrunner/engine_test.go); cmd/auth's " +
+				"TestTheAuthBinaryLinksNoJavaScriptEngine fails the day the auth binary links any engine. The whole-run deadline is " +
+				"the core's contract (a timeout is (zero, false, err)), and it trades the reference's acknowledged-and-lost loop " +
+				"for a redelivery an operator can see and fix; a never-settling promise is answered at once because with no timers " +
+				"and synchronous actions nothing could settle it, and a redelivery would hang the same way. The type rules on the " +
+				"result are the core's InboundScriptResult. The manifest ships empty because which effects a webhook may cause is " +
+				"the deployment's decision and each one is paid for in IAM.",
+			Spec: "docs/inbound-webhooks.md; docs/config-reference.md §17.5; upstream tools_webhook.go (InboundScriptRunner)",
+		},
+		{
+			ID:      "admin-actions-list-omits-the-runner-manifest",
+			Surface: "GET <admin>/api/actions",
+			Behaviour: "Answers an empty list whatever the script runner's manifest holds, so the admin console's action toggles " +
+				"never show an action added to it; the ids are enabled by writing them into the settings' enabledWebhookActions " +
+				"(runtimeSettings.enabledWebhookActions, or PUT <admin>/api/settings) and into a webhook's allowedActions " +
+				"(PATCH <admin>/api/webhooks/{id}). With the shipped manifest, which is empty, the answer is the reference's for an " +
+				"empty registry.",
+			Reference: "Answers ActionRegistry.getAllMeta() (admin.router.ts:946-948): every decorated action's id, label, " +
+				"category, description and dependsOn.",
+			Why: "Not a choice this product made: the imported core's adminListActions answers [] unconditionally and exposes no " +
+				"seam to be told about a registry, and the registry lives in another binary by design -- the auth function must " +
+				"not link the runner's code. Serving the list from here would be a route this binary adds under the admin path, " +
+				"which the product's rules forbid. The fix is upstream: an AdminOptions field carrying action metadata, which " +
+				"the product would fill from a metadata-only half of the manifest. internal/scriptrunner " +
+				"TestTheShippedManifestIsEmpty fails the day an action ships, which is the day this entry becomes observable.",
+			Spec: "docs/inbound-webhooks.md (\"Adding an action\"); upstream admin_read.go (adminListActions)",
 		},
 		{
 			ID:      "tools-api-key-refusal-is-the-cores-bare-401",

@@ -16,12 +16,14 @@ import (
 // visible act: the ids are handles the docs and the operators key on.
 func TestWireDeviationIDsArePinned(t *testing.T) {
 	want := []string{
+		"admin-actions-list-omits-the-runner-manifest", // D9d
 		"admin-first-user-policy-is-refused",
 		"admin-login-skips-the-second-factor",
 		"admin-user-detail-is-single-tenant",
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",
+		"inbound-webhook-scripts-run-on-goja", // D9d
 		"inbound-webhooks-are-refused-without-a-runner",
 		"library-events-are-bridged-into-the-tools-fan-out",
 		"oauth-callback-skips-the-second-factor",
