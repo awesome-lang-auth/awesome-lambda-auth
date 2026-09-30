@@ -1147,9 +1147,10 @@ Parameters:
   # DynamoDB MaxRead/MaxWriteRequestUnits ceilings. Everything here is how you
   # find out in ten minutes instead of at the end of the month.
   #
-  # Costs. Nine standard-resolution alarm metrics, against a CloudWatch
+  # Costs. Nine standard-resolution alarm metrics (ten with EnableWebhookQueue,
+  # D9b), against a CloudWatch
   # always-free allowance of ten — so in an account with no other alarms this
-  # section is free, and USD 0.90/month in one that has already spent the
+  # section is free, and USD 0.90/month (1.00 with the queue) in one that has already spent the
   # allowance. The SNS topic and its subscription cost nothing at rest and are
   # not created at all unless AlarmEmail is set. The budget is the second budget
   # in an account that has the AWS-provided zero-spend one, and the first two per
@@ -1173,11 +1174,11 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      Create the nine CloudWatch alarms. On by default: they are within the
+      Create the nine CloudWatch alarms (ten with EnableWebhookQueue). On by default: they are within the
       always-free ten alarm metrics, and an unmonitored serverless stack is the
       failure mode this section exists to prevent. Turn them off only in an
       account whose free allowance is already spent and where 0.90 USD/month is
-      not worth it — or where the alarms are managed centrally somewhere else.
+      (1.00 with the queue) not worth it — or where the alarms are managed centrally somewhere else.
 
   # The notification target. Empty is the default and empty means NOTHING is
   # created — no topic, no subscription, no charge — and the alarms are then
@@ -3162,7 +3163,7 @@ Resources:
   # Observability
   # =====================================================================
   #
-  # Nine alarms, one optional topic to send them to, one optional budget and one
+  # Nine alarms (ten with EnableWebhookQueue), one optional topic to send them to, one optional budget and one
   # optional anomaly monitor. Each alarm below states the incident it catches and
   # why its threshold is that number, because an alarm whose threshold nobody can
   # justify is an alarm somebody eventually silences.

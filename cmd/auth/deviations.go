@@ -443,14 +443,23 @@ func WireDeviations() []WireDeviation {
 				"survives the auth function's execution environment being frozen or recycled, is retried on the " +
 				"reference's schedule -- at most Retries() further attempts, the first after RetryDelay(), each wait " +
 				"twice the last -- and, when the attempts are spent, is moved to a dead-letter queue kept fourteen " +
-				"days, with an alarm on its depth. Delivery is at-least-once: a worker that stops after the receiver " +
-				"answered and before the ledger recorded it (data-model.md §1.9) is retried, and the receiver sees " +
-				"the request twice. Four limits of the transport shape the schedule: a wait is whole seconds, " +
-				"rounded up; no wait exceeds just under twelve hours (SQS's visibility maximum); a subscription " +
-				"wanting more attempts than the queue's maxReceiveCount (template default 12) is dead-lettered at " +
-				"that ceiling with reason receive-ceiling; and an enqueue that fails spends one attempt of the " +
-				"subscription's budget, because the core numbers attempts before the transport sees them. An " +
-				"envelope over 256 KiB cannot be queued at all and is reported through the fan-out log.",
+				"days, with an alarm on its depth when EnableAlarms is on. Delivery is at-least-once, and a receiver " +
+				"can see one event twice in two ways: a worker that stops after the receiver answered and before " +
+				"the ledger recorded it (data-model.md §1.9) is retried, and the receiver sees the same request -- " +
+				"same X-Webhook-Delivery -- twice; and an enqueue that fails ambiguously (the two-second deadline " +
+				"expires after SQS has stored the message) is enqueued again by the core under a fresh delivery " +
+				"id, so the receiver sees two deliveries with two ids, which no key the receiver holds can join. " +
+				"Four limits of the transport shape the schedule: a wait is whole seconds, rounded up, and is set " +
+				"on one copy of the message, so an SQS duplicate copy can make an attempt early; no wait exceeds " +
+				"just under twelve hours (SQS's visibility maximum); the queue's maxReceiveCount (template default " +
+				"12) caps receives, and a receive that made no request -- a duplicate bounced off a live claim, the " +
+				"ledger unreachable -- counts against it as much as an attempt, so a subscription can be " +
+				"dead-lettered at that ceiling with attempts left (reasons receive-ceiling, busy-at-ceiling, " +
+				"ledger-unavailable); and an enqueue that fails spends one attempt of the subscription's budget, " +
+				"because the core numbers attempts before the transport sees them. A failing message near the " +
+				"queue's fourteen-day retention is dead-lettered as expiring; one never received within it is " +
+				"deleted by SQS unseen. An envelope over 256 KiB with its attributes cannot be queued at all and " +
+				"is reported through the fan-out log.",
 			Reference: "Delivery is at-most-once and in process: send is not awaited (src/tools/auth-tools.ts:266), " +
 				"retries run on setTimeout in the same process (src/tools/webhook-sender.ts:18-46), a process that " +
 				"exits drops them, the final failure is swallowed (.catch(() => {}), auth-tools.ts:280) and nothing " +
@@ -462,27 +471,32 @@ func WireDeviations() []WireDeviation {
 				"WebhookDeliverer), and on Lambda durable before return also means before the response, which is why " +
 				"App.Handle waits for the enqueue. Deduplication at the receiver is not possible on the reference's " +
 				"own header (a fresh X-Webhook-Delivery per attempt), so the worker keeps a ledger keyed on the id the " +
-				"core minted and makes one successful POST per delivery the normal case; exactly-once over HTTP to a " +
-				"third party is not available to anyone. The ceiling exists because SQS has one maxReceiveCount per " +
-				"queue and the reference's retry count is per subscription; the worker enforces the subscription's " +
-				"count itself and the queue's is a backstop for a worker that crashes on a message.",
+				"core minted and makes one successful POST per queued message the normal case; exactly-once over " +
+				"HTTP to a third party is not available to anyone, and an idempotent enqueue is not available on a " +
+				"standard queue. The ceiling exists because SQS has one maxReceiveCount per queue and the " +
+				"reference's retry count is per subscription; the worker enforces the subscription's count itself, " +
+				"dead-letters with a reason whenever the queue's count runs out first, and leaves SQS's own redrive " +
+				"for a receive it did not finish (a crash, a timeout, a failed hand-off).",
 			Spec: "docs/config-reference.md §17.4; docs/cost-model.md §3.3; docs/spec/data-model.md §1.9; " +
 				"internal/integration/aws/sqs.go; cmd/webhook-worker/worker.go",
 		},
 		{
 			ID:      "queued-webhook-retries-reuse-the-delivery-id",
 			Surface: "the X-Webhook-Delivery header of every retry of a queued outgoing webhook (tools.outboundWebhooks.queueUrl set)",
-			Behaviour: "Every attempt at one queued delivery carries the same X-Webhook-Delivery: the id the core minted " +
-				"for the attempt it handed the queue. A receiver sees one id per event and subscription, however many " +
-				"times it is retried.",
+			Behaviour: "Every attempt at one queued message carries the same X-Webhook-Delivery: the id the core minted " +
+				"for the attempt it handed the queue. A receiver sees one id per queued message, however many times " +
+				"the worker retries it. That is one id per event and subscription in the normal case and not always: " +
+				"an enqueue the core retried after an ambiguous failure (queued-webhooks-are-delivered-at-least-once) " +
+				"is a second queued message with a second id.",
 			Reference: "A fresh randomUUID() per attempt, minted inside the retry loop (src/tools/webhook-sender.ts:27), " +
 				"so two attempts at one event carry two ids.",
 			Why: "The core's WebhookDeliverer contract tells a host that redelivers from a queue to resend the header it " +
 				"was handed rather than mint one of its own, so that the identifiers a receiver sees are ones the core " +
 				"issued; the worker cannot mint a core id, and minting its own would be exactly what that forbids. The " +
 				"id also becomes a key the worker's ledger can deduplicate on. The difference is observable only to a " +
-				"receiver that compared the ids of two retries, and a receiver deduplicating on the header -- which the " +
-				"reference makes impossible -- now gets the answer it wanted.",
+				"receiver that compared the ids of two retries. A receiver deduplicating on the header -- which the " +
+				"reference makes impossible -- now catches the worker's retries and duplicates, but not a re-enqueue, " +
+				"which only a key in the payload it chose itself could join.",
 			Spec: "docs/config-reference.md §17.4; upstream webhook_sender.go (WebhookDeliverer, Idempotency; " +
 				"WebhookAttempt.DeliveryID)",
 		},

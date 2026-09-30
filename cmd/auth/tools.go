@@ -223,7 +223,7 @@ import (
 // admin.enabled, and the console's own rules (RS-6, RS-18) come with it
 // (toolsAccess).
 //
-// ── the two seams left empty on purpose ──────────────────────────────────────
+// ── the two seams left to later blocks (D9b fills the first when configured) ─
 //
 // WebhookSender is the default in-process HTTP deliverer. The core made
 // WebhookDeliverer the transport seam so that a deployment can queue deliveries
@@ -303,6 +303,8 @@ type apiKeyStoreProvider interface {
 // exactly as emailOptions refuses for one with no template store — a refusal
 // that cannot happen on the two drivers this build ships, and stays because
 // the next driver is the one it is for.
+//
+// queueDeliverer (D9b) is Options.WebhookDeliverer, handed to newWebhookQueue.
 func newToolsWiring(ctx context.Context, cfg *config.Config, users auth.UserStore, deliver *delivery, client *http.Client, queueDeliverer auth.WebhookDeliverer, log *slog.Logger) (*toolsWiring, error) {
 	if !cfg.Tools.Enabled {
 		return nil, nil
@@ -492,7 +494,7 @@ func (w webhookDefaults) FindByEvent(ctx context.Context, event, tenantID string
 			configs[i].RetryDelayMs = &delay
 		}
 	}
-	if w.queue != nil {
+	if w.queue != nil { // D9b: the snapshot and the flush count (webhook_queue.go)
 		w.queue.observe(configs)
 	}
 	return configs, nil
@@ -843,7 +845,7 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 		slog.Bool("docs", docsEnabled(cfg)),
 		slog.String("bridge", "on: every identity.* event the auth core raises is persisted to the telemetry store and delivered to every matching outgoing webhook"),
 		slog.String("stream", "not mounted on this runtime: GET "+mount+"/stream answers 404 whatever tools.stream.enabled says, until D9c (deviation tools-stream-is-not-mounted-on-api-gateway)"),
-		slog.String("outgoingWebhooks", outgoingWebhooksLine(cfg)))
+		slog.String("outgoingWebhooks", outgoingWebhooksLine(cfg))) // D9b: which deliverer is in force
 
 	// What each guarded posture still costs, said where the operator reads what
 	// came up rather than only in the config reference. The session line is a

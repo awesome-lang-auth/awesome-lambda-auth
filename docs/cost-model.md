@@ -55,7 +55,7 @@ At 512 MB the Lambda duration charge is **USD 0.0000000066667 per millisecond**
 **Total: USD 0.80 a month, or USD 1.80 with the identity provider on.** The
 observability block adds **nothing** to that in an account with fewer than ten
 other alarms, and **USD 0.90 a month** in one that has already spent the free
-allowance — nine alarm metrics at USD 0.10.
+allowance — nine alarm metrics at USD 0.10 (ten, USD 1.00, with `EnableWebhookQueue`, §3.3).
 
 Two things are worth saying plainly about this table. The whole standing bill is
 Secrets Manager and KMS, which are the two resources that exist to keep a signing
@@ -418,12 +418,52 @@ request. A receiver that hangs costs its 10-second timeout at 128 MB, USD
 0.0000167 an attempt, which is why the worker is at the smallest memory size:
 the work is waiting, not computing.
 
-**The ceiling is concurrency, not money.** `WebhookWorkerMaxConcurrency`
+**Concurrency bounds the rate, not the total.** `WebhookWorkerMaxConcurrency`
 (default 5) bounds how many worker environments drain the queue at once, so a
-burst of a hundred thousand logins is a backlog that drains at five batches
-at a time rather than a hundred thousand concurrent POSTs at every receiver —
-and a bill bounded by the drain rate. A backlog costs nothing to hold: the
-messages wait up to fourteen days.
+burst of a hundred thousand logins is a backlog that drains five batches at a
+time rather than a hundred thousand concurrent POSTs at every receiver. It
+does not bound the bill: every message enqueued is eventually received,
+claimed, settled, POSTed and deleted, so every per-attempt line above scales
+with **arrivals**, not with the drain. What concurrency does cap is the
+worker's *duration*: five environments busy for their whole 30-second timeout,
+around the clock, are 5 × 2 592 000 s × USD 0.0000016667 ≈ **USD 21.60 a
+month**, the most worker duration the default can bill in a month whatever
+arrives (a raised `WebhookWorkerMaxConcurrency` scales it linearly); the
+queue, ledger and invocation lines have no such ceiling.
+
+**Who fills the queue.** Anything that raises an event a subscription
+matches, and two of those need no credential at all:
+
+- `identity.auth.login.failed` is published for every refused login, an
+  unauthenticated request (the core's `login_2fa.go`). A subscription to it
+  turns a password-spraying run into one queued delivery per guess, and a
+  receiver that refuses them into four attempts each.
+- `POST <tools>/track/{event}` fires every matching subscription with a
+  caller-chosen payload under `tools.auth: none` (anyone) and `session` (any
+  self-registered user, config reference §17.6). The template's default,
+  `apiKey`, closes it.
+
+§2.8's "costs nothing further because the retry never runs" stops being true
+with the queue on: every such event now gets its full schedule — up to four
+attempts with the defaults, each up to a 10-second hang at 128 MB against a
+receiver that does not answer. And the per-request SQS price assumes a
+message under 64 KB, SQS's billing unit: a `track` payload near the
+~190 KiB envelope budget is **three** billed requests per `SendMessage`,
+receive and DLQ hand-off. A payload over the budget costs no SQS request —
+the enqueue is refused before it is sent — and, since the refusal is
+permanent, the auth function no longer waits out its two-second flush bound
+for it (about USD 0.33 per million requests for a 50 ms request, against
+USD 17 per million had it waited the bound at 512 MB).
+
+**A backlog is free to hold, for fourteen days.** Messages wait on the
+queue at no charge up to `WebhookQueue`'s retention. A failing message near
+it is dead-lettered as `expiring` (config reference §17.4); one never
+received within it — a backlog deeper than the worker drains in fourteen
+days, or a worker that cannot start — is deleted by SQS **silently**, with
+no redrive and no alarm. An alarm on the queue's
+`ApproximateAgeOfOldestMessage` would catch that and would cost USD 0.10 a
+month as the eleventh alarm metric; it is left out to keep the set inside the
+free ten.
 
 **The alarm budget (rule 10 of the block).** The worker adds one alarm, not
 four: `WebhookDeadLetterAlarm` on the dead-letter queue's depth, because a

@@ -640,9 +640,9 @@ worker's other four metrics are left unalarmed on purpose
 | `-table-write-capacity` | DynamoDB `ConsumedWriteCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | The same incident one step earlier — 30% of the ceiling. The limiter spends 1 WCU per limited request either way, so this rate is a credential-attempt rate, not a user base |
 | `-table-read-capacity` | DynamoDB `ConsumedReadCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | Where `sessions.checkOn: allcalls` shows up, and where a polling event stream will |
 | `-auth-log-ingestion` | Logs `IncomingBytes`, Sum | ≥ `LogIngestionAlarmBytes` (25 MiB) in 1 hour | A loop that logs per iteration. Retention bounds *storage*; nothing bounds *ingestion*, which is where the ~$0.50/GB is charged |
-| `-webhook-dead-letters` (D9b, only with `EnableWebhookQueue`) | SQS `ApproximateNumberOfMessagesVisible` on the webhook DLQ | ≥ 1 in 5 min | An outgoing webhook gave up: every attempt refused, the receive ceiling reached, or a message the worker could not schedule. The message is in the DLQ for 14 days with a `DeadLetterReason`; nothing retries it (docs/config-reference.md §17.4) |
+| `-webhook-dead-letters` (D9b, only with `EnableWebhookQueue`) | SQS `ApproximateNumberOfMessagesVisible` on the webhook DLQ | ≥ 1 in 5 min | An outgoing webhook gave up: every attempt refused, the receive ceiling reached, about to expire, or a message the worker could not schedule. The message is in the DLQ for 14 days from the hand-off with a `DeadLetterReason`; nothing retries it (docs/config-reference.md §17.4) |
 
-All nine treat missing data as not breaching — an idle stack publishes no Lambda
+All of them (nine, ten with the webhook queue) treat missing data as not breaching — an idle stack publishes no Lambda
 or DynamoDB metrics at all, and an alarm that fires because nothing happened is
 an alarm somebody turns off. None has an `OKActions`: "the alarm cleared" is not
 news, and doubling the mail volume is the reliable way to get alerts filtered
@@ -774,12 +774,12 @@ at rest or billed per request:
   only grows. Ingestion is the line that scales with traffic — roughly **$0.30
   per million requests** at the two lines this binary writes per request, which
   is a quarter of the API Gateway charge for the same traffic.
-- The observability block — nine alarms, the SNS topic, the budget, the anomaly
+- The observability block — nine alarms (ten with `EnableWebhookQueue`), the SNS topic, the budget, the anomaly
   monitor: **$0 at rest.** Nine alarm metrics fit inside CloudWatch's always-free
   ten, the topic and its subscription have no standing charge (and the first
   1 000 email notifications a month are free), the budget is the free second of
   two, and cost anomaly detection is free. In an account that has already spent
-  its ten alarm metrics elsewhere, $0.90/month.
+  its ten alarm metrics elsewhere, $0.90/month ($1.00 with the webhook queue).
 - S3 artifact bucket: a few megabytes per deployed version. Cents.
 - Admin uploads bucket (`EnableAdminUploads=true`): storage at ~$0.023 per
   GB-month — cents for a handful of logos — plus ~$0.0004 per thousand

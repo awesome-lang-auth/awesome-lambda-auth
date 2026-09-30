@@ -86,10 +86,22 @@ const (
 // duplicate of a delivery is still recognised.
 //
 // Twenty-four hours, rewritten on every claim and settle. SQS duplicates arrive
-// within minutes; the longest gap between two attempts of one delivery is SQS's
-// twelve-hour visibility maximum, which the worker caps its back-off at, so a
-// window refreshed at every transition outlives every gap in any schedule the
-// worker can produce.
+// within minutes, and the longest wait the worker sets between two attempts of
+// one delivery is SQS's twelve-hour visibility maximum, so a window refreshed
+// at every transition outlives every gap the schedule itself produces.
+//
+// It does not outlive every gap a backlog can add. The gap between two claims
+// is the wait plus the time the message then sits visible behind other
+// messages before it is received, and the second part is bounded only by the
+// queue's retention. If that ever exceeds a day, TTL may reap the item between
+// two attempts: the claim count restarts at one, so the delivery gets its
+// budget again (still bounded by the queue's maxReceiveCount), and a
+// "delivered" record that is gone lets a late duplicate POST once more — the
+// at-least-once the register already states. Covering the retention instead
+// (fifteen days) was weighed and not chosen: storage is negligible either way,
+// but the window is also how long a replayed dead-letter bounces straight back
+// (config-reference.md §17.4), and a fortnight of that is the worse trade for
+// a backlog the worker would have to be days behind to produce.
 const WebhookDeliveryWindow = 24 * time.Hour
 
 // maxWebhookDeliveryIDLen bounds the delivery id segment. The core mints a
@@ -159,6 +171,18 @@ type WebhookClaimResult struct {
 var ErrWebhookClaimLost = errors.New("dynamodb: the webhook delivery claim was lost to another claimant")
 
 func webhookDeliveryPK(deliveryID string) string { return pkWebhookDeliveryPrefix + deliveryID }
+
+// webhookDeliveryLedger is the ledger's surface. No core interface describes
+// it — nothing in awesome-go-auth delivers from a queue — so, as with
+// rateLimitCounter, the shape is pinned here beside the implementation, one
+// assertion per store file (interfaces.go). cmd/webhook-worker declares its
+// own slice of it as the consumer.
+type webhookDeliveryLedger interface {
+	ClaimWebhookDelivery(ctx context.Context, deliveryID, configID string, leaseUntil time.Time) (WebhookClaimResult, error)
+	SettleWebhookDelivery(ctx context.Context, claim WebhookClaim, state WebhookDeliveryState) error
+}
+
+var _ webhookDeliveryLedger = (*Store)(nil)
 
 // ClaimWebhookDelivery takes the lease on one delivery until leaseUntil, or
 // reports why it cannot (data-model.md §1.9 #76, #77).

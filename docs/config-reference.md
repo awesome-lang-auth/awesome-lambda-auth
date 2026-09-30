@@ -2246,8 +2246,10 @@ the signature and the numbering are unchanged; only the transport is.
   request started is stored on SQS before handing the response to the runtime.
   That is one `SendMessage` (tens of milliseconds) on the requests that match a
   subscription, and nothing on the rest. If the bound expires (SQS unreachable,
-  or an enqueue being retried), the response is released and the cold-start
-  logger says `outgoing webhook enqueue still in flight`.
+  or an enqueue being retried), the response is released and that request's
+  log line says `outgoing webhook enqueue still in flight`. An envelope too
+  large to queue does not wait at all: the refusal is permanent, so the
+  response is released at the first one (see **Size**).
 - **The retry schedule is the reference's, per subscription.** At most the
   row's `maxRetries` further attempts, the first after its `retryDelayMs`, each
   wait twice the last — with the defaults, four requests with waits of 1 s, 2 s
@@ -2257,40 +2259,86 @@ the signature and the numbering are unchanged; only the transport is.
   next event's schedule and never an event already queued. The worker waits by
   setting the message's visibility: whole seconds, rounded **up**, and capped
   just under SQS's twelve hours, so a schedule that reaches half a day waits
-  half a day and no longer. An enqueue that fails is retried by the core on the
+  half a day and no longer. The wait is set on one copy of the message: an SQS
+  duplicate copy that happens to be visible when an attempt fails can make the
+  next attempt at once, ahead of the schedule — rare, and it spends a slot of
+  the budget as numbered. An enqueue that fails is retried by the core on the
   same back-off and **spends one attempt** of the row's budget.
 - **Retries carry the same `X-Webhook-Delivery`.** The reference mints a fresh
-  id per attempt; here every attempt at one delivery carries the id the core
-  minted for the attempt it enqueued, so a receiver sees one id per event and
-  subscription and can deduplicate on it
-  (`queued-webhook-retries-reuse-the-delivery-id`). `X-Correlation-Id` is
+  id per attempt; here every attempt at one queued message carries the id the
+  core minted for the attempt it enqueued, so a receiver sees one id per queued
+  message and can deduplicate the worker's retries and duplicates on it
+  (`queued-webhook-retries-reuse-the-delivery-id`). That is one id per event
+  and subscription in the normal case, not always: an enqueue the core retried
+  after an ambiguous failure is a second message with a second id (next
+  bullet). `X-Correlation-Id` is
   carried across the queue and set on the POST, as the in-process client does.
 - **At-least-once, with a 24-hour idempotency window.** The worker claims each
   delivery in a ledger item in the table (`docs/spec/data-model.md` §1.9) before
   it POSTs, so two copies of one SQS message make one request, and a delivery
-  already acknowledged is never re-sent within 24 hours of its last attempt. A
-  worker that stops after the receiver answered and before the ledger recorded
-  it is retried: the receiver can see a duplicate, which the reference's
-  at-most-once delivery never produces (`queued-webhooks-are-delivered-at-least-once`).
+  already acknowledged is never re-sent within 24 hours of its last attempt.
+  The receiver can still see one event twice, which the reference's
+  at-most-once delivery never produces (`queued-webhooks-are-delivered-at-least-once`),
+  in two ways. A worker that stops after the receiver answered and before the
+  ledger recorded it is retried: the same request, same `X-Webhook-Delivery`,
+  twice. And an enqueue that fails ambiguously — the two-second deadline
+  expires after SQS has already stored the message — is enqueued again by the
+  core under a fresh id: two deliveries with two ids, which no header joins; a
+  receiver that must be exactly-once needs a key of its own in the payload.
+  The ledger's window is refreshed at every attempt, so it outlives any wait
+  the schedule sets; a message left waiting more than a day behind a backlog
+  can outlive it, and then gets its attempts again and may be delivered twice.
 - **The dead-letter queue.** When a subscription's attempts are spent, the
   message goes to the dead-letter queue (the stack output
-  `WebhookDeadLetterQueueUrl`), kept fourteen days, with a `DeadLetterReason`
-  attribute — `exhausted` (every attempt refused; `LastStatus` is the
-  receiver's last answer, absent after a timeout or a connection failure),
-  `receive-ceiling` (the row wants more attempts than the queue's
-  `maxReceiveCount`, template parameter `WebhookQueueMaxReceiveCount`, default
-  12), or `malformed` (a message the worker could not schedule). A message
-  with no reason was redriven by SQS after the worker crashed on it
-  `maxReceiveCount` times. One alarm watches the queue's depth; nothing
+  `WebhookDeadLetterQueueUrl`), kept fourteen days from the hand-off, with a
+  `DeadLetterReason` attribute:
+
+  | reason | what happened |
+  |---|---|
+  | `exhausted` | every attempt refused; `LastStatus` is the receiver's last answer, absent after a timeout or a connection failure |
+  | `receive-ceiling` | a refused attempt, with attempts left, on the queue's last receive: the queue's `maxReceiveCount` (template parameter `WebhookQueueMaxReceiveCount`, default 12) ran out first. Every receive counts, including the two below, so a row can meet it with fewer attempts than it asked for |
+  | `busy-at-ceiling` | a duplicate copy, bounced off another invocation's live claim, on its last receive; the other copy carries on, and the ledger says whether it delivered |
+  | `ledger-unavailable` | the ledger could not be reached on the last receive, so no request was made |
+  | `expiring` | a failing message whose next attempt would come within twelve hours of `WebhookQueue`'s fourteen-day retention, after which SQS deletes it without a redrive |
+  | `abandoned-earlier` | a copy received after the delivery was already given up; the first copy carries the real reason, if its hand-off succeeded |
+  | `malformed` | a message the worker could not schedule |
+
+  A message with **no** reason was redriven by SQS itself: the worker did not
+  finish its last receive (it crashed or timed out, or its own hand-off to the
+  DLQ failed). Such a message keeps its original enqueue time, so the DLQ keeps
+  it fourteen days *less* its time on the webhook queue. **A message that is
+  never received within the webhook queue's fourteen days is lost without a
+  trace** — a backlog deeper than the worker drains in that time, or a worker
+  that cannot start: SQS deletes it and redrives nothing, and no alarm watches
+  the queue's age (it would be the eleventh alarm metric, past the free ten;
+  `docs/cost-model.md` §3.3). One alarm watches the DLQ's depth; nothing
   redelivers from it automatically — replaying a message is sending its body
   and attributes back to the webhook queue, and it will then carry the same
   delivery id, which the ledger has already recorded as abandoned, so a replay
   within 24 hours of the last attempt goes straight back to the dead-letter
   queue without a request; delete its `IDEM#webhook#<deliveryId>` item first to
   replay sooner.
-- **Size.** An SQS message is at most 256 KiB, and base64 makes the envelope
-  budget about 190 KiB. An event whose envelope is larger cannot be queued; the
-  refusal reaches the log as a `tools fan-out` warning.
+- **Size.** An SQS message is at most 256 KiB, body and attributes together,
+  and base64 makes the envelope budget about 190 KiB. An event whose envelope
+  is larger cannot be queued; the refusal reaches the log as a `tools fan-out`
+  warning, and the response is released at once rather than after the flush
+  bound. What a caller can still cost: nothing caps a `POST <tools>/track`
+  body before it reaches the fan-out, so under `tools.auth: none` anyone, and
+  under `session` any self-registered user (§17.6), can send an event of up to
+  ~190 KiB that a subscription matches and have it queued — three billed SQS
+  requests per `SendMessage`, receive and dead-letter hand-off (SQS bills per
+  64 KB), and the full retry schedule if the receiver refuses it
+  (`docs/cost-model.md` §3.3). Over the budget, the request costs one
+  serialisation and no enqueue.
+- **What a queued message holds, and for how long.** The whole signed
+  request: the receiver URL — where a Slack- or Zapier-style endpoint keeps its
+  capability token — the headers, and the body, which is every `identity.*`
+  payload with its email addresses (including what was typed into a failed
+  login), IP, user agent and session id. Never the subscription's secret. It
+  lives on the webhook queue until it is delivered or dead-lettered (at most
+  fourteen days) and on the DLQ fourteen days more, encrypted at rest (SSE-SQS)
+  and readable by any principal in the account with `sqs:ReceiveMessage` on
+  the queue. A retention policy for personal data has to count both queues.
 
 The stack side is `EnableWebhookQueue` in the SAM template, with
 `EnableTools`; off, none of it exists and nothing of it is billed
