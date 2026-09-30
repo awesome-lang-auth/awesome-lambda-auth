@@ -1,6 +1,6 @@
 # Demo Flutter
 
-Consuma **`awesome_node_auth_flutter` da pub.dev, non modificato**, contro uno stack `awesome-lambda-auth` vivo. Si costruisce in due forme, e la coppia è il punto:
+Consuma **[`awesome_flutter_auth`](https://pub.dev/packages/awesome_flutter_auth) da pub.dev, non modificato**, contro uno stack `awesome-lambda-auth` vivo. Si costruisce in due forme, e la coppia è il punto:
 
 | | trasporto | prefisso |
 |---|---|---|
@@ -42,12 +42,11 @@ Il workflow resta il percorso di build riproducibile e versionato; il file servi
 
 `main/AndroidManifest.xml` dichiara `android.permission.INTERNET` a mano. Il template di Flutter lo mette solo nei manifest di debug e profile: un APK di release generato così com'è **non raggiungerebbe la rete**, e ogni chiamata di auth fallirebbe senza che sia ovvio il perché.
 
-## Due difetti del client che questo demo ha fatto emergere
+## Due difetti del client, chiusi in 1.10.1
 
-Entrambi sono della stessa famiglia del campo `sub` mancante chiuso da [awesome-go-auth#46](https://github.com/nik2208/awesome-go-auth/pull/46): **un cast non-nullable su un campo che non arriva non degrada un client, lo termina.** Il demo li intercetta e li mostra, invece di morire.
+Costruendo questo demo sono emersi due difetti del client, della stessa famiglia del campo `sub` mancante chiuso da [awesome-go-auth#46](https://github.com/awesome-lang-auth/awesome-go-auth/pull/46): un cast non-nullable su un campo che non arriva non degrada un client, lo termina.
 
-1. **[awesome-node-auth-flutter#21](https://github.com/nik2208/awesome-node-auth-flutter/issues/21)** — `getActiveSessions()` lancia. `SessionInfo.fromJson` legge `json['handle'] as String`, ma il contratto manda `sessionHandle` (`docs/spec/wire-contract.md:236`).
+- [awesome-flutter-auth#21](https://github.com/awesome-lang-auth/awesome-flutter-auth/issues/21) — `SessionInfo.fromJson` leggeva `handle` invece di `sessionHandle`, e `getActiveSessions()` lanciava.
+- [awesome-flutter-auth#22](https://github.com/awesome-lang-auth/awesome-flutter-auth/issues/22) — `TotpSetupData.fromJson` pretendeva `qrCode`, che questo port non manda (deviazione registrata), e `setup2fa()` lanciava.
 
-2. **[awesome-node-auth-flutter#22](https://github.com/nik2208/awesome-node-auth-flutter/issues/22)** — `setup2fa()` lancia. `TotpSetupData.fromJson` fa `json['qrCode'] as String`, e questo port non manda `qrCode` (deviazione registrata). Il commento upstream dice «un client disegna da sé `otpauthUrl`», ma questo client non ci arriva: muore prima, e `TotpSetupData` non espone comunque `otpauthUrl`.
-
-Quando saranno chiusi, i `try` in [`home_screen.dart`](lib/screens/home_screen.dart) vanno tolti — restano solo finché servono a rendere visibile il difetto.
+Entrambi sono chiusi in `awesome_flutter_auth` 1.10.1: `qrCode` è nullable e il modello espone `otpauthUrl`. Il demo non li aggira più; l'iscrizione TOTP mostra il segreto e l'URI `otpauth://` da inserire a mano, e [`test/client_defects_test.dart`](test/client_defects_test.dart) fissa il comportamento corretto.
