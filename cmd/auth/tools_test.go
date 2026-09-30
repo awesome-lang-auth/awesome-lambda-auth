@@ -881,6 +881,34 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
 			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
 		},
+		{
+			// The admin block's two knobs over reference constants, reported
+			// only when they differ from the value the core applies
+			// (admin.go, adminKnobGaps).
+			name: "the admin block's two knobs that reach constants in the core",
+			env: with(baseEnv(),
+				"AWESOME_AUTH_ADMIN_ENABLED", "true",
+				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+				"AWESOME_AUTH_ADMIN_SESSION_TTL", "8h",
+				"AWESOME_AUTH_ADMIN_UPLOAD_MAX_FILE_SIZE_MB", "10"),
+			want: []string{"admin.sessionTtl", "admin.upload.maxFileSizeMb", "security.jwt.refreshTokenSecret"},
+		},
+		{
+			// ui.uploadDir in the filesystem spelling: a family document
+			// loads, and this runtime says it names nothing durable.
+			name: "an upload directory in the filesystem spelling",
+			env:  with(baseEnv(), "AWESOME_AUTH_UI_UPLOAD_DIR", "/var/uploads"),
+			want: []string{"security.jwt.refreshTokenSecret", "ui.uploadDir"},
+		},
+		{
+			// Both blocks at once: the list is one list, sorted by path.
+			name: "the tools block beside an admin console with an overridden session lifetime",
+			env: toolsEnv(
+				"AWESOME_AUTH_ADMIN_ENABLED", "true",
+				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+				"AWESOME_AUTH_ADMIN_SESSION_TTL", "8h"),
+			want: []string{"admin.sessionTtl", "security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

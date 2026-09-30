@@ -640,10 +640,14 @@ func TestTemplateStoreRefusesADriverWithoutOne(t *testing.T) {
 // TEMPLATES partition and the memory driver hangs the core's MemoryTemplateStore
 // off the user store, so email.templatesDir is deployable on either. The
 // refusal mechanism still has to work, because the claim and the store can
-// drift apart again — so the second half enables a store no driver backs and
-// requires the early, named refusal. Early matters: without it the cold start
-// would get as far as building the real stores and then fail inside
-// emailOptions with a structural assertion that reads like an internal error.
+// drift apart again — so the second half used to enable a store no driver
+// backed and require the early, named refusal (rbac, then telemetry, each
+// until a block made it a real switch). Every flag the schema knows is handed
+// over now, so the second half pins the other side of the same claim: both
+// drivers back the same set, and a driver this build does not implement is
+// refused early and by name. Early matters: without it the cold start would
+// get as far as building the real stores and then fail inside emailOptions
+// with a structural assertion that reads like an internal error.
 func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
 	t.Parallel()
 
@@ -656,14 +660,28 @@ func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
 		}
 	}
 
-	// Telemetry was the last counter-example: the tools block (D9a) handed it over,
-	// so it is now accepted on both drivers too.
-	for _, driver := range []string{config.StoreDriverDynamoDB, config.StoreDriverMemory} {
-		cfg := config.Defaults()
-		cfg.Stores.Driver = driver
-		cfg.Stores.Enable.Telemetry = true
-		if err := checkStoreSupport(cfg); err != nil {
-			t.Errorf("%s backs a telemetry store and was refused one: %v", driver, err)
+	ddb, _ := driverStores(config.StoreDriverDynamoDB)
+	mem, _ := driverStores(config.StoreDriverMemory)
+	for name := range ddb {
+		if !mem[name] {
+			t.Errorf("stores.enable.%s is backed on dynamodb and not on memory; the development driver must back what the production one backs", name)
+		}
+	}
+	for name := range mem {
+		if !ddb[name] {
+			t.Errorf("stores.enable.%s is backed on memory and not on dynamodb", name)
+		}
+	}
+
+	cfg := config.Defaults()
+	cfg.Stores.Driver = "postgres"
+	err := checkStoreSupport(cfg)
+	if err == nil {
+		t.Fatal("a driver this build does not implement was accepted")
+	}
+	for _, want := range []string{"stores.driver", "postgres"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to name %q", err, want)
 		}
 	}
 }
