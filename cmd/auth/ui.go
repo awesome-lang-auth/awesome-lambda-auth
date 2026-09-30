@@ -87,9 +87,10 @@ import (
 // carry here. auth.AuthSettings.UI is the branding the document overrides with,
 // and this product seeds none of it: `runtimeSettings` has no `ui` member, and
 // declaredRuntimeSettings (settings.go) covers require2fa,
-// enabledWebhookActions and lazyEmailVerificationGracePeriodDays. So until the
-// admin surface can write it (D8, upstream U15), `settings.UI` is nil on every
-// read and uiBranding falls straight through to `ui.branding.*`. The seed and
+// enabledWebhookActions and lazyEmailVerificationGracePeriodDays. So until an
+// administrator writes a `ui` block through the console's settings routes
+// (upstream U15 for what the reference keeps there), `settings.UI` is nil on
+// every read and uiBranding falls straight through to `ui.branding.*`. The seed and
 // the reader do not overlap at all, which is why turning the UI on changes
 // nothing about what D3's seeding rule does — only about how often the store it
 // seeds is read.

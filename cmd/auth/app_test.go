@@ -691,8 +691,8 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// The slots that contribute no option. Filling one means deleting its name
 	// from here in the same commit.
 	//
-	// **Two of these three are empty on purpose and one is still waiting**, and
-	// the list cannot tell them apart, so this comment has to.
+	// **Both of these are empty on purpose**, and nothing is waiting any more;
+	// the list cannot say so itself, so this comment has to.
 	//
 	// `docs` and `ui` are the deliberate ones. Both blocks are wired, and both
 	// reach the core entirely through HTTPConfig — DocsOptions for the two

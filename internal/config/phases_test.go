@@ -43,9 +43,10 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 // when `ui` was wired, and to the admin block when `tools` was. The domain is
 // incidental — what is under test is that the environment layer is compared
 // like the document layer — but a test naming a wired domain would assert
-// nothing at all, so each move is the point rather than a rename. When D8
-// wires `admin` there is no gated domain left to say it with, and this test
-// retires with the mechanism it exercises.
+// nothing at all, so each move is the point rather than a rename. D8 wired
+// `admin`, so there is no gated domain left to say it with: the test skips
+// while unwiredDomains() is empty and speaks again, with a new domain, the day
+// one is gated.
 func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 	if len(unwiredDomains()) == 0 {
 		t.Skip("every domain is wired; this test retires with the phase gate")
@@ -63,8 +64,9 @@ func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 //
 // The SSE distributor's password stands in for what used to be the admin
 // bootstrap secret here, which stood in for idProvider.privateKey before it:
-// both of those domains are wired now, and this test needs a domain that still
-// has a secretPrefix. `tools` is the last one, and its only secret is this one.
+// both of those domains are wired now, and this test needs a gated domain that
+// has a secretPrefix. `tools` was the last one, and its only secret is this
+// one; D9a wired it, so the test skips while unwiredDomains() is empty.
 // TestAdminIsWired holds the other side — the bootstrap secret through the same
 // kind of variable loads, because it is read.
 func TestUnwiredDomainViaSecretIsAlsoRefused(t *testing.T) {
@@ -560,17 +562,15 @@ func TestToolsIsWired(t *testing.T) {
 // still waiting, by name, so a domain cannot linger on it unnoticed after its
 // block lands and none can be added to it silently.
 //
-// Today the set is {admin}. The roadmap's definition of done is that the list
-// is empty, with a test that says so; that assertion is this one with an empty
-// want, and the parent flips it — the `want` line below — when D8 merges. The
-// shape is chosen so that the test passes on this branch with `admin` present
-// and on D8's branch with `tools` present, whichever merges second: each block
-// asserts only that its own domain is gone and that everything remaining is
-// one of a named set.
+// Today the set is empty: `tools` left it with D9a and `admin` with D8, the
+// last two, and this is the empty-set assertion the roadmap's definition of
+// done asks for. The shape is kept from the days the set had members — a block
+// that gates a new domain names it in `want`, everything else is refused here,
+// and an empty `want` demands an empty list — so the test reads the same way
+// when the set grows again and shrinks back.
 func TestUnwiredDomainsIsPinned(t *testing.T) {
-	// The domains a block other than this one is still entitled to leave here.
-	// When this reads []string{}, the mechanism has done its job and
-	// unwiredDomains returns nil.
+	// The domains a pending block is entitled to leave here. Empty: every
+	// domain the schema defines is wired, and unwiredDomains returns nil.
 	want := []string{}
 
 	got := sortedDomainPaths()
