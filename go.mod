@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.3
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.66.6
 	github.com/aws/aws-sdk-go-v2/service/sns v1.42.6
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.3
 	github.com/aws/smithy-go v1.28.1
 	github.com/nik2208/awesome-go-auth v0.11.0
