@@ -827,14 +827,11 @@ func (l *SseLog) pollOnce(ctx context.Context, st *sseFollowState, limit int, lo
 	for i, topic := range st.topics {
 		lower := st.high[topic]
 		if lookBack {
-			lower = lookBackFrom(st.high[topic], st.base[topic], l.opts.Settle)
-			// And by count: at most a page of events behind the mark is
-			// read again, so a busy topic's look-back is its last Page
-			// events rather than three seconds of them — the re-read no
-			// longer grows with the event rate.
-			if r := st.recent[topic]; len(r) >= keep && bytes.Compare(r[0][:], lower[:]) > 0 {
-				lower = r[0]
-			}
+			// Settle behind the mark and, by count, at most a page of
+			// events behind it, so a busy topic's look-back is its last
+			// Page events rather than three seconds of them — the re-read
+			// no longer grows with the event rate.
+			lower = st.lookBackBound(topic, l.opts.Settle, keep)
 		}
 		if i == 0 || bytes.Compare(lower[:], lowest[:]) < 0 {
 			lowest = lower
@@ -905,13 +902,36 @@ func (l *SseLog) pollOnce(ctx context.Context, st *sseFollowState, limit int, lo
 	}
 
 	// The delivered set only has to remember what a look-back can still
-	// return; anything below the lowest lower bound is behind every cursor.
+	// return. The bound is the one the next paced poll will read from — not
+	// this poll's own, which on a catch-up is the high-water mark itself and
+	// would forget events the next look-back reads again and re-delivers.
+	// Marks only move up and so does a topic's oldest remembered event, so
+	// nothing at or below the lowest of these bounds is read again.
+	trim := st.lookBackBound(st.topics[0], l.opts.Settle, keep)
+	for _, topic := range st.topics[1:] {
+		if b := st.lookBackBound(topic, l.opts.Settle, keep); bytes.Compare(b[:], trim[:]) < 0 {
+			trim = b
+		}
+	}
+	if bytes.Compare(lowest[:], trim[:]) < 0 {
+		trim = lowest
+	}
 	for k := range st.seen {
-		if bytes.Compare(k.id[:], lowest[:]) <= 0 {
+		if bytes.Compare(k.id[:], trim[:]) <= 0 {
 			delete(st.seen, k)
 		}
 	}
 	return delivered, last, more, nil
+}
+
+// lookBackBound is where a paced poll of topic starts reading: Settle behind
+// its mark, no lower than its base, and no more than keep-1 events behind it.
+func (st *sseFollowState) lookBackBound(topic string, settle time.Duration, keep int) ulid {
+	lower := lookBackFrom(st.high[topic], st.base[topic], settle)
+	if r := st.recent[topic]; len(r) >= keep && bytes.Compare(r[0][:], lower[:]) > 0 {
+		lower = r[0]
+	}
+	return lower
 }
 
 // lookBackFrom is the lower bound of a topic's next Query: Settle behind its

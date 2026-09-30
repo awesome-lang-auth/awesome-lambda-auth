@@ -486,12 +486,16 @@ func TestSseLookBackIsBoundedByCount(t *testing.T) {
 		publish(t, l, "global", auth.StreamEvent{ID: "q" + strconv.Itoa(i), Type: strconv.Itoa(i)})
 	}
 	st := newSseFollowState([]string{"global"}, floor, true)
-	fn := func(string, auth.StreamEvent) {}
+	delivered := 0
+	fn := func(string, auth.StreamEvent) { delivered++ }
 	for more, lookBack := true, true; more; lookBack = !more {
 		var err error
 		if _, _, more, err = l.pollOnce(context.Background(), st, page, lookBack, fn); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if delivered != 40 {
+		t.Fatalf("the catch-up delivered %d events, want 40", delivered)
 	}
 	counter.reset()
 	if _, _, _, err := l.pollOnce(context.Background(), st, page, true, fn); err != nil {
@@ -499,6 +503,9 @@ func TestSseLookBackIsBoundedByCount(t *testing.T) {
 	}
 	if n := counter.reset(); n > page {
 		t.Errorf("a paced poll over a caught-up topic read %d items back; the look-back is bounded at %d", n, page)
+	}
+	if delivered != 40 {
+		t.Errorf("the paced poll after a catch-up re-delivered %d events it had forgotten", delivered-40)
 	}
 }
 
@@ -676,8 +683,11 @@ func TestSseFollowPagesThroughABacklog(t *testing.T) {
 	for i := 0; i < n; i++ {
 		publish(t, l, "tenant:t1", auth.StreamEvent{ID: "b" + strconv.Itoa(i), Type: strconv.Itoa(i)})
 	}
-	stop := follow(t, l, SseFollow{Topics: []string{"tenant:t1"}, Floor: floor})
+	stop := follow(t, l, SseFollow{Topics: []string{"tenant:t1"}, Floor: floor, Deduplicate: true})
 	got := c.await(t, n)
+	// Let paced polls run after the catch-up: their look-back re-reads the
+	// last page, and what the catch-up delivered must still be remembered.
+	time.Sleep(50 * time.Millisecond)
 	_ = stop()
 	for i, ev := range got {
 		if ev.Type != strconv.Itoa(i) {
