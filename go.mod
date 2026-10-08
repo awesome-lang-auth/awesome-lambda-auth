@@ -18,7 +18,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.3
 	github.com/aws/smithy-go v1.28.1
 	github.com/dop251/goja v0.0.0-20260926152631-39ec2650adc9
-	github.com/nik2208/awesome-go-auth v0.11.0
+	github.com/nik2208/awesome-go-auth v0.12.0
 	golang.org/x/crypto v0.51.0
 )
 
