@@ -613,9 +613,17 @@ release:
 
 It is idempotent, resumable (`--start-key`, printed on interruption) and safe
 while the table is serving: every write is a conditional `UpdateItem` on the
-two index attributes. It is an operator command rather than something the
-function does because it is a `Scan`, which the execution role deliberately
-does not grant. `--dry-run` reports what it would index and writes nothing.
+two index attributes, or a transaction writing the by-id pointer. It is an
+operator command rather than something the function does because it is a
+`Scan`, which the execution role deliberately does not grant. `--dry-run`
+reports what it would index and point and writes nothing.
+
+**And again after upgrading a table from before the `v0.12.0` pin**, once the
+new release serves every request: the console's user detail reads a by-id
+pointer that older accounts lack, and until the sweep gives them one it finds
+only accounts under the empty tenant. An id the sweep finds under two tenants
+is printed as a `CONFLICT` and needs an operator; `docs/config-reference.md`
+§16.6 says how to resolve one.
 
 **What the console's session is.** Logging in at `/admin/login` sets a
 24-hour cookie under the same name as the auth access token, signed with
