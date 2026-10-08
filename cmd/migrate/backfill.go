@@ -240,7 +240,9 @@ func reportBackfill(stdout, stderr *os.File, t backfillTally, resumeKey string) 
 		}
 		fmt.Fprintf(stderr, "Decide which account keeps each id, delete the other, delete the item\n"+
 			"PK=UID#<id> SK=UID, and run this command again: it points the id at the survivor.\n"+
-			"See docs/config-reference.md §16.6.\n")
+			"The console's DELETE reaches only an account under the empty tenant; one under\n"+
+			"another tenant is deleted with DELETE <prefix>/account and that account's token,\n"+
+			"or by hand. See docs/config-reference.md §16.6.\n")
 	}
 	if resumeKey != "" {
 		fmt.Fprintf(stderr, "\nresume with: --start-key %s\n"+

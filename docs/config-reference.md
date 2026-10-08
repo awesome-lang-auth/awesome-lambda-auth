@@ -1862,8 +1862,11 @@ no row under `""` and answer `500 {"error":"Internal server error"}`. `GET
 <admin>/api/users/{id}/roles` reads the empty tenant too, on purpose: there the
 tenant is the scope of a role *assignment*, and the console assigns in the empty
 scope. And an id the store holds under two tenants — possible only on a table
-written before the pin — is a `404` rather than either account, until an
-operator resolves it (§16.6).
+written before the pin — is a `404` rather than either account once `migrate
+backfill-users` has found and marked it, until an operator resolves it
+(§16.6). Before that sweep the store cannot see the second record without a
+`Scan`, so the route can show either one: the empty tenant's, as `v0.11.0`
+did, or the one a registration after the pin pointed.
 
 ### 16.5 Uploads: `ui.uploadDir` as an S3 location, and what a logo costs
 
@@ -1943,10 +1946,12 @@ refuses it, §16.1.) D6 declared the debt; this block ships the job that pays it
 
 One page per iteration, resumable from the key an interrupted run prints
 (`--start-key`), idempotent — a swept table matches nothing and writes nothing —
-and safe while the table is serving, because every write is a conditional
-`UpdateItem` naming the two index attributes and guarded by
-`attribute_exists(PK) AND attribute_not_exists(GSI1PK)`: a profile registered or
-deleted mid-sweep is skipped, never overwritten and never resurrected. It is an
+and safe while the table is serving, because every write it makes is
+conditional. The index half's is an `UpdateItem` naming the two index
+attributes and guarded by `attribute_exists(PK) AND
+attribute_not_exists(GSI1PK)`: a profile registered or deleted mid-sweep is
+skipped, never overwritten and never resurrected. The pointer half's are
+transactions with arguments of their own, below. It is an
 operator command and not something the function does because it is a `Scan`,
 which the execution role deliberately does not grant. **Run it once against a
 table that predates D6 before turning `admin.enabled` on there**; the cold-start
@@ -1964,8 +1969,9 @@ same pass, each one in one transaction with a stamp on the profile
 (`uidPointer`) that is what makes a swept table match nothing, guarded by the
 profile still existing and by the id still being free: a profile deleted
 mid-sweep gets no pointer, and a pointer written meanwhile is read again rather
-than overwritten. It reads one small item per unpointed profile (0.5 RRU) and
-writes two units for each, once.
+than overwritten. It reads one small item per unpointed profile, strongly
+consistent (1 RRU), and writes a two-item transaction for each (4 WCU), once:
+about USD 0.53 per hundred thousand users (`docs/cost-model.md`).
 
 **Upgrading a table written before the `v0.12.0` pin:** deploy the release,
 wait until no instance of the previous one is serving — a profile the old code
@@ -1973,6 +1979,22 @@ registers mid-rollout gets no pointer — and run the command above once more
 against the table. A dry run lists what it would point (`would point <id>`).
 Nothing else changes for a single-tenant deployment, and nothing breaks if the
 sweep is never run there: the empty tenant is where its users already are.
+
+**What an older binary does to a pointed table**, during the rollout or at any
+time after rolling back to a release from before the pin: its `DeleteUser`
+removes the profile and not the pointer, which leaves a `UID#<id>` item naming
+nothing — the detail route rightly answers `404` for it, but the id is refused
+to every other tenant and the sweep, which scans profiles, never sees it; and
+its `CreateUser` does not read the pointer, so it can register an id a pointer
+already gives another tenant, which the detail route then resolves to the
+pointed record until the next sweep marks the pair. Both matter only to a
+host- or import-supplied id — the core mints 128 random bits, so a fresh
+registration never repeats one — and neither heals itself. Keep the rollout
+short, prefer rolling forward to rolling back, and after any window in which
+an older binary served, run the sweep again and, if ids are ever supplied from
+outside, look for stray pointers: `_t = "userid"` items whose
+`USER#<tenantId>#<userId>` / `PROFILE` is missing, deleted by hand. Nothing in
+this release sweeps for them.
 
 **An id under two tenants is a conflict, and the one outcome that needs you.**
 Nothing refused one id under two tenants before the pin — the core mints random
@@ -1985,6 +2007,21 @@ ATTENTION**. To resolve one: decide which account keeps the id, delete the other
 (deleting it leaves the mark in place, on purpose — the store cannot know the
 survivor is the right one), delete the item `PK=UID#<id>`, `SK=UID` by hand,
 and run the sweep again, which points the id at the survivor.
+
+How to delete the other depends on its tenant, because the console's delete
+passes the empty tenant (§16.4) and the detail route answers `404` for both
+halves while the mark is set. The half under `""` the console's `DELETE
+<admin>/api/users/{id}` removes. A half under any other tenant it cannot reach:
+either the user deletes it with their own session, `DELETE <prefix>/account`
+with that account's access token, which runs the store's whole `DeleteUser`
+under the account's own tenant, or you delete it by hand — every item of the
+partition `USER#<tenant>#<id>` (the `PROFILE` last), the `EMAIL#<tenant>#<email>`
+/ `EMAIL` item, and the membership `TENANT#<tenant>` / `MEMBER#<id>`. A hand
+delete leaves the account's sessions, which cannot refresh once the profile is
+gone and expire, and its OAuth links (`OAUTH#<provider>#<providerId>` and
+`LINKID#<linkId>`), which do not expire and keep that provider identity from
+signing up again until they are deleted too; the account route has none of
+these leftovers, which is why it is the better of the two.
 
 ### 16.7 The promote route's own limiter, and the login's
 

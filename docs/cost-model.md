@@ -225,10 +225,16 @@ The one-off `migrate backfill-users` sweep is a `Scan` of the whole table —
 of a million items of ~1 KB is about USD 0.03 of reads; a hundred thousand
 pre-D6 users about USD 0.25 of writes. It runs once per debt: on a table from
 before the `v0.12.0` pin the same pass also gives each unpointed profile its
-by-id pointer — one 0.5 RRU read and a 2 WCU transaction (pointer plus profile
-stamp) per user, about USD 0.30 for a hundred thousand of them. Every
-registration since pays that pointer inside its own transaction: 1 WCU more
-than before.
+by-id pointer — one strongly consistent read (1 RRU) and a two-item
+transaction (pointer plus profile stamp, 2 × 2 = 4 WCU) per user, about
+USD 0.53 for a hundred thousand of them (100 000 × (4 × 1.25 + 1 × 0.25) / 1 000 000);
+a conflict's mark is a three-item transaction, 6 WCU, and there are as many of
+those as there are duplicated ids. Every registration since pays that pointer
+inside its own transaction, as a fourth item: 2 WCU more than before. And
+every `DeleteUser` pays for it too: one strongly consistent read of the pointer
+(1 RRU), and the profile leaves the batch (1 WCU) for a two-item transaction
+with the pointer (4 WCU) — 1 RRU and 3 WCU more per deleted account than before
+the pin.
 
 ### 2.8 The tools block — one telemetry write per identity event, and a webhook that races the freeze
 
