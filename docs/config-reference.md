@@ -1836,27 +1836,34 @@ on both — with the memory driver's usual caveat that every store is per
 execution environment, so a role assigned through one cold start is unknown to
 the next. RS-12 already refuses that driver in production.
 
-**One route of the users tab is single-tenant, and that is the pinned core's, not
-a decision made here.** `GET <admin>/api/users` lists every user in every tenant,
-because `AdminUserStore.ListUsers` reads `""` as a wildcard; the detail route
-beside it, `GET <admin>/api/users/{id}`, asks `GetUserByID(id, "")`, where `""` is
-the literal single tenant (`admin_read.go` `adminGetUser` at `v0.11.0`, whose
-comment says as much). On a table whose users all live in the empty tenant —
-every account this binary registers, since it never turns the store's
-multi-tenant mode on — the two agree. On a table that holds users under a
-tenant, which `migrate cognito --tenant` can produce, the listing links to rows
-whose detail answers `404 User not found`. The reference's `findById(id)` carries
-no tenant at all (`admin.router.ts:789-800`), so a by-id lookup that spans
-tenants is what closing it takes, and that is a store seam the core has to grow:
-the fix is written upstream (`UserLookupStore`) and **not tagged**, so this build
-stays on `v0.11.0` and serves what `v0.11.0` serves. Nothing here works around
-it — a product-side route would be a route under the admin path, and this binary
-adds none (§12.3 says why) — and the DynamoDB store's half, an item keyed on the
-id alone, lands with the pin that can call it. It is registered as
-`admin-user-detail-is-single-tenant`, because the product register's scope
-includes a divergence a core route causes that this product cannot fix without
-forking the core; `TestAdminUserDetailIsSingleTenant` fails the day the pin
-moves to a core whose detail route spans tenants.
+**The detail route spans tenants as the listing does — on DynamoDB, once the
+table is swept.** `GET <admin>/api/users` lists every user in every tenant,
+because `AdminUserStore.ListUsers` reads `""` as a wildcard. Since the `v0.12.0`
+pin the detail route beside it, `GET <admin>/api/users/{id}`, resolves the id
+through `auth.UserLookupStore` — by id alone, across every tenant, which is the
+reference's `findById(id)` (`admin.router.ts:789-800`) — and both drivers
+implement it: the memory driver through the core's `MemoryUserStore`, the
+DynamoDB store through a by-id pointer item that every registration writes
+(`internal/store/dynamodb/user_lookup.go`, data-model §1.1 #3b). On a table
+written before that pin, a profile has no pointer until `migrate
+backfill-users` gives it one (§16.6); until then the route finds the users
+under the empty tenant — every account this binary registers, since it never
+turns the store's multi-tenant mode on — and answers `404 User not found` for a
+user `migrate cognito --tenant` imported under another, which is what it did
+before. The product register's `admin-user-detail-is-single-tenant` is retired
+(`docs/deviations.md` §1.1).
+
+What the core still does with the empty tenant is the core's, recorded upstream
+as `admin-user-detail-spans-tenants-only-through-a-lookup-store`, and no store
+closes it: `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
+with `{"method":"flag"}` both pass `""` whatever the store implements, so on a
+table with users under a tenant neither reaches them: on this store both find
+no row under `""` and answer `500 {"error":"Internal server error"}`. `GET
+<admin>/api/users/{id}/roles` reads the empty tenant too, on purpose: there the
+tenant is the scope of a role *assignment*, and the console assigns in the empty
+scope. And an id the store holds under two tenants — possible only on a table
+written before the pin — is a `404` rather than either account, until an
+operator resolves it (§16.6).
 
 ### 16.5 Uploads: `ui.uploadDir` as an S3 location, and what a logo costs
 
@@ -1945,6 +1952,39 @@ which the execution role deliberately does not grant. **Run it once against a
 table that predates D6 before turning `admin.enabled` on there**; the cold-start
 log says so whenever the console mounts on the DynamoDB driver, because it is
 the only place this deployment can.
+
+**The same sweep pays the `v0.12.0` debt: the by-id pointer.** The detail route
+reads `auth.UserLookupStore`, which this store serves from an item keyed on the
+user id alone, `UID#<id>`, naming the tenant the profile lives under (§16.4).
+Every registration since the pin writes it in the profile's own transaction; a
+profile written before has none, so on an older table the detail route finds
+only the empty tenant's users — what it did before the pin, and every user on a
+table this binary filled itself. The sweep writes the missing pointers in the
+same pass, each one in one transaction with a stamp on the profile
+(`uidPointer`) that is what makes a swept table match nothing, guarded by the
+profile still existing and by the id still being free: a profile deleted
+mid-sweep gets no pointer, and a pointer written meanwhile is read again rather
+than overwritten. It reads one small item per unpointed profile (0.5 RRU) and
+writes two units for each, once.
+
+**Upgrading a table written before the `v0.12.0` pin:** deploy the release,
+wait until no instance of the previous one is serving — a profile the old code
+registers mid-rollout gets no pointer — and run the command above once more
+against the table. A dry run lists what it would point (`would point <id>`).
+Nothing else changes for a single-tenant deployment, and nothing breaks if the
+sweep is never run there: the empty tenant is where its users already are.
+
+**An id under two tenants is a conflict, and the one outcome that needs you.**
+Nothing refused one id under two tenants before the pin — the core mints random
+128-bit ids, so it takes a host- or import-supplied id to produce one — and the
+interface forbids answering either record. So the sweep does not overwrite a
+pointer that names another tenant: it marks it ambiguous, the detail route
+answers `404` for that id, registering it again is refused, and every later run
+lists both halves on stderr as `CONFLICT user id <id>: …` under **NEED
+ATTENTION**. To resolve one: decide which account keeps the id, delete the other
+(deleting it leaves the mark in place, on purpose — the store cannot know the
+survivor is the right one), delete the item `PK=UID#<id>`, `SK=UID` by hand,
+and run the sweep again, which points the id at the survivor.
 
 ### 16.7 The promote route's own limiter, and the login's
 

@@ -223,7 +223,12 @@ The one-off `migrate backfill-users` sweep is a `Scan` of the whole table —
 0.5 RRU per 4 KB scanned, every item type included, not only profiles — plus
 1 WCU for the profile and 1 for its new GSI1 entry per user it fixes. A table
 of a million items of ~1 KB is about USD 0.03 of reads; a hundred thousand
-pre-D6 users about USD 0.25 of writes. It runs once.
+pre-D6 users about USD 0.25 of writes. It runs once per debt: on a table from
+before the `v0.12.0` pin the same pass also gives each unpointed profile its
+by-id pointer — one 0.5 RRU read and a 2 WCU transaction (pointer plus profile
+stamp) per user, about USD 0.30 for a hundred thousand of them. Every
+registration since pays that pointer inside its own transaction: 1 WCU more
+than before.
 
 ### 2.8 The tools block — one telemetry write per identity event, and a webhook that races the freeze
 
