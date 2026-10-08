@@ -188,7 +188,12 @@ func profileItem(u auth.User) item {
 		s(attrTOTPSecret, u.TOTPSecret).
 		s(attrPendingEmail, u.PendingEmail).
 		t(attrCreatedAt, u.CreatedAt).
-		t(attrUpdatedAt, u.UpdatedAt)
+		t(attrUpdatedAt, u.UpdatedAt).
+		// The by-id pointer stamp (user_lookup.go). True on every profile this
+		// codec writes, because createUser writes the pointer in the same
+		// transaction; it is how the backfill tells a profile that has one from
+		// a profile written before pointers existed.
+		b(attrUIDPointer, true)
 
 	// Addressed through the families rather than the bare constants, so the codec
 	// and the conditional writes can never disagree about an attribute name.
@@ -346,8 +351,8 @@ var (
 	_ auth.UserAccountStore = (*Store)(nil)
 )
 
-// CreateUser writes the profile, the email-uniqueness item and the tenant
-// membership in one transaction (data-model.md #1).
+// CreateUser writes the profile, the email-uniqueness item, the tenant
+// membership and the by-id pointer in one transaction (data-model.md #1).
 //
 // The uniqueness constraint is the reason this is a transaction and not three
 // writes: a GSI cannot enforce uniqueness and is eventually consistent, so the
@@ -435,18 +440,30 @@ func (s *Store) createUser(ctx context.Context, user auth.User, marker Migration
 			// Unconditional: re-registering the same membership is a no-op, and
 			// a stale membership must not fail a registration.
 			{Put: &types.Put{TableName: aws.String(s.table), Item: memberIt}},
+			// The by-id pointer (user_lookup.go). Its condition is the one thing
+			// in this transaction that looks across tenants: the profile's own
+			// attribute_not_exists covers USER#<t>#<u> and nothing else, so
+			// without it an id another tenant holds would register here too, and
+			// FindUserByID would have two records to choose between.
+			// MemoryUserStore refuses that id at CreateUser as well.
+			{Put: &types.Put{
+				TableName:                 aws.String(s.table),
+				Item:                      uidItem(user.ID, user.TenantID),
+				ConditionExpression:       aws.String(uidClaimCondition),
+				ExpressionAttributeNames:  uidClaimNames(),
+				ExpressionAttributeValues: map[string]types.AttributeValue{":tenant": avS(user.TenantID)},
+			}},
 		},
 	})
 	if err != nil {
 		if reasons, ok := txConditionFailures(err); ok {
-			// Either the id or the address was taken. The reference returns the
-			// same error for both (memory_store.go:39-45), so no distinction is
-			// invented here.
-			if _, failed := txFailedAt(reasons, 0); failed {
-				return auth.User{}, auth.ErrUserExists
-			}
-			if _, failed := txFailedAt(reasons, 1); failed {
-				return auth.User{}, auth.ErrUserExists
+			// The id, the address, or the id under another tenant was taken.
+			// The reference returns the same error for all three
+			// (memory_store.go:39-45), so no distinction is invented here.
+			for _, i := range []int{0, 1, 3} {
+				if _, failed := txFailedAt(reasons, i); failed {
+					return auth.User{}, auth.ErrUserExists
+				}
 			}
 		}
 		return auth.User{}, wrap("create user", err)
@@ -562,8 +579,9 @@ func (s *Store) UpdateProfile(ctx context.Context, userID, tenantID, firstName, 
 	return userFromItem(out.Attributes)
 }
 
-// DeleteUser removes the user's whole item collection plus the two items outside
-// it that this store wrote: the email-uniqueness item and the tenant membership.
+// DeleteUser removes the user's whole item collection plus the items outside it
+// that this store wrote: the email-uniqueness item, the tenant membership and,
+// when it names this tenant, the by-id pointer.
 //
 // Sessions are swept through GSI1, which is eventually consistent — a session
 // created microseconds earlier can be missed. That is acceptable and not papered
@@ -595,7 +613,10 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 	keys := make([]map[string]types.AttributeValue, 0, len(collection)+8)
 	for _, it := range collection {
 		if getS(it, attrSK) == skProfile {
+			// Not into the batch: the profile goes last, in one transaction
+			// with the by-id pointer (deleteProfileAndPointer).
 			profile = it
+			continue
 		}
 		keys = append(keys, key(getS(it, attrPK), getS(it, attrSK)))
 	}
@@ -663,6 +684,13 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 	keys = append(keys, metaKeys...)
 
 	if err := s.deleteKeys(ctx, keys); err != nil {
+		return wrap("delete user", err)
+	}
+	// The profile, and the by-id pointer when it is this record's. After the
+	// batch rather than inside it, because a batch carries no conditions and the
+	// pointer's removal must be conditional on naming this tenant — and last,
+	// so a delete that failed above still finds its profile on retry.
+	if err := s.deleteProfileAndPointer(ctx, userID, tenantID); err != nil {
 		return wrap("delete user", err)
 	}
 	return nil

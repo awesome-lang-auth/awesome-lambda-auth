@@ -29,6 +29,8 @@ func seedPreD6Users(t *testing.T, client *awsddb.Client, table, tenantID string,
 		it := profileItem(u)
 		delete(it, attrGSI1PK)
 		delete(it, attrGSI1SK)
+		// And no by-id pointer stamp: that is younger still (user_lookup.go).
+		delete(it, attrUIDPointer)
 		if _, err := client.PutItem(ctx, &awsddb.PutItemInput{TableName: aws.String(table), Item: it}); err != nil {
 			t.Fatalf("put pre-D6 profile %s: %v", u.ID, err)
 		}
@@ -53,6 +55,11 @@ func sweep(t *testing.T, api BackfillAPI, opts BackfillOptions) (pages int, tota
 		total.Written += page.Written
 		total.Skipped += page.Skipped
 		total.Planned = append(total.Planned, page.Planned...)
+		total.PointerMatched += page.PointerMatched
+		total.PointersWritten += page.PointersWritten
+		total.PointersSkipped += page.PointersSkipped
+		total.PlannedPointers = append(total.PlannedPointers, page.PlannedPointers...)
+		total.Conflicts = append(total.Conflicts, page.Conflicts...)
 		if page.NextKey == "" {
 			return pages, total
 		}
