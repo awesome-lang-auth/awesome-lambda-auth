@@ -12,7 +12,9 @@ import (
 )
 
 // `migrate backfill-users`: the one-time sweep that makes profiles written
-// before the D6 release visible to the admin user directory.
+// before the D6 release visible to the admin user directory, and — since the
+// v0.12.0 pin — gives profiles written before that release the by-id pointer the
+// console's user detail route reads across tenants.
 //
 // It belongs in this command and not in the function for the reason the
 // package comment gives for the Cognito import: it is a bulk operation over the
@@ -33,9 +35,14 @@ import (
 // GSI1 user directory, before admin.enabled is turned on for that deployment.
 // The 'first-user' access policy asks ListUsers for the first registered
 // account, and GET <admin>/api/users pages the same index; on an unswept table
-// both under-report, and neither failure is visible from outside. Running it
-// again later is free of consequence: a swept table matches nothing and writes
-// nothing.
+// both under-report, and neither failure is visible from outside. And once more
+// after a table written before the v0.12.0 pin has been upgraded — after the
+// new release has replaced the old one everywhere, because a profile the old
+// code registers mid-rollout gets no pointer: until then
+// GET <admin>/api/users/{id} finds only users under the empty tenant, which is
+// what it did before. Running it again later is free of consequence: a swept
+// table matches nothing and writes nothing — except that an id found under two
+// tenants is reported on every run until an operator resolves it.
 
 type backfillFlags struct {
 	table     string
@@ -67,10 +74,12 @@ func runBackfillUsers(ctx context.Context, args []string, stdout, stderr *os.Fil
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "migrate backfill-users writes the GSI1 user-directory attributes onto every profile\n"+
 			"that lacks them, so that GET <admin>/api/users sees the accounts created before\n"+
-			"the store gained the directory.\n\n"+
-			"It is idempotent and safe to run while the table is serving: every write is a\n"+
-			"conditional UpdateItem naming the two index attributes and nothing else. Run it\n"+
-			"once per table before turning admin.enabled on.\n\n"+
+			"the store gained the directory, and the by-id pointer onto every profile that\n"+
+			"lacks one, so that GET <admin>/api/users/{id} finds a user under any tenant.\n\n"+
+			"It is idempotent and safe to run while the table is serving: every write is\n"+
+			"conditional. Run it once per table before turning admin.enabled on, and again\n"+
+			"after upgrading a table written before the v0.12.0 pin. An id it finds under\n"+
+			"two tenants is reported as a CONFLICT and needs you.\n\n"+
 			"flags:\n")
 		fs.PrintDefaults()
 	}
@@ -121,6 +130,12 @@ type backfillTally struct {
 	matched   int
 	written   int
 	skipped   int
+
+	// The by-id pointer half (internal/store/dynamodb backfill.go).
+	pointerMatched int
+	pointed        int
+	pointerSkipped int
+	conflicts      []ddbstore.BackfillConflict
 }
 
 // backfillAll pages the table to the end, or to --max-pages, and reports.
@@ -159,6 +174,10 @@ func backfillAll(ctx context.Context, api ddbstore.BackfillAPI, f backfillFlags,
 		t.matched += page.Matched
 		t.written += page.Written
 		t.skipped += page.Skipped
+		t.pointerMatched += page.PointerMatched
+		t.pointed += page.PointersWritten
+		t.pointerSkipped += page.PointersSkipped
+		t.conflicts = append(t.conflicts, page.Conflicts...)
 		if err != nil {
 			fmt.Fprintf(stderr, "migrate backfill-users: page %d failed: %v\n", t.pages, err)
 			reportBackfill(stdout, stderr, t, resumeKey)
@@ -166,17 +185,28 @@ func backfillAll(ctx context.Context, api ddbstore.BackfillAPI, f backfillFlags,
 		}
 
 		verb, count := "indexed", page.Written
+		pverb, pcount := "pointed", page.PointersWritten
 		if f.dryRun {
 			// A dry run writes nothing, so what it reports is what a real run
 			// would have written: every match the sweep understood.
 			verb, count = "would index", page.Matched-page.Skipped
+			pverb, pcount = "would point", len(page.PlannedPointers)
 		}
-		fmt.Fprintf(stdout, "page %d: evaluated %d, matched %d, %s %d, skipped %d\n",
-			t.pages, page.Evaluated, page.Matched, verb, count, page.Skipped)
+		fmt.Fprintf(stdout, "page %d: evaluated %d, matched %d, %s %d, skipped %d; unpointed %d, %s %d, conflicts %d\n",
+			t.pages, page.Evaluated, page.Matched, verb, count, page.Skipped,
+			page.PointerMatched, pverb, pcount, len(page.Conflicts))
 		if !f.quietList {
 			for _, id := range page.Planned {
 				fmt.Fprintf(stdout, "  %s %s\n", verb, id)
 			}
+			for _, id := range page.PlannedPointers {
+				fmt.Fprintf(stdout, "  %s %s\n", pverb, id)
+			}
+		}
+		// Conflicts are listed whatever --quiet says: they are the one outcome
+		// that needs the operator.
+		for _, c := range page.Conflicts {
+			fmt.Fprintf(stderr, "  CONFLICT %s\n", describeConflict(c))
 		}
 
 		if page.NextKey == "" {
@@ -194,14 +224,44 @@ func backfillAll(ctx context.Context, api ddbstore.BackfillAPI, f backfillFlags,
 }
 
 func reportBackfill(stdout, stderr *os.File, t backfillTally, resumeKey string) {
-	fmt.Fprintf(stdout, "pages %d, evaluated %d, matched %d, indexed %d, skipped %d\n",
-		t.pages, t.evaluated, t.matched, t.written, t.skipped)
-	if t.skipped > 0 {
+	fmt.Fprintf(stdout, "pages %d, evaluated %d, matched %d, indexed %d, skipped %d; unpointed %d, pointed %d, pointer skipped %d, conflicts %d\n",
+		t.pages, t.evaluated, t.matched, t.written, t.skipped,
+		t.pointerMatched, t.pointed, t.pointerSkipped, len(t.conflicts))
+	if t.skipped > 0 || t.pointerSkipped > 0 {
 		fmt.Fprintf(stdout, "skipped profiles were indexed by a concurrent registration or run, or deleted since the scan; none needs attention\n")
+	}
+	if len(t.conflicts) > 0 {
+		// The one outcome that is not self-resolving. The pointer is marked, so
+		// the console answers 404 for these ids rather than one of the two
+		// records, and registering either id again is refused.
+		fmt.Fprintf(stderr, "\n%d user id(s) are held under more than one tenant and NEED ATTENTION:\n", len(t.conflicts))
+		for _, c := range t.conflicts {
+			fmt.Fprintf(stderr, "  %s\n", describeConflict(c))
+		}
+		fmt.Fprintf(stderr, "Decide which account keeps each id, delete the other, delete the item\n"+
+			"PK=UID#<id> SK=UID, and run this command again: it points the id at the survivor.\n"+
+			"The console's DELETE reaches only an account under the empty tenant; one under\n"+
+			"another tenant is deleted with DELETE <prefix>/account and that account's token,\n"+
+			"or by hand. See docs/config-reference.md §16.6.\n")
 	}
 	if resumeKey != "" {
 		fmt.Fprintf(stderr, "\nresume with: --start-key %s\n"+
 			"(re-running from the beginning is also safe and is the simpler recovery:\n"+
 			"every profile already indexed is skipped rather than rewritten.)\n", resumeKey)
 	}
+}
+
+// describeConflict names both halves of one conflict, the empty tenant by name
+// rather than as an empty string an operator would read as a formatting bug.
+func describeConflict(c ddbstore.BackfillConflict) string {
+	tenant := func(t string) string {
+		if t == "" {
+			return `the empty tenant ""`
+		}
+		return "tenant " + t
+	}
+	if c.AlreadyAmbiguous {
+		return fmt.Sprintf("user id %s: a profile under %s, and the pointer was already marked ambiguous by an earlier run", c.UserID, tenant(c.TenantID))
+	}
+	return fmt.Sprintf("user id %s: a profile under %s, and the pointer names %s", c.UserID, tenant(c.TenantID), tenant(c.PointerTenantID))
 }

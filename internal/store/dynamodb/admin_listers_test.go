@@ -18,10 +18,17 @@ import (
 // be reproduced and is registered instead.
 
 // newAdminUser mints a profile with a deterministic id, so a test can assert an
-// order rather than discover one. The prefix keeps ids inside idPattern.
+// order rather than discover one. The prefix keeps ids inside idPattern. The
+// tenant is in the id because one id names one user across every tenant
+// (CreateUser refuses a second, user_lookup.go), so two tenants seeded with
+// the same n would otherwise collide.
 func newAdminUser(tenantID string, n int) auth.User {
+	tag := ""
+	if tenantID != "" {
+		tag = tenantID + "_"
+	}
 	return auth.User{
-		ID:       fmt.Sprintf("usr_%04d", n),
+		ID:       fmt.Sprintf("usr_%s%04d", tag, n),
 		Email:    uniqueEmail("admin"),
 		TenantID: tenantID,
 	}
@@ -64,7 +71,7 @@ func TestListUsersScopedIsIDAscending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list users: %v", err)
 	}
-	want := []string{"usr_0000", "usr_0001", "usr_0002", "usr_0003", "usr_0004"}
+	want := []string{"usr_acme_0000", "usr_acme_0001", "usr_acme_0002", "usr_acme_0003", "usr_acme_0004"}
 	if fmt.Sprint(userIDs(got)) != fmt.Sprint(want) {
 		t.Fatalf("scoped listing = %v, want %v", userIDs(got), want)
 	}
@@ -202,7 +209,7 @@ func TestAdminListerPagingRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("negative offset: %v", err)
 		}
-		if fmt.Sprint(userIDs(got)) != fmt.Sprint([]string{"usr_0000", "usr_0001"}) {
+		if fmt.Sprint(userIDs(got)) != fmt.Sprint([]string{"usr_acme_0000", "usr_acme_0001"}) {
 			t.Fatalf("negative offset returned %v, want the first page", userIDs(got))
 		}
 	})

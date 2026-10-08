@@ -333,6 +333,12 @@ func TestDynamoDBStoreSatisfiesTheOAuthWiring(t *testing.T) {
 	if provider.LinkedAccounts() == nil || provider.PendingLinks() == nil {
 		t.Fatal("the OAuth store views are nil")
 	}
+	// Not OAuth, but discovered the same structural way and silent the same
+	// way when it drifts: GET <admin>/api/users/{id} falls back to the empty
+	// tenant without it.
+	if !asserts[auth.UserLookupStore](store) {
+		t.Error("*dynamodb.Store does not satisfy auth.UserLookupStore, so the admin detail route cannot span tenants")
+	}
 	// And the memory bundle, so the development driver cannot drift out of shape
 	// either.
 	if _, ok := any(memoryStoreBundle{MemoryUserStore: auth.NewMemoryUserStore()}).(oauthStoreProvider); !ok {
@@ -347,6 +353,9 @@ func TestDynamoDBStoreSatisfiesTheOAuthWiring(t *testing.T) {
 		"EmailChangeStore":       asserts[auth.EmailChangeStore](bundle),
 		"TOTPStore":              asserts[auth.TOTPStore](bundle),
 		"UserPasswordStore":      asserts[auth.UserPasswordStore](bundle),
+		// The admin detail route's tenant-spanning lookup (core v0.12.0):
+		// hidden, the route quietly falls back to the empty tenant.
+		"UserLookupStore": asserts[auth.UserLookupStore](bundle),
 	} {
 		if !satisfied {
 			t.Errorf("memoryStoreBundle hides %s from the core's type assertion", name)

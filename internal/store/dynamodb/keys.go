@@ -108,6 +108,13 @@ const (
 	// migration sweep is most likely to have to find, and finding it by type is
 	// what stops that sweep from hardcoding the key.
 	typeSettings = "settings"
+
+	// typeUserID is the by-id user pointer (data-model.md §1.1 #3b): the item
+	// auth.UserLookupStore.FindUserByID reads, keyed on the user id alone and
+	// naming the tenant the profile lives under. Its own type rather than a
+	// second "user": a sweep selecting profiles by _t must not meet it, and the
+	// two have nothing in common but the id.
+	typeUserID = "userid"
 )
 
 // Sort keys and partition-key prefixes for the item types this package writes.
@@ -285,6 +292,24 @@ const (
 	// partition would grow without bound.
 	pkTelemetryPrefix = "TEL" + keySep
 
+	// pkUIDPrefix keys the by-id user pointer, UID#<u>, which is what makes
+	// auth.UserLookupStore one GetItem: the method carries an id and no tenant,
+	// and every other user item has the tenant in its key (user_lookup.go,
+	// FindUserByID).
+	//
+	// Why it cannot collide with anything. Every prefixed partition key in this
+	// table is a word followed by keySep, and no other word is "UID": two keys
+	// with different words differ before their first '#', and the tail cannot
+	// smuggle one in because the user id is idPattern-checked and '#'-free. The
+	// constant partitions (TENANTS, ROLES, TEMPLATES, SETTINGS, WEBHOOKS) carry
+	// no '#' at all. Not "USERID#", although that is the word that reads best:
+	// it is already gsi1UserIDPrefix, the by-owner fan-out's GSI1 partition
+	// key. That would not be a collision either — a main-table key and an index
+	// key never meet — but one string meaning two things in one table is the
+	// confusion this catalogue exists to prevent, and "USERBYID#" would sort
+	// among the USER# partitions in a console listing without being one.
+	pkUIDPrefix = "UID" + keySep
+
 	skProfile = "PROFILE"
 	skEmail   = "EMAIL"
 
@@ -303,6 +328,11 @@ const (
 	skLinkID       = "LINKID"
 	skPendingLink  = "PLINK"
 	skMemberPrefix = "MEMBER" + keySep
+
+	// skUID is the single sort key of the by-id user pointer's partition, a
+	// constant as LINKID's and KEYID's are: the partition holds exactly one
+	// item.
+	skUID = "UID"
 )
 
 // idPattern is the accepted shape of a tenant, user or session identifier. It
@@ -459,6 +489,9 @@ func refreshPK(hash string) string { return pkRefreshPrefix + hash }
 func tenantPK(tenantID string) string { return pkTenantPrefix + tenantID }
 
 func memberSK(userID string) string { return skMemberPrefix + userID }
+
+// uidPK is the by-id user pointer's partition, UID#<u>; see pkUIDPrefix.
+func uidPK(userID string) string { return pkUIDPrefix + userID }
 
 // userGSI1SK is the admin user directory's sort key: <tenantID>#<id>.
 //

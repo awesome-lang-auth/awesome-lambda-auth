@@ -710,13 +710,19 @@ func TestAdvTenantIsolationIsStructural(t *testing.T) {
 	store, client := newStore(t, func(o *Options) { o.MultiTenant = true })
 	ctx := context.Background()
 
-	// One id, two tenants. Nothing stops a deployment from doing this, and the
-	// isolation must not depend on ids being globally unique.
+	// One id, two tenants. CreateUser has refused this since the by-id pointer
+	// (user_lookup.go), but a table written before that release can hold it,
+	// and the isolation must not depend on ids being globally unique — so the
+	// second half is written the way the store used to write it.
 	shared := uniqueID("usr")
-	for _, tenant := range []string{"t1", "t2"} {
+	for i, tenant := range []string{"t1", "t2"} {
 		u := sampleUser(tenant)
 		u.ID = shared
 		u.ResetTokenHash, u.ResetTokenExpiresAt = "", nil
+		if i > 0 {
+			putLegacyUser(t, client, store, u)
+			continue
+		}
 		if _, err := store.CreateUser(ctx, u); err != nil {
 			t.Fatalf("create %s/%s: %v", tenant, shared, err)
 		}
@@ -803,14 +809,20 @@ func TestAdvTenantIsolationIsStructural(t *testing.T) {
 // multi-tenancy off, "" is a real tenant and must not collide with a named one.
 func TestAdvSingleTenantEmptyTenantIsItsOwnPartition(t *testing.T) {
 	t.Parallel()
-	store, _ := newStore(t)
+	store, client := newStore(t)
 	ctx := context.Background()
 
+	// The second half is a legacy write, for TestAdvTenantIsolationIsStructural's
+	// reason.
 	shared := uniqueID("usr")
-	for _, tenant := range []string{"", "t1"} {
+	for i, tenant := range []string{"", "t1"} {
 		u := sampleUser(tenant)
 		u.ID = shared
 		u.ResetTokenHash, u.ResetTokenExpiresAt = "", nil
+		if i > 0 {
+			putLegacyUser(t, client, store, u)
+			continue
+		}
 		if _, err := store.CreateUser(ctx, u); err != nil {
 			t.Fatalf("create %q/%s: %v", tenant, shared, err)
 		}

@@ -174,9 +174,14 @@ it if you ask.
 
 The function's policy grants exactly the seven DynamoDB item actions the store
 calls, on exactly two ARNs — the table and its one index — and nothing else. No
-`Resource: "*"`, no `dynamodb:*`, no `Scan`, no `DescribeTable`, not even `ConditionCheckItem`,
-because nothing in the current store puts a bare condition check into a
-transaction. If you copy one thing out of this template into your own stack,
+`Resource: "*"`, no `dynamodb:*`, no `Scan`, no `DescribeTable`, not even
+`ConditionCheckItem`, which a bare condition check inside a transaction needs:
+the user store asserts items with conditional writes the role already grants
+instead, and `TestUserTransactionsUseOnlyGrantedActions`
+(`internal/store/dynamodb/iam_test.go`) fails if a transaction needs an action
+this policy lacks. Two older transactions do carry a bare condition check —
+assigning a role and adding a tenant membership (`roles.go`, `tenants.go`) —
+and are named in that test as a known gap, not yet closed. If you copy one thing out of this template into your own stack,
 copy that block. A wildcard in an auth service's execution role is a bad example
 that propagates.
 
@@ -613,9 +618,19 @@ release:
 
 It is idempotent, resumable (`--start-key`, printed on interruption) and safe
 while the table is serving: every write is a conditional `UpdateItem` on the
-two index attributes. It is an operator command rather than something the
-function does because it is a `Scan`, which the execution role deliberately
-does not grant. `--dry-run` reports what it would index and writes nothing.
+two index attributes, or a conditional transaction writing the by-id pointer
+or marking one an id conflict. It is an
+operator command rather than something the function does because it is a
+`Scan`, which the execution role deliberately does not grant. `--dry-run`
+reports what it would index and point and writes nothing.
+
+**And again after upgrading a table from before the `v0.12.0` pin**, once the
+new release serves every request: the console's user detail reads a by-id
+pointer that older accounts lack, and until the sweep gives them one it finds
+only accounts under the empty tenant. An id the sweep finds under two tenants
+is printed as a `CONFLICT` and needs an operator; `docs/config-reference.md`
+§16.6 says how to resolve one, and what an older binary still serving the
+table — mid-rollout, or after a rollback — can leave behind.
 
 **What the console's session is.** Logging in at `/admin/login` sets a
 24-hour cookie under the same name as the auth access token, signed with
