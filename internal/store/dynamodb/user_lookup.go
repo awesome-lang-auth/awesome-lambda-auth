@@ -32,8 +32,9 @@ import (
 // tenant the profile lives under, and its lifecycle is the profile's exactly:
 //
 //   - createUser writes it in the profile's own transaction, conditioned on
-//     attribute_not_exists — which is also what enforces the precondition the
-//     whole interface rests on, that one id names at most one user across every
+//     uidClaimCondition (the id is free, or a stale pointer already names this
+//     tenant) — which is also what enforces the precondition the whole
+//     interface rests on, that one id names at most one user across every
 //     tenant. MemoryUserStore enforces it the same way, at CreateUser; this
 //     store did not until now, because nothing needed it.
 //   - DeleteUser removes it in the profile's own transaction, conditioned on the
@@ -82,13 +83,6 @@ const (
 // picked by the store, is the answer the interface forbids.
 var ErrUserIDAmbiguous = errors.New("dynamodb: user id is held under more than one tenant")
 
-// The by-id read the admin console's detail route reaches for. See the core's
-// UserLookupStore doc for the contract; a drifted signature here would not fail
-// a build anywhere else — the core would quietly fall back to
-// GetUserByID(id, "") and GET <admin>/api/users/{id} would answer 404 again for
-// every user the listing shows under a tenant.
-var _ auth.UserLookupStore = (*Store)(nil)
-
 // uidItem is the pointer: the id it is keyed on, and the tenant the profile
 // lives under. Nothing else — it is a key, not a copy of the user.
 func uidItem(userID, tenantID string) item {
@@ -116,6 +110,13 @@ func uidClaimNames() map[string]string {
 	return exprNames(attrPK, attrTenantID, attrAmbiguous)
 }
 
+// The by-id read the admin console's detail route reaches for. See the core's
+// UserLookupStore doc for the contract; a drifted signature here would not fail
+// a build anywhere else — the core would quietly fall back to
+// GetUserByID(id, "") and GET <admin>/api/users/{id} would answer 404 again for
+// every user the listing shows under a tenant.
+var _ auth.UserLookupStore = (*Store)(nil)
+
 // FindUserByID implements auth.UserLookupStore: the user with this id, whatever
 // tenant holds it.
 //
@@ -127,8 +128,9 @@ func uidClaimNames() map[string]string {
 //
 // A pointer that names a profile which is not there answers ErrUserNotFound, as
 // GetUserByID would: both are written and removed in one transaction, so that
-// state is one nothing in this package produces, and the honest answer to it is
-// the one the route turns into 404.
+// state is one this package does not produce — a pre-v0.12.0 binary deleting a
+// user during a rollout or after a rollback does (config-reference §16.6) —
+// and the honest answer to it is the one the route turns into 404.
 func (s *Store) FindUserByID(ctx context.Context, id string) (auth.User, error) {
 	if err := checkID("user id", id); err != nil {
 		return auth.User{}, err
@@ -165,6 +167,14 @@ func (s *Store) FindUserByID(ctx context.Context, id string) (auth.User, error) 
 // backfill is what makes the detail route span tenants on an older table, and
 // the upgrade notes say so (config-reference §16.6, decisions D-22).
 //
+// Until that sweep, this is also where the store can still choose between two
+// records of one id, which the interface forbids and which no read can avoid
+// without a Scan: if the id is held under "" and under another tenant too, this
+// answers the "" one, exactly as v0.11.0 did; and a registration that claimed
+// the id under another tenant after the pin is answered through its pointer,
+// while an unswept "" profile of the same id waits for the sweep to find the
+// pair and mark it (D-22 records both halves of that window).
+//
 // It reads the profile directly rather than calling GetUserByID(id, ""), for two
 // reasons that change nothing observable: GetUserByID files the migration
 // marker (see FindUserByID), and in multi-tenant mode its checkTenant turns ""
@@ -199,10 +209,11 @@ func (s *Store) readProfile(ctx context.Context, tenantID, id string) (auth.User
 	return userFromItem(out.Item)
 }
 
-// uidDeleteAttempts bounds deleteProfileAndPointer's retry. The only thing that
-// can move the pointer under a delete is the backfill — writing one where there
-// was none, or marking it ambiguous — and each of those happens once per id, so
-// a third attempt seeing a third state would be a bug, not contention.
+// uidDeleteAttempts bounds deleteProfileAndPointer's retry. What can move the
+// pointer under a delete is the backfill — writing one where there was none, or
+// marking it ambiguous — and the other same-id record's own DeleteUser freeing
+// it; each happens once per id, so a third attempt seeing a third state would be
+// a bug, not contention.
 const uidDeleteAttempts = 3
 
 // deleteProfileAndPointer is DeleteUser's last write: the profile and, when the
@@ -210,31 +221,42 @@ const uidDeleteAttempts = 3
 //
 // Last, and the profile with it, so that a DeleteUser which fails halfway
 // leaves a profile to find on retry: everything the user owned that the batch
-// already removed is idempotent to remove again, and the profile is the commit
-// point. Atomic with the pointer, so neither can outlive the other — a pointer
-// without a profile would refuse the id to every other tenant for ever, and a
-// profile without a pointer is the pre-backfill state this release exists to
-// leave behind.
+// already removed is idempotent to remove again — a retry re-reads the
+// collection, finds the profile, and derives the same keys from it — and the
+// profile is the commit point. Atomic with the pointer, so neither can outlive
+// the other — a pointer without a profile would refuse the id to every other
+// tenant for ever, and a profile without a pointer is the pre-backfill state
+// this release exists to leave behind.
 //
 // The pointer is read first, because whether this delete owns it depends on
 // what it says, and the transaction re-asserts what was read:
 //
 //   - naming this tenant, not ambiguous: deleted, conditioned on still saying so;
-//   - absent: the profile is deleted with a ConditionCheck that it is still
-//     absent, because a concurrent backfill may write one between the read and
-//     the delete, and that pointer would be stranded;
-//   - naming another tenant, or ambiguous: left alone. It is not this record's —
-//     the other tenant's same-id record, or a conflict for an operator — and
-//     nothing can turn it into this record's while this profile exists, because
-//     every pointer write requires the id to be free or this tenant's already.
+//   - absent: deleted anyway, conditioned on attribute_not_exists(PK). A Delete
+//     of a missing item under that condition succeeds and writes nothing, and it
+//     fails exactly when a concurrent backfill has written a pointer between the
+//     read and the transaction, which would otherwise be stranded. A
+//     ConditionCheck would say the same, but it is authorised by an IAM action of
+//     its own, dynamodb:ConditionCheckItem, which the function's role does not
+//     grant (infra/sam/template.yaml, AuthTableItems); DeleteItem it does.
+//     TestUserTransactionsUseOnlyGrantedActions pins that, because DynamoDB
+//     Local enforces no IAM;
+//   - naming another tenant, or ambiguous: left alone, because it is not this
+//     record's — the other tenant's same-id record, or a conflict for an
+//     operator — but re-asserted all the same, with a no-op Update conditioned
+//     on the tenant and the mark as read. It can change under the delete: the
+//     other record's own DeleteUser frees the id, a concurrent backfill then
+//     points it at this very profile, and an unconditioned profile Delete would
+//     leave that pointer naming nothing.
 //
 // A cancelled transaction re-reads and tries again; anything else is an error.
 func (s *Store) deleteProfileAndPointer(ctx context.Context, userID, tenantID string) error {
 	profileKey := key(userPK(tenantID, userID), skProfile)
+	ptrKey := key(uidPK(userID), skUID)
 	for attempt := 0; ; attempt++ {
 		out, err := s.api.GetItem(ctx, &awsddb.GetItemInput{
 			TableName:      aws.String(s.table),
-			Key:            key(uidPK(userID), skUID),
+			Key:            ptrKey,
 			ConsistentRead: aws.Bool(true),
 		})
 		if err != nil {
@@ -245,20 +267,39 @@ func (s *Store) deleteProfileAndPointer(ctx context.Context, userID, tenantID st
 		}
 		switch ptr := out.Item; {
 		case len(ptr) == 0:
-			ops = append(ops, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			ops = append(ops, types.TransactWriteItem{Delete: &types.Delete{
 				TableName:                aws.String(s.table),
-				Key:                      key(uidPK(userID), skUID),
+				Key:                      ptrKey,
 				ConditionExpression:      aws.String("attribute_not_exists(#PK)"),
 				ExpressionAttributeNames: exprNames(attrPK),
 			}})
 		case getS(ptr, attrTenantID) == tenantID && !getBool(ptr, attrAmbiguous):
 			ops = append(ops, types.TransactWriteItem{Delete: &types.Delete{
 				TableName:                aws.String(s.table),
-				Key:                      key(uidPK(userID), skUID),
+				Key:                      ptrKey,
 				ConditionExpression:      aws.String("#tenantId = :tenant AND attribute_not_exists(#ambiguous)"),
 				ExpressionAttributeNames: exprNames(attrTenantID, attrAmbiguous),
 				ExpressionAttributeValues: map[string]types.AttributeValue{
 					":tenant": avS(tenantID),
+				},
+			}})
+		default:
+			mark := "attribute_not_exists(#ambiguous)"
+			if getBool(ptr, attrAmbiguous) {
+				mark = "attribute_exists(#ambiguous)"
+			}
+			// SET of the very value the condition requires: a write that
+			// changes nothing, which is how a role without ConditionCheckItem
+			// asserts an item. On a missing item the condition fails, so it
+			// cannot create one.
+			ops = append(ops, types.TransactWriteItem{Update: &types.Update{
+				TableName:                aws.String(s.table),
+				Key:                      ptrKey,
+				UpdateExpression:         aws.String("SET #tenantId = :named"),
+				ConditionExpression:      aws.String("#tenantId = :named AND " + mark),
+				ExpressionAttributeNames: exprNames(attrTenantID, attrAmbiguous),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":named": avS(getS(ptr, attrTenantID)),
 				},
 			}})
 		}

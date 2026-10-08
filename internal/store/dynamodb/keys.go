@@ -294,7 +294,7 @@ const (
 
 	// pkUIDPrefix keys the by-id user pointer, UID#<u>, which is what makes
 	// auth.UserLookupStore one GetItem: the method carries an id and no tenant,
-	// and every other user item has the tenant in its key (users.go,
+	// and every other user item has the tenant in its key (user_lookup.go,
 	// FindUserByID).
 	//
 	// Why it cannot collide with anything. Every prefixed partition key in this

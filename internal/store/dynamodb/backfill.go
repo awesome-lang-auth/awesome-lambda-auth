@@ -46,8 +46,12 @@ import (
 //
 // # Safe while serving, and what makes it so
 //
-// Every write is a conditional UpdateItem that names the two index attributes
-// and nothing else, guarded by attribute_exists(PK) AND
+// Every write the sweep makes is conditional, and it makes two kinds: the
+// index half below, and the by-id pointer half, which has its own argument
+// further down ("The second debt").
+//
+// The index half's write is a conditional UpdateItem that names the two index
+// attributes and nothing else, guarded by attribute_exists(PK) AND
 // attribute_not_exists(GSI1PK). Three interleavings are possible with a live
 // store and each is refused rather than reasoned about:
 //
@@ -60,12 +64,14 @@ import (
 //   - a concurrent run of this same job over the same page loses the race on
 //     the same condition, so two operators cannot double-write.
 //
-// Nothing else on the profile is read or written: a login updating updatedAt or
-// a password change rewriting passwordHash on the same item is unaffected,
-// because an UpdateItem is atomic per item and this one names two attributes
-// the login path never touches. The sweep is therefore idempotent — a second
-// run scans the same table and writes nothing — and resumable from any page
-// boundary, which is what the encoded key below is for.
+// Nothing else on the profile is read or written by this half: a login
+// updating updatedAt or a password change rewriting passwordHash on the same
+// item is unaffected, because an UpdateItem is atomic per item and this one
+// names two attributes the login path never touches (the pointer half's
+// profile writes name only its own stamp, for the same reason). The sweep is
+// therefore idempotent — a second run scans the same table and writes nothing —
+// and resumable from any page boundary, which is what the encoded key below is
+// for.
 //
 // # What it costs
 //
@@ -100,13 +106,16 @@ import (
 //     pointer — attribute_not_exists, or still this tenant's and not ambiguous —
 //     and the stamp, guarded by attribute_exists(PK). A profile deleted since the
 //     scan cancels it, so the sweep cannot strand a pointer; a pointer written
-//     meanwhile cancels it too, and the profile is read again.
+//     meanwhile cancels it too, and the pointer is read again and the decision
+//     re-made.
 //   - naming another tenant, not ambiguous: two profiles hold one id, which
 //     nothing refused before this release. The sweep does not overwrite — it
 //     marks the pointer ambiguous and removes the other profile's stamp, in one
-//     transaction, so FindUserByID answers ErrUserIDAmbiguous for that id
-//     rather than either record, createUser refuses the id, and every later run
-//     reports both profiles again until an operator resolves it.
+//     transaction that also asserts the swept profile still exists, so
+//     FindUserByID answers ErrUserIDAmbiguous for that id rather than either
+//     record, createUser refuses the id, and every later run reports both
+//     profiles again until an operator resolves it. A swept profile deleted
+//     since the scan cancels the mark: that is one record, not two.
 //   - already ambiguous: reported, nothing written.
 //
 // A conflict is the one outcome that needs an operator, and BackfillPage carries
@@ -115,8 +124,9 @@ import (
 // writing anything; two profiles that both predate pointers become a conflict
 // only when the real run has pointed the first of them.
 //
-// The read is one strongly-consistent GetItem per unstamped profile — 0.5 RRU
-// for an item this small — and the write two units in a transaction, once.
+// The read is one strongly-consistent GetItem per unstamped profile — 1 RRU for
+// an item this small — and the write a two-item transaction, 4 WCU at 2 per
+// item (a conflict's mark is a three-item one, 6 WCU), once.
 
 // BackfillAPI is the slice of the DynamoDB client the sweep uses. Scan is
 // deliberately absent from the store's own API interface (store.go): the store
@@ -172,8 +182,10 @@ type BackfillPage struct {
 	Written int
 
 	// Skipped is the number of matched profiles whose conditional write was
-	// refused: indexed by a concurrent CreateUser or a concurrent run, or
-	// deleted since the scan. Never a failure.
+	// refused — indexed by a concurrent CreateUser or a concurrent run, or
+	// deleted since the scan — or that carry no usable userId and are not
+	// written at all. Never a failure. On a dry run only the last kind is
+	// counted, so Matched - Skipped is what a real run would index.
 	Skipped int
 
 	// Planned lists the user ids this page would index — on a dry run — or did
@@ -190,8 +202,9 @@ type BackfillPage struct {
 	// run.
 	PointersWritten int
 
-	// PointersSkipped is the number of unstamped profiles that needed no
-	// pointer after all: deleted since the scan. Never a failure.
+	// PointersSkipped is the number of unstamped profiles that got no pointer
+	// and no conflict mark: deleted since the scan, or carrying no usable
+	// userId. Never a failure.
 	PointersSkipped int
 
 	// PlannedPointers lists the user ids this page would write a pointer for —
@@ -289,8 +302,14 @@ func BackfillUsersPage(ctx context.Context, api BackfillAPI, opts BackfillOption
 			// ever wrote (sAlways writes it at creation), and guessing an id
 			// from the partition key would be indexing a row this package does
 			// not understand. Reported as skipped, with the key, rather than
-			// written.
-			page.Skipped++
+			// written — under each half it was matched by, so that every
+			// matched profile lands in exactly one outcome of its half.
+			if needsIndex {
+				page.Skipped++
+			}
+			if needsPointer {
+				page.PointersSkipped++
+			}
 			page.Planned = append(page.Planned, "skipped (no userId): "+getS(m, attrPK))
 			continue
 		}
@@ -353,7 +372,8 @@ func backfillIndex(ctx context.Context, api BackfillAPI, table string, m map[str
 		TableName:        aws.String(table),
 		Key:              key(getS(m, attrPK), getS(m, attrSK)),
 		UpdateExpression: aws.String("SET #GSI1PK = :pk, #GSI1SK = :sk"),
-		// The whole safety argument is this line; see the file header.
+		// The index half's whole safety argument is this line; see the file
+		// header.
 		ConditionExpression:      aws.String("attribute_exists(#PK) AND attribute_not_exists(#GSI1PK)"),
 		ExpressionAttributeNames: exprNames(attrPK, attrGSI1PK, attrGSI1SK),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -419,19 +439,16 @@ func backfillPointer(ctx context.Context, api BackfillAPI, table, userID, tenant
 			// later run reports both halves until the conflict is resolved. The
 			// mark is conditioned on the pointer still naming what was read; the
 			// stamp removal on the other profile still existing, because an
-			// UpdateItem on a missing key would create one.
+			// UpdateItem on a missing key would create one. The third item is
+			// the swept profile itself, asserted still there: the Scan is
+			// eventually consistent and a DeleteUser can land after it, and a
+			// conflict with a profile that is gone is no conflict — marking it
+			// would answer an error for the one record that really holds the
+			// id. Its REMOVE is a no-op (an unstamped profile is why the sweep
+			// is here), and it is an Update rather than a ConditionCheck so that
+			// the sweep needs no ConditionCheckItem from the operator either.
 			err := transactBackfill(ctx, api, []types.TransactWriteItem{
-				{Update: &types.Update{
-					TableName:                aws.String(table),
-					Key:                      key(uidPK(userID), skUID),
-					UpdateExpression:         aws.String("SET #ambiguous = :true"),
-					ConditionExpression:      aws.String("#tenantId = :named AND attribute_not_exists(#ambiguous)"),
-					ExpressionAttributeNames: exprNames(attrTenantID, attrAmbiguous),
-					ExpressionAttributeValues: map[string]types.AttributeValue{
-						":named": avS(named),
-						":true":  &types.AttributeValueMemberBOOL{Value: true},
-					},
-				}},
+				{Update: markAmbiguousUpdate(table, userID, named)},
 				{Update: &types.Update{
 					TableName:                aws.String(table),
 					Key:                      key(userPK(named, userID), skProfile),
@@ -439,9 +456,14 @@ func backfillPointer(ctx context.Context, api BackfillAPI, table, userID, tenant
 					ConditionExpression:      aws.String("attribute_exists(#PK)"),
 					ExpressionAttributeNames: exprNames(attrPK, attrUIDPointer),
 				}},
+				{Update: assertProfileUpdate(table, profileKey)},
 			})
 			if err == nil {
 				return pointerConflict, conflict, nil
+			}
+			if _, failed := txFailedAtAny(err, 2); failed {
+				// The swept profile is gone: nothing to point, nothing to mark.
+				return pointerSkipped, BackfillConflict{}, nil
 			}
 			if _, failed := txFailedAtAny(err, 0); failed || isTransactionConflict(err) {
 				// The pointer moved since it was read; decide again.
@@ -449,15 +471,25 @@ func backfillPointer(ctx context.Context, api BackfillAPI, table, userID, tenant
 			}
 			if _, failed := txFailedAtAny(err, 1); failed {
 				// The other profile is gone: the pointer names nothing. Marking
-				// it alone is still the safe answer — the two transactions that
-				// remove a profile remove its pointer with it, so this is a state
-				// only a hand edit produces, and an operator should see it.
-				if err := markAmbiguous(ctx, api, table, userID, named); err == nil {
+				// it alone is still the safe answer — this package's two
+				// transactions that remove a profile remove its pointer with it,
+				// so only a hand edit or a pre-v0.12.0 binary's DeleteUser (in a
+				// rollout or after a rollback, config-reference §16.6) leaves
+				// one, and an operator should see it.
+				err := transactBackfill(ctx, api, []types.TransactWriteItem{
+					{Update: markAmbiguousUpdate(table, userID, named)},
+					{Update: assertProfileUpdate(table, profileKey)},
+				})
+				if err == nil {
 					return pointerConflict, conflict, nil
-				} else if !isConditionFailed(err) {
-					return 0, BackfillConflict{}, err
 				}
-				continue
+				if _, failed := txFailedAtAny(err, 1); failed {
+					return pointerSkipped, BackfillConflict{}, nil
+				}
+				if _, failed := txFailedAtAny(err, 0); failed || isTransactionConflict(err) {
+					continue
+				}
+				return 0, BackfillConflict{}, wrap("backfill mark pointer "+userID, err)
 			}
 			return 0, BackfillConflict{}, wrap("backfill mark pointer "+userID, err)
 
@@ -501,10 +533,10 @@ func backfillPointer(ctx context.Context, api BackfillAPI, table, userID, tenant
 	return 0, BackfillConflict{}, fmt.Errorf("dynamodb: backfill: the pointer for %q kept changing under the sweep; re-run from this page", userID)
 }
 
-// markAmbiguous is the conflict mark on its own, for the one case where the
-// other profile cannot have its stamp removed because it is not there.
-func markAmbiguous(ctx context.Context, api BackfillAPI, table, userID, named string) error {
-	_, err := api.UpdateItem(ctx, &awsddb.UpdateItemInput{
+// markAmbiguousUpdate is the conflict mark: the pointer, still naming the tenant
+// it was read naming and not yet marked, set ambiguous.
+func markAmbiguousUpdate(table, userID, named string) *types.Update {
+	return &types.Update{
 		TableName:                aws.String(table),
 		Key:                      key(uidPK(userID), skUID),
 		UpdateExpression:         aws.String("SET #ambiguous = :true"),
@@ -514,8 +546,21 @@ func markAmbiguous(ctx context.Context, api BackfillAPI, table, userID, named st
 			":named": avS(named),
 			":true":  &types.AttributeValueMemberBOOL{Value: true},
 		},
-	})
-	return err
+	}
+}
+
+// assertProfileUpdate asserts that the swept profile still exists, as a
+// transaction item that writes nothing: REMOVE of the stamp an unstamped
+// profile does not carry, guarded by attribute_exists(PK) so that it cannot
+// create the item either.
+func assertProfileUpdate(table string, profileKey map[string]types.AttributeValue) *types.Update {
+	return &types.Update{
+		TableName:                aws.String(table),
+		Key:                      profileKey,
+		UpdateExpression:         aws.String("REMOVE #uidPointer"),
+		ConditionExpression:      aws.String("attribute_exists(#PK)"),
+		ExpressionAttributeNames: exprNames(attrPK, attrUIDPointer),
+	}
 }
 
 // transactBackfill is one TransactWriteItems call. No conflict retry here, unlike

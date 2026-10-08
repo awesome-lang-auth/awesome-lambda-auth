@@ -151,8 +151,8 @@ func TestDeleteUserRemovesThePointerAndOnlyItsOwn(t *testing.T) {
 // existing tables (decisions D-22): a profile written before pointers existed is
 // found if it lives under the empty tenant — what the console's detail route
 // answered on core v0.11.0 — and is not found under another, until the backfill
-// has run. In multi-tenant mode nobody lives under the empty tenant, and the
-// fallback answers not-found rather than ErrTenantRequired.
+// has run. In multi-tenant mode nobody lives under the empty tenant, so the
+// fallback does not run there: the same unpointed "" profile is not found.
 func TestFindUserByIDFallsBackToTheEmptyTenantBeforeTheBackfill(t *testing.T) {
 	t.Parallel()
 	store, client := newStore(t)
@@ -170,17 +170,20 @@ func TestFindUserByIDFallsBackToTheEmptyTenantBeforeTheBackfill(t *testing.T) {
 		t.Errorf("unpointed tenanted user: err = %v, want ErrUserNotFound until the backfill", err)
 	}
 
-	sweep(t, client, BackfillOptions{TableName: store.table})
-	if got, err := store.FindUserByID(ctx, tenanted.ID); err != nil || got.TenantID != "acme" {
-		t.Errorf("after the backfill = %+v, %v; want the acme user", got, err)
-	}
-
+	// The same unpointed "" profile, asked of a multi-tenant store over the
+	// same table: the fallback is what would find it, and in that mode it must
+	// not run — so this, and only this, is what tells the branch apart.
 	multi, err := New(client, Options{TableName: store.table, MultiTenant: true})
 	if err != nil {
 		t.Fatalf("new multi-tenant store: %v", err)
 	}
-	if _, err := multi.FindUserByID(ctx, uniqueID("usr")); !errors.Is(err, ErrUserNotFound) {
-		t.Errorf("multi-tenant miss: err = %v, want ErrUserNotFound", err)
+	if got, err := multi.FindUserByID(ctx, home.ID); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("multi-tenant miss on an unpointed \"\" profile = %+v, %v; want ErrUserNotFound, not the fallback's answer", got, err)
+	}
+
+	sweep(t, client, BackfillOptions{TableName: store.table})
+	if got, err := store.FindUserByID(ctx, tenanted.ID); err != nil || got.TenantID != "acme" {
+		t.Errorf("after the backfill = %+v, %v; want the acme user", got, err)
 	}
 }
 
@@ -346,4 +349,137 @@ func (d *deletingAPI) Scan(ctx context.Context, in *awsddb.ScanInput, optFns ...
 		return nil, err
 	}
 	return out, nil
+}
+
+// afterPointerRead runs hook once, right after the first strongly-consistent
+// read of one id's pointer has returned — the window between a read and the
+// transaction that re-asserts it, which is what the races below live in.
+type afterPointerRead struct {
+	*awsddb.Client
+	userID string
+	hook   func(ctx context.Context)
+	done   bool
+}
+
+func (a *afterPointerRead) GetItem(ctx context.Context, in *awsddb.GetItemInput, optFns ...func(*awsddb.Options)) (*awsddb.GetItemOutput, error) {
+	out, err := a.Client.GetItem(ctx, in, optFns...)
+	if err != nil || a.done || getS(in.Key, attrPK) != uidPK(a.userID) {
+		return out, err
+	}
+	a.done = true
+	a.hook(ctx)
+	return out, nil
+}
+
+// TestBackfillDoesNotMarkAnIDWhoseSweptProfileWasDeleted: the sweep reads a
+// pointer naming another tenant — a conflict, as read — and the swept profile
+// is deleted before the mark lands, by a DeleteUser or simply because the
+// eventually-consistent Scan returned it after it was gone. One record holds
+// the id, so marking it would answer an error for the one user who is not in
+// conflict; the mark's transaction asserts the swept profile and is cancelled.
+func TestBackfillDoesNotMarkAnIDWhoseSweptProfileWasDeleted(t *testing.T) {
+	t.Parallel()
+	store, client := newStore(t)
+	ctx := context.Background()
+
+	owner := newUser(t, store, "t1")
+	stray := sampleUser("t2")
+	stray.ID = owner.ID
+	putLegacyUser(t, client, store, stray)
+
+	racing := &afterPointerRead{Client: client, userID: owner.ID, hook: func(ctx context.Context) {
+		if err := store.DeleteUser(ctx, stray.ID, "t2"); err != nil {
+			t.Errorf("delete the stray record mid-sweep: %v", err)
+		}
+	}}
+	_, total := sweep(t, racing, BackfillOptions{TableName: store.table})
+	if !racing.done {
+		t.Fatal("the sweep never read the pointer; the race was not staged")
+	}
+	if len(total.Conflicts) != 0 || total.PointersSkipped != 1 {
+		t.Fatalf("conflicts %v, pointers skipped %d; want no conflict and the deleted profile skipped", total.Conflicts, total.PointersSkipped)
+	}
+	ptr := rawItem(t, client, store.table, uidPK(owner.ID), skUID)
+	if getBool(ptr, attrAmbiguous) || getS(ptr, attrTenantID) != "t1" {
+		t.Fatalf("pointer = %v; want it naming t1 and not marked", ptr)
+	}
+	if got, err := store.FindUserByID(ctx, owner.ID); err != nil || got.TenantID != "t1" {
+		t.Errorf("FindUserByID = %+v, %v; want the t1 user", got, err)
+	}
+}
+
+// TestDeleteUserDoesNotStrandAPointerThatMovedToItsRecord: DeleteUser of one
+// half of a same-id pair reads the pointer naming the other half, and before
+// its transaction lands the other half is deleted (freeing the id) and the
+// sweep points the id at this very record. Left unasserted, the profile delete
+// would strand that pointer — naming nothing, refusing the id to every tenant,
+// and invisible to a sweep that scans profiles. The no-op Update on the pointer
+// cancels the transaction, the retry sees the pointer is now this record's, and
+// both go together.
+func TestDeleteUserDoesNotStrandAPointerThatMovedToItsRecord(t *testing.T) {
+	t.Parallel()
+	store, client := newStore(t)
+	ctx := context.Background()
+
+	owner := newUser(t, store, "t1")
+	stray := sampleUser("t2")
+	stray.ID = owner.ID
+	putLegacyUser(t, client, store, stray)
+
+	api := &afterPointerRead{Client: client, userID: owner.ID, hook: func(ctx context.Context) {
+		if err := store.DeleteUser(ctx, owner.ID, "t1"); err != nil {
+			t.Errorf("delete the t1 record mid-delete: %v", err)
+			return
+		}
+		_, total := sweep(t, client, BackfillOptions{TableName: store.table})
+		if total.PointersWritten != 1 {
+			t.Errorf("the mid-delete sweep wrote %d pointers, want the t2 record pointed", total.PointersWritten)
+		}
+	}}
+	racing, err := New(api, Options{TableName: store.table})
+	if err != nil {
+		t.Fatalf("new racing store: %v", err)
+	}
+	if err := racing.DeleteUser(ctx, stray.ID, "t2"); err != nil {
+		t.Fatalf("delete the t2 record: %v", err)
+	}
+	if !api.done {
+		t.Fatal("DeleteUser never read the pointer; the race was not staged")
+	}
+	mustNotExist(t, client, store.table, userPK("t2", stray.ID), skProfile)
+	mustNotExist(t, client, store.table, uidPK(stray.ID), skUID)
+	again := sampleUser("globex")
+	again.ID = owner.ID
+	if _, err := store.CreateUser(ctx, again); err != nil {
+		t.Errorf("the id is not free after both records went: %v", err)
+	}
+}
+
+// TestDeleteUserOfAnUnpointedProfileLeavesNoPointer: the pre-backfill path —
+// no pointer to own — deletes the profile and asserts the pointer still absent
+// with a conditional Delete, which is what the function's role can authorise
+// (TestUserTransactionsUseOnlyGrantedActions). A pointer the sweep writes in
+// between cancels it, and the retry takes the pointer with the profile.
+func TestDeleteUserOfAnUnpointedProfileLeavesNoPointer(t *testing.T) {
+	t.Parallel()
+	store, client := newStore(t)
+	ctx := context.Background()
+
+	u := sampleUser("acme")
+	putLegacyUser(t, client, store, u)
+
+	api := &afterPointerRead{Client: client, userID: u.ID, hook: func(context.Context) {
+		if _, total := sweep(t, client, BackfillOptions{TableName: store.table}); total.PointersWritten != 1 {
+			t.Errorf("the mid-delete sweep wrote %d pointers, want the profile pointed", total.PointersWritten)
+		}
+	}}
+	racing, err := New(api, Options{TableName: store.table})
+	if err != nil {
+		t.Fatalf("new racing store: %v", err)
+	}
+	if err := racing.DeleteUser(ctx, u.ID, "acme"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	mustNotExist(t, client, store.table, userPK("acme", u.ID), skProfile)
+	mustNotExist(t, client, store.table, uidPK(u.ID), skUID)
 }
