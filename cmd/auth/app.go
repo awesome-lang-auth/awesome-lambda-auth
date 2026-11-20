@@ -1298,10 +1298,10 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	if cfg.RefreshTokenSecret() != "" {
 		gaps = append(gaps, knobGap{
 			Path: "security.jwt.refreshTokenSecret",
-			Problem: "the auth core signs access and refresh tokens with one HS256 secret and tells them apart by the typ claim, " +
-				"so security.jwt.accessTokenSecret is the only secret in use and this one signs nothing",
-			Remedy: "keep it set — RS-1 requires it and it becomes live as soon as the core takes a second secret — but do not " +
-				"rely on rotating it to invalidate refresh tokens today",
+			Problem: "the auth core takes a second secret since awesome-go-auth v0.13.0 (WithRefreshSecret), but this build does not " +
+				"pass it yet, so security.jwt.accessTokenSecret still signs the refresh tokens and this one signs nothing",
+			Remedy: "keep it set — RS-1 requires it, and it becomes live when this product wires it, which signs every outstanding " +
+				"session out once — but do not rely on rotating it to invalidate refresh tokens today",
 		})
 	}
 

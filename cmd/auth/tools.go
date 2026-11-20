@@ -664,8 +664,10 @@ func toolsAccess(cfg *config.Config, core *auth.Auth, base auth.HTTPConfig, user
 		// verification, for a cookie caller only (auth.middleware.ts:33-41).
 		//
 		// The adapter's own guard: the access token from the bearer header or
-		// the cookie, verified through Auth.Authenticate, the principal put on
-		// the context where POST /track reads it as the fallback userId. Built
+		// the cookie, verified through Auth.VerifyAccess — the token's claims,
+		// with no user-store read since awesome-go-auth v0.13.0 — and the
+		// principal put on the context where POST /track reads it as the
+		// fallback userId. Built
 		// from the same resolved configuration the adapter mounts with, so the
 		// cookie it reads is the cookie the login route set.
 		//
