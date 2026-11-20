@@ -3149,6 +3149,12 @@ and no redeploy:
 4. Do not rotate again until step 3 is done everywhere: after the next
    rotation the old value is neither current nor previous.
 
+**Rotating because the value leaked takes two rotations.** After the first,
+the leaked value is the secret's `AWSPREVIOUS` and is still accepted. Once the
+front door sends the new value everywhere, rotate again: the leaked value then
+holds neither label, and every environment stops accepting it within five
+minutes.
+
 `AWSPENDING` is never accepted. A rotation function that moves the front door
 must do it after its `finishSecret` step, not in `setSecret`, or the front door
 sends a value the function does not accept yet.

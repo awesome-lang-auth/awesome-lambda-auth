@@ -217,12 +217,14 @@ where they do not:
 Both statements are absent from the role entirely unless their half is
 configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
 
-There are three more `secretsmanager:GetSecretValue` statements, and each
+There are four more `secretsmanager:GetSecretValue` statements, and each
 follows the signing-secret one exactly: one present only when
 `EmailDeliveryWebhookSecretArn` is set, one only when `ClaimsWebhookSecretArn`
-is set, and one only when an OAuth provider is configured, each scoped to the
+is set, one only when an OAuth provider is configured, and one —
+`ReadOriginVerifySecret`, on the SSE function's role too, because it runs the
+same check — only when `OriginVerifySecretArn` is set, each scoped to the
 ARNs actually named with any `#<jsonKey>` selector stripped, because the
-selector is the function's and the resource is the secret. Three statements
+selector is the function's and the resource is the secret. Four statements
 rather than one with every ARN on it, so that a stack with one webhook grants
 nothing for the other; and a stack with one provider grants one read, while a
 stack with none grants nothing for OAuth at all.
@@ -562,7 +564,9 @@ OriginVerifyExemptHealthz=false           # the default: /healthz is checked too
 - **Rotation needs no flag day.** The function accepts the secret's
   `AWSCURRENT` and `AWSPREVIOUS` values and re-reads both every five minutes:
   `put-secret-value`, wait five minutes, then switch the front door. The value
-  it was sending stays accepted until the next rotation.
+  it was sending stays accepted until the next rotation — so if you are
+  rotating because that value leaked, rotate a second time once the front door
+  sends the new one.
 - **It fails closed.** A secret the function cannot read, or one too short to
   accept, refuses the cold start; a later re-read that fails keeps the values
   already read and retries every 30 seconds.

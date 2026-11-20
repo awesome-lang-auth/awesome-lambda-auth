@@ -396,6 +396,46 @@ func TestOriginVerifyFollowsARotation(t *testing.T) {
 	}
 }
 
+// TestOriginVerifyRefreshesOnTheWallClock: on the real clock, the refresh
+// deadline carries no monotonic reading, so it is compared against elapsed
+// wall time and not against a monotonic clock that need not advance while an
+// idle execution environment is frozen. A failed refresh's retry deadline is
+// held to the same rule. (originClock above uses time.Date, which has no
+// monotonic reading either way, so only this test can see the difference.)
+func TestOriginVerifyRefreshesOnTheWallClock(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(originEnv())})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	secret := newFakeOriginSecret(testOriginCurrent, "")
+	v, err := newOriginVerifier(context.Background(), cfg, secret.read, discardLogger())
+	if err != nil {
+		t.Fatalf("newOriginVerifier: %v", err)
+	}
+	monotonic := func(when time.Time) bool { return strings.Contains(when.String(), " m=") }
+	if at := v.secrets.Load().refreshAt; monotonic(at) || at.Before(time.Now().Add(originSecretRefreshInterval-time.Minute)) {
+		t.Errorf("refreshAt = %s, want a wall-clock time one interval away", at)
+	}
+
+	// Due now, and the read fails: the retry deadline is wall-clock too.
+	due := *v.secrets.Load()
+	due.refreshAt = time.Now().Add(-time.Second).Round(0)
+	v.secrets.Store(&due)
+	secret.set("", "", errors.New("ThrottlingException: rate exceeded"))
+	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
+	req.Header.Set(config.DefaultOriginVerifyHeader, testOriginCurrent)
+	if ok, why := v.admits(req); !ok {
+		t.Fatalf("the held value was refused during a failed refresh (%s)", why)
+	}
+	if at := v.secrets.Load().refreshAt; monotonic(at) || !at.After(time.Now()) {
+		t.Errorf("after a failed refresh refreshAt = %s, want a wall-clock time in the future", at)
+	}
+	if n := secret.readCount(); n != 2 {
+		t.Errorf("the secret was read %d times, want 2 (cold start, failed refresh)", n)
+	}
+}
+
 // TestOriginVerifyRefusesToStartWithoutAUsableSecret: a current value that
 // cannot be read, or cannot be accepted, fails the cold start with the knob's
 // path and without the value; a previous value that cannot be accepted only

@@ -173,8 +173,14 @@ func newOriginVerifierAt(ctx context.Context, cfg *config.Config, read OriginSec
 		exemptHealthz: ov.ExemptHealthz,
 		secretArn:     ov.SecretARN,
 		read:          read,
-		now:           now,
-		log:           log,
+		// The wall clock, with Go's monotonic reading stripped. The interval
+		// is a promise about elapsed time — rotate, wait five minutes, switch
+		// the front door — and a monotonic clock is not guaranteed to advance
+		// while the platform freezes an idle execution environment between
+		// invocations, which would stretch it into five minutes of running
+		// time on exactly the environments that serve least.
+		now: func() time.Time { return now().Round(0) },
+		log: log,
 	}
 	secrets, previousProblem, err := v.load(ctx)
 	if err != nil {
