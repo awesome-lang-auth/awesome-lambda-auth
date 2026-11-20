@@ -47,11 +47,7 @@ func TestRuntimeSettingsSeedReachesTheCore(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t, settingsEnv("AWESOME_AUTH_RUNTIME_SETTINGS_REQUIRE_2FA", "true"))
 
-	reg := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("settings@example.test"))
-	if reg.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d (body %s)", reg.StatusCode, reg.Body)
-	}
+	reg := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), "settings@example.test")
 	token, _ := decodeBody(t, reg)["accessToken"].(string)
 
 	resp := invoke(t, app, http.MethodPost, "/auth/2fa/disable", bearer(token), nil, "")
@@ -71,11 +67,7 @@ func TestNoRuntimeSettingsSeedLeavesTheRouteAlone(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t, settingsEnv())
 
-	reg := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("unseeded@example.test"))
-	if reg.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d (body %s)", reg.StatusCode, reg.Body)
-	}
+	reg := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), "unseeded@example.test")
 	token, _ := decodeBody(t, reg)["accessToken"].(string)
 
 	resp := invoke(t, app, http.MethodPost, "/auth/2fa/disable", bearer(token), nil, "")

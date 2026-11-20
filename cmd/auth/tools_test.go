@@ -293,10 +293,7 @@ func TestSessionPostureDoubleSubmit(t *testing.T) {
 	t.Parallel()
 
 	app := newToolsApp(t, toolsEnv(), nil)
-	reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
-	if reg.StatusCode != http.StatusCreated {
-		t.Fatalf("cookie-mode register = %d %s", reg.StatusCode, reg.Body)
-	}
+	reg := registerAndLogin(t, app, jsonHeaders(), testEmail)
 	jar := map[string]string{}
 	for _, c := range reg.Cookies {
 		name, rest, _ := strings.Cut(c, "=")
@@ -305,7 +302,7 @@ func TestSessionPostureDoubleSubmit(t *testing.T) {
 	}
 	access, csrf := jar[auth.AccessTokenCookieName], jar[auth.CSRFTokenCookieName]
 	if access == "" || csrf == "" {
-		t.Fatalf("register set no access-token or csrf-token cookie: %v", reg.Cookies)
+		t.Fatalf("login set no access-token or csrf-token cookie: %v", reg.Cookies)
 	}
 	accessCookie := auth.AccessTokenCookieName + "=" + access
 	csrfCookie := auth.CSRFTokenCookieName + "=" + csrf
@@ -490,11 +487,7 @@ func TestToolsAccessPostures(t *testing.T) {
 		// that is not it (core admin.go, authorise; admin.router.ts:197-199),
 		// so an ordinary user's access token gets that 403 and never 202. The
 		// refusal of a signed-in user a policy judges is the next subtest's.
-		reg := invoke(t, app, http.MethodPost, "/auth/register",
-			jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("tools-admin-posture@example.test"))
-		if reg.StatusCode != http.StatusCreated {
-			t.Fatalf("register = %d %s", reg.StatusCode, reg.Body)
-		}
+		reg := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), "tools-admin-posture@example.test")
 		token, _ := decodeBody(t, reg)["accessToken"].(string)
 		user := invoke(t, app, http.MethodPost, "/tools/track/anything", jsonHeaders("authorization", "Bearer "+token), nil, `{}`)
 		if user.StatusCode != http.StatusForbidden {
@@ -515,10 +508,7 @@ func TestToolsAccessPostures(t *testing.T) {
 		), bundle)
 
 		const email = "tools-admin-policy@example.test"
-		reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(email))
-		if reg.StatusCode != http.StatusCreated {
-			t.Fatalf("register = %d %s", reg.StatusCode, reg.Body)
-		}
+		reg := registerAndLogin(t, app, jsonHeaders(), email)
 		jar := map[string]string{}
 		for _, c := range reg.Cookies {
 			name, rest, _ := strings.Cut(c, "=")
@@ -527,7 +517,7 @@ func TestToolsAccessPostures(t *testing.T) {
 		}
 		access, csrf := jar[auth.AccessTokenCookieName], jar[auth.CSRFTokenCookieName]
 		if access == "" || csrf == "" {
-			t.Fatalf("a cookie registration set no access-token or csrf-token cookie, so this case proves nothing: %v", reg.Cookies)
+			t.Fatalf("a cookie login set no access-token or csrf-token cookie, so this case proves nothing: %v", reg.Cookies)
 		}
 		cookies := []string{auth.AccessTokenCookieName + "=" + access, auth.CSRFTokenCookieName + "=" + csrf}
 
@@ -1240,18 +1230,26 @@ func TestDynamoDBTelemetryRoundTrip(t *testing.T) {
 
 	creds := registerAndToken(t, app, testEmail)
 	bearer := jsonHeaders("authorization", "Bearer "+creds.accessToken)
+	logins := func() ([]any, string) {
+		t.Helper()
+		q := invoke(t, app, http.MethodGet, "/tools/telemetry?event="+auth.EventAuthLoginSuccess, bearer, nil, "")
+		if q.StatusCode != http.StatusOK {
+			t.Fatalf("telemetry = %d %s", q.StatusCode, q.Body)
+		}
+		data, _ := decodeBody(t, q)["data"].([]any)
+		return data, q.Body
+	}
+	// registerAndToken has logged in once already: register opens no session
+	// since awesome-go-auth v0.13.0 (#21). What is under test is that the login
+	// below adds exactly one row.
+	before, _ := logins()
 	login := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(), nil, registerBody(testEmail))
 	if login.StatusCode != http.StatusOK {
 		t.Fatalf("login = %d %s", login.StatusCode, login.Body)
 	}
-
-	q := invoke(t, app, http.MethodGet, "/tools/telemetry?event="+auth.EventAuthLoginSuccess, bearer, nil, "")
-	if q.StatusCode != http.StatusOK {
-		t.Fatalf("telemetry = %d %s", q.StatusCode, q.Body)
-	}
-	data, _ := decodeBody(t, q)["data"].([]any)
-	if len(data) != 1 {
-		t.Fatalf("telemetry holds %d row(s) for the login, want exactly one: %s", len(data), q.Body)
+	data, body := logins()
+	if len(data) != len(before)+1 {
+		t.Fatalf("telemetry holds %d row(s) after the login and %d before it, want exactly one more: %s", len(data), len(before), body)
 	}
 
 	// And a tracked event, which is the route writing rather than the bridge.
@@ -1262,7 +1260,7 @@ func TestDynamoDBTelemetryRoundTrip(t *testing.T) {
 			n.Add(1)
 		}
 	}
-	q = invoke(t, app, http.MethodGet, "/tools/telemetry?event=ddb.probe&limit=10", bearer, nil, "")
+	q := invoke(t, app, http.MethodGet, "/tools/telemetry?event=ddb.probe&limit=10", bearer, nil, "")
 	data, _ = decodeBody(t, q)["data"].([]any)
 	if int32(len(data)) != n.Load() || n.Load() != 3 {
 		t.Errorf("tracked %d events and the store holds %d", n.Load(), len(data))

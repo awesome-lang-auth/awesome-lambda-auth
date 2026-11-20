@@ -173,6 +173,26 @@ func registerBody(email string) string {
 	return fmt.Sprintf(`{"email":%q,"password":%q}`, email, testPassword)
 }
 
+// registerAndLogin registers email and then logs in with the same credentials,
+// both with headers, and returns the login's response. Since awesome-go-auth
+// v0.13.0 (#21) POST /register answers the reference's
+// 201 {"success":true,"userId":"…"} and opens no session, so a case that needs
+// one asks POST /login for it, as a client does. The login delivers the session
+// in the mode the headers choose: cookies, or top-level tokens under
+// X-Auth-Strategy: bearer.
+func registerAndLogin(t *testing.T, app *App, headers map[string]string, email string) events.APIGatewayV2HTTPResponse {
+	t.Helper()
+	reg := invoke(t, app, http.MethodPost, "/auth/register", headers, nil, registerBody(email))
+	if reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201 (body %s)", reg.StatusCode, reg.Body)
+	}
+	login := invoke(t, app, http.MethodPost, "/auth/login", headers, nil, loginBody(email, testPassword))
+	if login.StatusCode != http.StatusOK {
+		t.Fatalf("login after register status = %d, want 200 (body %s)", login.StatusCode, login.Body)
+	}
+	return login
+}
+
 // TestValidConfigServesBearerRoundTrip is the composition test: a valid
 // configuration must produce a handler that answers a real Lambda event with a
 // real auth response, all the way from event normalisation through the imported
@@ -181,27 +201,45 @@ func TestValidConfigServesBearerRoundTrip(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t, baseEnv())
 
-	resp := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(testEmail))
+	bearerHeaders := jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+	reg := invoke(t, app, http.MethodPost, "/auth/register", bearerHeaders, nil, registerBody(testEmail))
+	if reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d (body %s)", reg.StatusCode, http.StatusCreated, reg.Body)
+	}
+	// The reference's answer since awesome-go-auth v0.13.0 (#21): success and
+	// the new id, and no credential of any kind.
+	regBody := decodeBody(t, reg)
+	if regBody["success"] != true || regBody["userId"] == nil {
+		t.Errorf("register body = %s, want {success: true, userId}", reg.Body)
+	}
+	for _, issued := range []string{"accessToken", "refreshToken"} {
+		if _, present := regBody[issued]; present {
+			t.Errorf("register issued %q, but it opens no session by default: %s", issued, reg.Body)
+		}
+	}
+	if len(reg.Cookies) != 0 {
+		t.Errorf("bearer register set %d cookies, want 0: %v", len(reg.Cookies), reg.Cookies)
+	}
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want %d (body %s)", resp.StatusCode, http.StatusCreated, resp.Body)
+	resp := invoke(t, app, http.MethodPost, "/auth/login", bearerHeaders, nil, loginBody(testEmail, testPassword))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d, want 200 (body %s)", resp.StatusCode, resp.Body)
 	}
 	body := decodeBody(t, resp)
 	if body["success"] != true {
-		t.Errorf("register body success = %v, want true", body["success"])
+		t.Errorf("login body success = %v, want true", body["success"])
 	}
 	accessToken, _ := body["accessToken"].(string)
 	if accessToken == "" {
-		t.Fatalf("register returned no top-level accessToken for a bearer caller: %s", resp.Body)
+		t.Fatalf("login returned no top-level accessToken for a bearer caller: %s", resp.Body)
 	}
 	if body["refreshToken"] == nil {
-		t.Errorf("register returned no top-level refreshToken for a bearer caller")
+		t.Errorf("login returned no top-level refreshToken for a bearer caller")
 	}
 	// A bearer caller must get no cookies at all, or a browser would end up
 	// holding credentials the client never asked it to hold.
 	if len(resp.Cookies) != 0 {
-		t.Errorf("bearer register set %d cookies, want 0: %v", len(resp.Cookies), resp.Cookies)
+		t.Errorf("bearer login set %d cookies, want 0: %v", len(resp.Cookies), resp.Cookies)
 	}
 
 	me := invoke(t, app, http.MethodGet, "/auth/me",
@@ -231,9 +269,20 @@ func TestCookieDeliverySetsAuthCookies(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t, baseEnv())
 
-	resp := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want 201 (body %s)", resp.StatusCode, resp.Body)
+	// Register opens no session since awesome-go-auth v0.13.0 (#21), so it sets
+	// no auth cookie; the login is the response that carries all three.
+	reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(testEmail))
+	if reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201 (body %s)", reg.StatusCode, reg.Body)
+	}
+	for _, c := range reg.Cookies {
+		if name := strings.SplitN(c, "=", 2)[0]; name == auth.AccessTokenCookieName || name == auth.RefreshTokenCookieName {
+			t.Errorf("register set %q, but it opens no session by default: %v", name, reg.Cookies)
+		}
+	}
+	resp := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(), nil, loginBody(testEmail, testPassword))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d, want 200 (body %s)", resp.StatusCode, resp.Body)
 	}
 
 	got := map[string]bool{}
@@ -250,7 +299,7 @@ func TestCookieDeliverySetsAuthCookies(t *testing.T) {
 	body := decodeBody(t, resp)
 	for _, leaked := range []string{"accessToken", "refreshToken"} {
 		if _, present := body[leaked]; present {
-			t.Errorf("cookie-mode register put %q in the body: %s", leaked, resp.Body)
+			t.Errorf("cookie-mode login put %q in the body: %s", leaked, resp.Body)
 		}
 	}
 }

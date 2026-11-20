@@ -30,11 +30,7 @@ func TestTOTPSetupAdvertisesTheConfiguredIssuer(t *testing.T) {
 	const issuer = "Example Identity"
 	app := newTestApp(t, with(baseEnv(), "AWESOME_AUTH_2FA_APP_NAME", issuer))
 
-	reg := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("totp@example.test"))
-	if reg.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d (body %s)", reg.StatusCode, reg.Body)
-	}
+	reg := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), "totp@example.test")
 	token, _ := decodeBody(t, reg)["accessToken"].(string)
 
 	setup := invoke(t, app, http.MethodPost, "/auth/2fa/setup", bearer(token), nil, "")
@@ -74,8 +70,7 @@ func TestTOTPIssuerDefaultsToTheSchemaLiteral(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t, baseEnv())
-	reg := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("totp-default@example.test"))
+	reg := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), "totp-default@example.test")
 	token, _ := decodeBody(t, reg)["accessToken"].(string)
 
 	setup := invoke(t, app, http.MethodPost, "/auth/2fa/setup", bearer(token), nil, "")

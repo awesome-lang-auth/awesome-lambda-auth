@@ -24,32 +24,38 @@ func init() {
 		},
 
 		Case{
-			Name:  "register/auto-authenticates-tracked-as-upstream-21",
-			Doc:   "§3.7 — the reference issues no tokens and sets no cookies here, and the client calls POST /login next. This port does auto-authenticate; that is a known defect, not a deviation, tracked as nik2208/awesome-go-auth#21",
+			Name:  "register/issues-no-credentials",
+			Doc:   "§3.7 — the reference issues no tokens and sets no session cookie here, and the client calls POST /login next. The port answers the same since awesome-go-auth v0.13.0 (nik2208/awesome-go-auth#21), where it used to auto-authenticate",
 			Needs: []Capability{CapRegister},
 			Run: func(t *testing.T, e *Env) {
-				acct := randomAccount()
-				r := e.NewClient().POST(t, "/register", body{"email": acct.Email, "password": acct.Password})
-				r.mustStatusIn(t, 200, 201)
-
-				// This case asserts what the port DOES, not what it should, so
-				// the suite stays a signal for new breakage instead of carrying
-				// a permanent red that everyone learns to ignore. It is not an
-				// endorsement: the defect is security-relevant, because a
-				// registration that authenticates bypasses whatever
-				// email-verification gate the deployment configured, and it is
-				// why the run prints the warning below every time.
-				//
-				// When #21 lands this fails, which is the point: the reference
-				// behaviour arrives and this case must be restored to demanding
-				// it.
-				t.Logf("KNOWN DEFECT (upstream #21): POST /register auto-authenticates — it issues a session and sets cookies where the reference issues nothing. A registration therefore bypasses the email-verification gate.")
-
-				if len(r.setCookies()) == 0 {
-					t.Errorf("registration no longer sets cookies — upstream #21 appears fixed; restore this case to asserting the reference behaviour (no credentials issued)\n  %s", r.where())
-				}
-				if !r.hasKey(t, "userId") {
-					t.Errorf("registration response has no userId; the body shape is right even where the credentials are not\n  %s", r.where())
+				// Both delivery modes: a session in either would let a
+				// registration bypass whatever email-verification gate the
+				// deployment configured, which is why this used to be tracked as
+				// a known defect and is now demanded.
+				for _, mode := range []struct {
+					name string
+					opts []reqOpt
+				}{
+					{"cookie", nil},
+					{"bearer", []reqOpt{BearerStrategy()}},
+				} {
+					acct := randomAccount()
+					r := e.NewClient().POST(t, "/register", body{"email": acct.Email, "password": acct.Password}, mode.opts...)
+					r.mustStatusIn(t, 200, 201)
+					m := r.obj(t)
+					if id, _ := m["userId"].(string); id == "" {
+						t.Errorf("%s registration: want a non-empty userId, got %v\n  %s", mode.name, m["userId"], r.where())
+					}
+					for _, credential := range []string{"accessToken", "refreshToken"} {
+						if c := r.cookie(credential); c != nil {
+							t.Errorf("%s registration set the %s cookie (%s); the reference issues no session on POST /register\n  %s",
+								mode.name, credential, c.Name, r.where())
+						}
+						if _, ok := m[credential]; ok {
+							t.Errorf("%s registration put %q in the body; the reference issues no session on POST /register\n  %s",
+								mode.name, credential, r.where())
+						}
+					}
 				}
 			},
 		},

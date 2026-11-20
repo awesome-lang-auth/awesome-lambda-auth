@@ -361,14 +361,10 @@ func s256(verifier string) string {
 // arrange the "an account already holds this address" situations.
 func registerAccount(t *testing.T, app *App, email string) string {
 	t.Helper()
-	resp := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(email))
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want 201 (body %s)", resp.StatusCode, resp.Body)
-	}
+	resp := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), email)
 	token, _ := decodeBody(t, resp)["accessToken"].(string)
 	if token == "" {
-		t.Fatalf("register returned no access token: %s", resp.Body)
+		t.Fatalf("login returned no access token: %s", resp.Body)
 	}
 	me := invoke(t, app, http.MethodGet, "/auth/me", bearer(token), nil, "")
 	id, _ := decodeBody(t, me)["id"].(string)

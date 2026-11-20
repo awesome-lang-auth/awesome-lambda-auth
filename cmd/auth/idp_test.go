@@ -422,7 +422,8 @@ func TestDiscoveryDocumentShape(t *testing.T) {
 		"response_types_supported":              "code",
 		"subject_types_supported":               "public",
 		"id_token_signing_alg_values_supported": "RS256",
-		"token_endpoint_auth_methods_supported": "client_secret_post",
+		"token_endpoint_auth_methods_supported": "client_secret_basic",
+		"code_challenge_methods_supported":      "S256",
 	} {
 		list, ok := doc[key].([]any)
 		if !ok || len(list) == 0 {
@@ -432,6 +433,11 @@ func TestDiscoveryDocumentShape(t *testing.T) {
 		if list[0] != want {
 			t.Errorf("%s[0] = %v, want %q", key, list[0], want)
 		}
+	}
+	// Since awesome-go-auth v0.13.0 (#97) the token endpoint accepts both
+	// RFC 6749 §2.3.1 methods, and advertises both.
+	if methods, _ := doc["token_endpoint_auth_methods_supported"].([]any); len(methods) != 2 || methods[1] != "client_secret_post" {
+		t.Errorf("token_endpoint_auth_methods_supported = %v, want [client_secret_basic client_secret_post]", methods)
 	}
 	// The issuer is where the discovery document is served from, which is what
 	// makes it usable: <issuer>/.well-known/openid-configuration must be this
@@ -659,11 +665,14 @@ func TestAuthorizationCodeFlowEndToEnd(t *testing.T) {
 		t.Fatalf("no code in %q", location)
 	}
 
-	// /token: client_secret_post, the only method the discovery document
-	// advertises.
+	// /token: client_secret_post, one of the two methods the discovery
+	// document advertises. redirect_uri is required and must be the
+	// authorization request's (RFC 6749 §4.1.3), which the core enforces since
+	// awesome-go-auth v0.13.0 (#97).
 	exchange := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
+		"redirect_uri":  {redirect},
 		"client_id":     {"console"},
 		"client_secret": {"console-client-secret"},
 	}
@@ -748,16 +757,13 @@ func TestSessionTokensStayHS256InIdPMode(t *testing.T) {
 	const email = "hs256@example.test"
 	bearer := jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
 
-	reg := invoke(t, app, http.MethodPost, "/auth/register", bearer, nil, registerBody(email))
-	if reg.StatusCode != http.StatusCreated {
-		t.Fatalf("register = %d (%s)", reg.StatusCode, reg.Body)
-	}
+	reg := registerAndLogin(t, app, bearer, email)
 	body := decodeBody(t, reg)
 
 	for _, name := range []string{"accessToken", "refreshToken"} {
 		token, _ := body[name].(string)
 		if token == "" {
-			t.Fatalf("register returned no %s", name)
+			t.Fatalf("login returned no %s", name)
 		}
 		header, _, _, _ := jwtParts(t, token)
 		if header["alg"] != "HS256" {

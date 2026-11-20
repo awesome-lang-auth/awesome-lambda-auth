@@ -190,18 +190,14 @@ func newDeliveryAppWith(t *testing.T, env map[string]string, adjust func(*Option
 	return d
 }
 
-// register creates a user and returns its bearer access token, for the two
-// authenticated delivery routes.
+// register creates a user, logs it in, and returns its bearer access token,
+// for the two authenticated delivery routes.
 func (d *deliveryApp) register(t *testing.T, email string) string {
 	t.Helper()
-	resp := invoke(t, d.app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(email))
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want 201 (body %s)", resp.StatusCode, resp.Body)
-	}
+	resp := registerAndLogin(t, d.app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), email)
 	token, _ := decodeBody(t, resp)["accessToken"].(string)
 	if token == "" {
-		t.Fatalf("register returned no access token: %s", resp.Body)
+		t.Fatalf("login returned no access token: %s", resp.Body)
 	}
 	return token
 }
@@ -1112,9 +1108,12 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 			t.Fatalf("no code in %q, so this test proves nothing", location)
 		}
 
+		// redirect_uri is required at /token since awesome-go-auth v0.13.0
+		// (RFC 6749 §4.1.3).
 		exchange := url.Values{
 			"grant_type":    {"authorization_code"},
 			"code":          {code},
+			"redirect_uri":  {redirect},
 			"client_id":     {"console"},
 			"client_secret": {testIDPClientSecret},
 		}
