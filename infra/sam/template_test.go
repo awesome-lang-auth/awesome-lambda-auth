@@ -1043,6 +1043,10 @@ func TestTheSseFunctionIsASubsetOfTheAuthFunction(t *testing.T) {
 		"AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER", "AWESOME_AUTH_SESSIONS_CHECK_ON",
 		"AWESOME_AUTH_TOOLS_AUTH", "AWESOME_AUTH_TOOLS_BASE_PATH", "AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE",
 		"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", "AWESOME_AUTH_HTTP_API_PREFIX", "AWESOME_AUTH_CONFIG_FILE",
+		// The Function URL is a second front door onto the same composition;
+		// without the origin check's secret it would answer what the
+		// execute-api URL refuses.
+		"AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN",
 	} {
 		if _, ok := sseEnv[name]; !ok {
 			t.Errorf("SseFunction does not set %s, which the stream path reads", name)
