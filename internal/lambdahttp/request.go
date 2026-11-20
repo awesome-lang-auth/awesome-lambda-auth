@@ -234,6 +234,105 @@ func EventFrom(ctx context.Context) any {
 	return ctx.Value(eventKey{})
 }
 
+// WithoutEventHeader returns ctx with the event EventFrom reports replaced by a
+// copy that no longer carries the header name, compared case-insensitively, in
+// Headers or in MultiValueHeaders. The original event is not modified; ctx is
+// returned as it is when it carries no event, or one of a type this package
+// does not produce.
+//
+// A middleware that strips a header from the request it hands on — a secret
+// the front door sends, for example — calls it too, so that a handler reading
+// the raw event cannot find there what the request no longer carries.
+func WithoutEventHeader(ctx context.Context, name string) context.Context {
+	event := EventFrom(ctx)
+	if event == nil {
+		return ctx
+	}
+	var scrubbed any
+	switch e := event.(type) {
+	case events.APIGatewayV2HTTPRequest:
+		e.Headers = withoutHeader(e.Headers, name)
+		scrubbed = e
+	case *events.APIGatewayV2HTTPRequest:
+		c := *e
+		c.Headers = withoutHeader(c.Headers, name)
+		scrubbed = &c
+	case events.APIGatewayProxyRequest:
+		e.Headers = withoutHeader(e.Headers, name)
+		e.MultiValueHeaders = withoutMultiHeader(e.MultiValueHeaders, name)
+		scrubbed = e
+	case *events.APIGatewayProxyRequest:
+		c := *e
+		c.Headers = withoutHeader(c.Headers, name)
+		c.MultiValueHeaders = withoutMultiHeader(c.MultiValueHeaders, name)
+		scrubbed = &c
+	case events.LambdaFunctionURLRequest:
+		e.Headers = withoutHeader(e.Headers, name)
+		scrubbed = e
+	case *events.LambdaFunctionURLRequest:
+		c := *e
+		c.Headers = withoutHeader(c.Headers, name)
+		scrubbed = &c
+	case events.ALBTargetGroupRequest:
+		e.Headers = withoutHeader(e.Headers, name)
+		e.MultiValueHeaders = withoutMultiHeader(e.MultiValueHeaders, name)
+		scrubbed = e
+	case *events.ALBTargetGroupRequest:
+		c := *e
+		c.Headers = withoutHeader(c.Headers, name)
+		c.MultiValueHeaders = withoutMultiHeader(c.MultiValueHeaders, name)
+		scrubbed = &c
+	default:
+		return ctx
+	}
+	return context.WithValue(ctx, eventKey{}, scrubbed)
+}
+
+// withoutHeader returns a copy of headers without name, compared
+// case-insensitively; headers itself is left alone, since the event that owns
+// it may still be read elsewhere. A map without the header is returned as it
+// is.
+func withoutHeader(headers map[string]string, name string) map[string]string {
+	found := false
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return headers
+	}
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if !strings.EqualFold(k, name) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// withoutMultiHeader is withoutHeader for a multi-value header map.
+func withoutMultiHeader(headers map[string][]string, name string) map[string][]string {
+	found := false
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return headers
+	}
+	out := make(map[string][]string, len(headers))
+	for k, v := range headers {
+		if !strings.EqualFold(k, name) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // decodeBody returns the raw request body bytes, base64-decoding when the event
 // says the body is encoded.
 func decodeBody(body string, isBase64Encoded bool) ([]byte, error) {

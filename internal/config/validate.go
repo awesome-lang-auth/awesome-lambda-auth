@@ -811,13 +811,19 @@ var originVerifySecretARN = regexp.MustCompile(`^arn:[a-z0-9-]+:secretsmanager:[
 // these would take Authorization from every bearer client, the Origin from
 // every redirect check or the client address from the rate limiter — and
 // would make the front door's secret the value a route reads as a token.
-// Compared in canonical form.
+// The second group are headers a proxy or the platform sets, which a request
+// handler, a log line or the language negotiation may read: stripping one
+// would only degrade what they do, but a secret in one of them is a secret
+// something else reads too. Compared in canonical form.
 var originVerifyReservedHeaders = map[string]struct{}{
 	"Accept": {}, "Authorization": {}, "Connection": {}, "Content-Length": {},
 	"Content-Type": {}, "Cookie": {}, "Host": {}, "Last-Event-Id": {},
 	"Origin": {}, "Referer": {}, "Transfer-Encoding": {}, "User-Agent": {},
 	"X-Api-Key": {}, "X-Auth-Strategy": {}, "X-Correlation-Id": {},
 	"X-Csrf-Token": {}, "X-Forwarded-For": {}, "X-Forwarded-Proto": {},
+
+	"Accept-Language": {}, "Forwarded": {}, "X-Amzn-Trace-Id": {},
+	"X-Forwarded-Host": {}, "X-Forwarded-Port": {}, "X-Real-Ip": {},
 }
 
 // validateOriginVerify checks http.originVerify.*.

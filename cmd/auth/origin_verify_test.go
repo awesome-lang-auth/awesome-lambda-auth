@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
 	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
+	"github.com/nik2208/awesome-lambda-auth/internal/lambdahttp"
 	ddbstore "github.com/nik2208/awesome-lambda-auth/internal/store/dynamodb"
 )
 
@@ -631,3 +634,161 @@ func TestNoOriginSecretReachesTheLog(t *testing.T) {
 		t.Errorf("%s is not on the static deny-list", config.DefaultOriginVerifyHeader)
 	}
 }
+
+// TestOriginVerifyStripsTheHeaderFromTheEvent: the raw Lambda event the
+// request carries on its context — what lambdahttp.EventFrom hands a handler
+// that type-switches on it — no longer holds the header behind the check
+// either, in any letter case, and the event the caller passed in is left as
+// it was.
+func TestOriginVerifyStripsTheHeaderFromTheEvent(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(originEnv())})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	v, err := newOriginVerifier(context.Background(), cfg, newFakeOriginSecret(testOriginCurrent, "").read, discardLogger())
+	if err != nil {
+		t.Fatalf("newOriginVerifier: %v", err)
+	}
+	event := events.APIGatewayV2HTTPRequest{
+		Version:        "2.0",
+		RawPath:        "/auth/me",
+		Headers:        map[string]string{"x-origin-verify": testOriginCurrent, "x-kept": "yes"},
+		RequestContext: events.APIGatewayV2HTTPRequestContext{HTTP: events.APIGatewayV2HTTPRequestContextHTTPDescription{Method: http.MethodGet, Path: "/auth/me"}},
+	}
+	req, err := lambdahttp.NewRequest(context.Background(), event, lambdahttp.Options{})
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	var seen any
+	probe := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = lambdahttp.EventFrom(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	})
+	rec := httptest.NewRecorder()
+	v.gate(probe).ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want the probe's 204", rec.Code)
+	}
+	got, ok := seen.(events.APIGatewayV2HTTPRequest)
+	if !ok {
+		t.Fatalf("the handler saw event %T, want the v2 request", seen)
+	}
+	for k, value := range got.Headers {
+		if strings.EqualFold(k, config.DefaultOriginVerifyHeader) || value == testOriginCurrent {
+			t.Errorf("the event behind the check still carries %s", k)
+		}
+	}
+	if got.Headers["x-kept"] != "yes" {
+		t.Error("the event lost a header the check does not own")
+	}
+	if event.Headers["x-origin-verify"] != testOriginCurrent {
+		t.Error("the caller's event was modified; the check must replace it with a copy")
+	}
+
+	// The REST, Function URL and ALB shapes, multi-value maps included.
+	ctx := context.Background()
+	for name, ev := range map[string]any{
+		"rest":         events.APIGatewayProxyRequest{Headers: map[string]string{"X-Origin-Verify": "s"}, MultiValueHeaders: map[string][]string{"x-origin-verify": {"s"}}},
+		"function url": &events.LambdaFunctionURLRequest{Headers: map[string]string{"x-origin-verify": "s"}},
+		"alb":          events.ALBTargetGroupRequest{MultiValueHeaders: map[string][]string{"X-ORIGIN-VERIFY": {"s"}}},
+	} {
+		scrubbed := lambdahttp.EventFrom(lambdahttp.WithoutEventHeader(contextWithEvent(t, ctx, ev), config.DefaultOriginVerifyHeader))
+		if strings.Contains(strings.ToLower(fmt.Sprintf("%+v", scrubbed)), "x-origin-verify") {
+			t.Errorf("%s: the scrubbed event still carries the header: %+v", name, scrubbed)
+		}
+	}
+}
+
+// contextWithEvent puts ev on ctx the way the event adapter does, by building
+// the request from it.
+func contextWithEvent(t *testing.T, ctx context.Context, ev any) context.Context {
+	t.Helper()
+	switch e := ev.(type) {
+	case events.APIGatewayProxyRequest:
+		e.HTTPMethod, e.Path = http.MethodGet, "/"
+		ev = e
+	case *events.LambdaFunctionURLRequest:
+		e.RawPath, e.RequestContext.HTTP.Method = "/", http.MethodGet
+	case events.ALBTargetGroupRequest:
+		e.HTTPMethod, e.Path = http.MethodGet, "/"
+		ev = e
+	}
+	req, err := lambdahttp.NewRequest(ctx, ev, lambdahttp.Options{})
+	if err != nil {
+		t.Fatalf("NewRequest(%T): %v", ev, err)
+	}
+	return req.Context()
+}
+
+// TestOriginVerifyEscalatesRepeatedRefreshFailures: a failed refresh is a
+// WARN, and from the originSecretFailuresBeforeError-th in a row an ERROR with
+// the count — the line an operator alarms on, since a value a rotation retired
+// stays accepted for as long as refreshes fail. A successful read resets it.
+func TestOriginVerifyEscalatesRepeatedRefreshFailures(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(originEnv())})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	log := newLogger(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}), slog.LevelDebug)
+	clock := &originClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+	secret := newFakeOriginSecret(testOriginCurrent, "")
+	v, err := newOriginVerifierAt(context.Background(), cfg, secret.read, log, clock.now)
+	if err != nil {
+		t.Fatalf("newOriginVerifier: %v", err)
+	}
+	gate := v.gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	hit := func() {
+		req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
+		req.Header.Set(config.DefaultOriginVerifyHeader, testOriginCurrent)
+		gate.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	levels := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []string
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			var rec map[string]any
+			if json.Unmarshal([]byte(line), &rec) != nil || !strings.Contains(fmt.Sprint(rec["msg"]), "could not be re-read") {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%v/%v", rec["level"], rec["consecutiveFailures"]))
+		}
+		buf.Reset()
+		return out
+	}
+	levels() // the cold start's lines
+
+	secret.set("", "", errors.New("AccessDeniedException: not authorized"))
+	clock.advance(originSecretRefreshInterval)
+	for i := 0; i < originSecretFailuresBeforeError+1; i++ {
+		hit()
+		clock.advance(originSecretRetryInterval)
+	}
+	want := []string{"WARN/1", "WARN/2", "ERROR/3", "ERROR/4"}
+	if got := levels(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("refresh failure lines = %v, want %v", got, want)
+	}
+
+	// A successful read resets the count: the next failure is a WARN again.
+	secret.set(testOriginCurrent, "", nil)
+	hit()
+	clock.advance(originSecretRefreshInterval)
+	secret.set("", "", errors.New("ThrottlingException"))
+	hit()
+	if got := levels(); strings.Join(got, ",") != "WARN/1" {
+		t.Fatalf("after a recovery, refresh failure lines = %v, want [WARN/1]", got)
+	}
+}
+
+// writerFunc adapts a function to io.Writer.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

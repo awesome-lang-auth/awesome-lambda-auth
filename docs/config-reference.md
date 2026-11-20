@@ -3051,13 +3051,20 @@ cannot do. What is refused at start:
   nothing is the misconfiguration an operator cannot see from outside.
 - A `secretArn` that is not a Secrets Manager secret ARN. An ARN and not a
   name, because the template scopes the role's read to it, and because the
-  secret is read in the region the ARN names.
+  secret is read in the region the ARN names. Give the **full** ARN, with the
+  six-character suffix Secrets Manager appends to the name (`…:secret:name-AbCdEf`):
+  a partial ARN passes this check, but the role's statement names it verbatim,
+  so IAM denies the read and the cold start refuses — closed, but with an
+  `AccessDenied` rather than this message.
 - A `header` that is not a valid header name, or that names a header the auth
   surface reads — `Authorization`, `Cookie`, `Origin`, `Referer`,
   `Content-Type`, `X-CSRF-Token`, `X-Api-Key`, `X-Auth-Strategy`,
   `X-Correlation-Id`, `X-Forwarded-For`, `X-Forwarded-Proto`, `Last-Event-ID`,
-  `Accept`, `User-Agent`, and the framing headers. The check removes its header
-  from every request, so naming one of those would take it from every route.
+  `Accept`, `User-Agent`, and the framing headers — and the headers a proxy or
+  the platform sets, which a handler, a log line or the language negotiation
+  may read: `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Port`, `X-Real-IP`,
+  `X-Amzn-Trace-Id` and `Accept-Language`. The check removes its header from
+  every request, so naming one of those would take it from every route.
 - A secret whose `AWSCURRENT` value cannot be read, or is not usable: shorter
   than 32 characters once trimmed (RS-1's floor), or holding anything outside
   visible ASCII. The cold start fails with the knob's path and the reason,
@@ -3153,7 +3160,13 @@ and no redeploy:
 the leaked value is the secret's `AWSPREVIOUS` and is still accepted. Once the
 front door sends the new value everywhere, rotate again: the leaked value then
 holds neither label, and every environment stops accepting it within five
-minutes.
+minutes **of its next successful read**. That condition matters: an environment
+whose refreshes fail keeps accepting what it read last, the leaked value
+included, for as long as they fail. During an incident, keep the execution
+role's `secretsmanager:GetSecretValue` (and the KMS key's decrypt) on the
+secret, rotate to a value that passes the refusals above, and watch for the
+`ERROR` below; if in doubt, publish a new version of the functions, which
+starts every environment cold.
 
 `AWSPENDING` is never accepted. A rotation function that moves the front door
 must do it after its `finishSecret` step, not in `setSecret`, or the front door
@@ -3164,7 +3177,11 @@ keeps the values already read in force, writes a warning, and tries again
 after 30 seconds rather than on every request. It never widens what is
 accepted, and never empties it. A rotation to a value that is not usable
 (§19, the refusals above) is a failed refresh too: the warning names the
-reason and the old values stay.
+reason and the old values stay. From the third failure in a row — a minute and
+a half of retries — the line is logged at `ERROR` instead, with
+`consecutiveFailures`, so an alarm on it (a CloudWatch metric filter on
+`"level":"ERROR"` and `origin verification`) fires while a rotation is still
+waiting on it; the next successful read resets the count.
 
 ### 19.4 What it costs
 

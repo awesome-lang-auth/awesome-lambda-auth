@@ -20,11 +20,19 @@ under [Unreleased].
   every route; `GET /healthz` is checked too unless
   `http.originVerify.exemptHealthz` is `true`. The value is compared as a
   SHA-256 digest in constant time, the header is removed before the routes
-  see the request, and its name is on the logging deny-list. The secret is
-  read at cold start — a missing, unreadable or unusable value (shorter than
-  32 characters, or outside visible ASCII) refuses to start — and re-read
-  every five minutes, so a rotation needs no redeploy; a failed re-read keeps
-  the values already read. Variables
+  see the request — from its headers and from the raw Lambda event the
+  request carries for handlers (`lambdahttp.EventFrom`, via the new
+  `lambdahttp.WithoutEventHeader`) — and its name is on the logging
+  deny-list. The secret is read at cold start — a missing, unreadable or
+  unusable value (shorter than 32 characters, or outside visible ASCII)
+  refuses to start — and re-read every five minutes, so a rotation needs no
+  redeploy; a failed re-read keeps the values already read, which means a
+  value the last rotation retired stays accepted while re-reads fail: each
+  failure is a WARN, and from the third in a row an ERROR with
+  `consecutiveFailures` to alarm on (§19.3). The header may not name one the
+  auth surface, a proxy or the platform sets (`Authorization`, `Cookie`,
+  `X-Forwarded-For`, `Forwarded`, `X-Amzn-Trace-Id`, `Accept-Language` and
+  others). Variables
   `AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN`, `..._HEADER` and
   `..._EXEMPT_HEALTHZ`; SAM parameters `OriginVerifySecretArn`,
   `OriginVerifyHeader` and `OriginVerifyExemptHealthz`, with a scoped

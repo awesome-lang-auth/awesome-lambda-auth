@@ -15,6 +15,7 @@ import (
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
 	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
+	"github.com/nik2208/awesome-lambda-auth/internal/lambdahttp"
 )
 
 // Origin verification: only the front door may call the origin
@@ -90,14 +91,20 @@ import (
 // A failed refresh keeps the values already held and tries again after
 // originSecretRetryInterval. It never widens what is accepted: a secret the
 // role can no longer read leaves the last values it read in force, and never
-// none.
+// none. The flip side is that a rotation is only as good as the next
+// successful read: while refreshes fail, a value the last rotation retired is
+// still accepted. Each failure is a WARN, and from the
+// originSecretFailuresBeforeError-th in a row an ERROR an operator can alarm
+// on (§19.3).
 //
 // ── after the check ──────────────────────────────────────────────────────────
 //
-// The header is removed from the request before anything else sees it, so no
-// route, guard, script runner or log line downstream can read the front
-// door's secret — and its name is on the logging deny-list (logging.go, and
-// withRedactedKeys below for a name of the operator's choosing).
+// The header is removed from the request before anything else sees it — from
+// the request's headers, and from the raw Lambda event the request carries on
+// its context (lambdahttp.EventFrom) — so no route, guard, script runner or
+// log line downstream can read the front door's secret; and its name is on the
+// logging deny-list (logging.go, and withRedactedKeys below for a name of the
+// operator's choosing).
 
 // originSecretRefreshInterval is how long a read of the secret is trusted
 // before the next request re-reads it. Five minutes is the AWS Parameters and
@@ -110,6 +117,13 @@ const originSecretRefreshInterval = 5 * time.Minute
 // role that lost its permission costs two reads a minute and not two per
 // request.
 const originSecretRetryInterval = 30 * time.Second
+
+// originSecretFailuresBeforeError is how many refreshes in a row may fail
+// before the failure is logged at ERROR rather than WARN. Three is a minute and
+// a half of retries: past a throttle or a blip, and well inside the five
+// minutes a rotation waits before the front door switches, so an alarm on the
+// ERROR fires while a refresh that never comes still matters.
+const originSecretFailuresBeforeError = 3
 
 // originSecretMinLength is the floor on the secret's length, the one RS-1 sets
 // for the signing secrets. The value is a password presented on every request
@@ -136,6 +150,9 @@ type originVerifier struct {
 	// one in progress uses the values already held rather than waiting.
 	secrets    atomic.Pointer[originSecrets]
 	refreshing sync.Mutex
+	// failures counts the refreshes that have failed in a row since the last
+	// one that succeeded. Only the request holding refreshing touches it.
+	failures int
 }
 
 // originSecrets is one read of the secret, as digests.
@@ -270,12 +287,20 @@ func (v *originVerifier) inForce(ctx context.Context) *originSecrets {
 		kept := *held
 		kept.refreshAt = v.now().Add(originSecretRetryInterval)
 		v.secrets.Store(&kept)
-		loggerFrom(ctx, v.log).Warn("origin verification: the secret could not be re-read; the values read before stay in force",
+		v.failures++
+		level := slog.LevelWarn
+		if v.failures >= originSecretFailuresBeforeError {
+			level = slog.LevelError
+		}
+		loggerFrom(ctx, v.log).Log(ctx, level, "origin verification: the secret could not be re-read; the values read before stay in force",
 			slog.String("path", "http.originVerify.secretArn"),
 			slog.String("error", err.Error()),
+			slog.Int("consecutiveFailures", v.failures),
+			slog.String("effect", "a value a rotation has retired since the last successful read is still accepted"),
 			slog.String("retryIn", originSecretRetryInterval.String()))
 		return &kept
 	}
+	v.failures = 0
 	if previousProblem != "" {
 		loggerFrom(ctx, v.log).Warn("origin verification: the secret's previous value is not accepted",
 			slog.String("path", "http.originVerify.secretArn"),
@@ -346,14 +371,18 @@ func (v *originVerifier) gate(next http.Handler) http.Handler {
 	})
 }
 
-// strip removes the header from a copy of the request. A copy, because the
-// request belongs to the caller — the event adapter builds a fresh one per
-// invocation, but a host embedding App.Handler need not.
+// strip removes the header from a copy of the request, and from the raw Lambda
+// event the request carries on its context (lambdahttp.EventFrom), which a
+// handler may read: what the chain behind the check can see, the secret is in
+// neither. A copy, because the request belongs to the caller — the event
+// adapter builds a fresh one per invocation, but a host embedding App.Handler
+// need not — and the event is replaced, not edited, for the same reason.
 func (v *originVerifier) strip(r *http.Request) *http.Request {
-	if _, present := r.Header[v.header]; !present {
+	ctx := lambdahttp.WithoutEventHeader(r.Context(), v.header)
+	if _, present := r.Header[v.header]; !present && ctx == r.Context() {
 		return r
 	}
-	clone := r.Clone(r.Context())
+	clone := r.Clone(ctx)
 	clone.Header.Del(v.header)
 	return clone
 }

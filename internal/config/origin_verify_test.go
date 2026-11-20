@@ -133,6 +133,21 @@ func TestOriginVerifyRefusesWhatWouldCheckNothing(t *testing.T) {
 			env:  map[string]string{"AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN": testOriginVerifyARN, "AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER": "X-Forwarded-For"},
 			path: "http.originVerify.header", want: "a header the auth surface reads",
 		},
+		{
+			name: "a header the platform sets",
+			doc:  map[string]any{"http.originVerify.secretArn": testOriginVerifyARN, "http.originVerify.header": "x-amzn-trace-id"},
+			path: "http.originVerify.header", want: "a header the auth surface reads",
+		},
+		{
+			name: "a header a proxy sets",
+			doc:  map[string]any{"http.originVerify.secretArn": testOriginVerifyARN, "http.originVerify.header": "Forwarded"},
+			path: "http.originVerify.header", want: "a header the auth surface reads",
+		},
+		{
+			name: "the language the mail templates negotiate on",
+			doc:  map[string]any{"http.originVerify.secretArn": testOriginVerifyARN, "http.originVerify.header": "Accept-Language"},
+			path: "http.originVerify.header", want: "a header the auth surface reads",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc := baseDoc()
