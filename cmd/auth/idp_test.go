@@ -624,6 +624,76 @@ func TestAJWKSPathThatCollidesIsRefusedNotPanicked(t *testing.T) {
 //
 // It also pins decision D-3 where it is observable: the access_token in that
 // same response is the HS256 session token, not an RS256 one.
+// TestIdPServesNoRefreshTokenGrant pins DisableRefreshTokenGrant (idp.go): the
+// core's refresh_token grant would keep its tokens in process memory here, so a
+// code granted offline_access gets no refresh token, the grant itself is
+// unsupported, and discovery advertises neither.
+func TestIdPServesNoRefreshTokenGrant(t *testing.T) {
+	t.Parallel()
+	f := newFakeKeyring(t, "current")
+	app := newIDPApp(t, f, idpEnv(
+		ConfigJSONEnv, clientDocument("console", "https://console.example.test/callback"),
+		"AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET", "console-client-secret",
+	))
+
+	doc := discovery(t, app)
+	for key, absent := range map[string]string{"grant_types_supported": "refresh_token", "scopes_supported": "offline_access"} {
+		list, _ := doc[key].([]any)
+		for _, v := range list {
+			if v == absent {
+				t.Errorf("discovery %s advertises %q, but the grant is off: %v", key, absent, list)
+			}
+		}
+	}
+
+	const (
+		email    = "oidc-offline@example.test"
+		redirect = "https://console.example.test/callback"
+	)
+	if reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(email)); reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register = %d (%s)", reg.StatusCode, reg.Body)
+	}
+	form := url.Values{"email": {email}, "password": {testPassword}}
+	authorize := invoke(t, app, http.MethodPost,
+		"/auth/authorize?client_id=console&redirect_uri="+url.QueryEscape(redirect)+"&state=xyz&nonce=n-1&scope="+url.QueryEscape("openid offline_access"),
+		map[string]string{"content-type": "application/x-www-form-urlencoded"}, nil, form.Encode())
+	if authorize.StatusCode != http.StatusFound {
+		t.Fatalf("authorize = %d, want 302 (body %s)", authorize.StatusCode, authorize.Body)
+	}
+	location, err := url.Parse(authorize.Headers["Location"])
+	if err != nil {
+		t.Fatalf("Location is not a URL: %v", err)
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in %q", location)
+	}
+	formHeaders := map[string]string{"content-type": "application/x-www-form-urlencoded"}
+	tokenResp := invoke(t, app, http.MethodPost, "/auth/token", formHeaders, nil, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {redirect},
+		"client_id":     {"console"},
+		"client_secret": {"console-client-secret"},
+	}.Encode())
+	if tokenResp.StatusCode != http.StatusOK {
+		t.Fatalf("token = %d, want 200 (body %s)", tokenResp.StatusCode, tokenResp.Body)
+	}
+	if _, issued := decodeBody(t, tokenResp)["refresh_token"]; issued {
+		t.Fatalf("a code granted offline_access got a refresh_token, which would live in one execution environment's memory: %s", tokenResp.Body)
+	}
+
+	refresh := invoke(t, app, http.MethodPost, "/auth/token", formHeaders, nil, url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {"anything"},
+		"client_id":     {"console"},
+		"client_secret": {"console-client-secret"},
+	}.Encode())
+	if refresh.StatusCode != http.StatusBadRequest || decodeBody(t, refresh)["error"] != "unsupported_grant_type" {
+		t.Fatalf("grant_type=refresh_token = %d %s, want 400 unsupported_grant_type", refresh.StatusCode, refresh.Body)
+	}
+}
+
 func TestAuthorizationCodeFlowEndToEnd(t *testing.T) {
 	t.Parallel()
 	f := newFakeKeyring(t, "current")

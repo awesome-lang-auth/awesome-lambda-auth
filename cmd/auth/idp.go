@@ -168,6 +168,16 @@ func idpOptions(ctx context.Context, cfg *config.Config, users auth.UserStore, n
 		JWKSPath:        cfg.IDProvider.JWKSPath,
 		JWKSCORSOrigins: jwksCORSOrigins(cfg),
 		Codes:           codes,
+		// The core's refresh_token grant (awesome-go-auth v0.13.0, #14) keeps its
+		// rotating tokens in IDPConfig.RefreshTokens, and with none it serves them
+		// from process memory: on Lambda a token minted by one execution
+		// environment is invalid_grant on the next, and every cold start forgets
+		// them all. Until this product has a DynamoDB IDPRefreshTokenStore the
+		// grant is off, which is the switch the core documents for exactly this
+		// case: /token issues no refresh token whatever scope a code was granted,
+		// answers grant_type=refresh_token with unsupported_grant_type, and the
+		// discovery document advertises neither the grant nor offline_access.
+		DisableRefreshTokenGrant: true,
 		// The JWKS document is served by the adapter at <prefix><jwksPath>, and
 		// the discovery document has to point at the same place. The core
 		// derives exactly that from Issuer + JWKSPath when this is empty, and
