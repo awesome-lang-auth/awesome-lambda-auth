@@ -835,7 +835,50 @@ func storeFields(e *StoreEnable) []struct {
 type HTTP struct {
 	APIPrefix string `json:"apiPrefix"`
 	CORS      CORS   `json:"cors"`
+
+	// OriginVerify is the front-door check: with a secretArn set, a request
+	// that does not carry the header holding the secret's value is answered a
+	// bare 403 before any route. [new] — the reference is a library inside
+	// somebody else's server and has no front door to tell from a back one;
+	// this product is reached through public execute-api and Function URL
+	// hosts that a CloudFront distribution or a WAF in front of them does not
+	// make private. cmd/auth/origin_verify.go.
+	OriginVerify OriginVerify `json:"originVerify"`
 }
+
+// DefaultOriginVerifyHeader is the header http.originVerify.header defaults to:
+// the name AWS's own CloudFront origin-verification pattern uses for the
+// custom header the distribution adds to every origin request.
+const DefaultOriginVerifyHeader = "X-Origin-Verify"
+
+// OriginVerify covers http.originVerify.*.
+//
+// The block is off until secretArn names a secret, and that is the only switch:
+// a header or an exemption set without it is refused (validateOriginVerify),
+// because a security knob that validates and then checks nothing is the
+// misconfiguration this package exists to refuse.
+type OriginVerify struct {
+	// Header is the request header the front door sets. Matched
+	// case-insensitively, as every HTTP header name is.
+	Header string `json:"header"`
+
+	// SecretARN is the Secrets Manager secret whose value the header must
+	// carry, optionally with a #<jsonKey> selector. It is a pointer and not a
+	// value, like idProvider.kmsKeyId, which is why it is a plain string rather
+	// than a Secret: the binary reads the secret's AWSCURRENT and AWSPREVIOUS
+	// versions itself, at cold start and again on a refresh interval, so that
+	// a rotation does not need every execution environment recycled.
+	SecretARN string `json:"secretArn"`
+
+	// ExemptHealthz lets GET /healthz through without the header, for a
+	// health checker that calls the origin directly. Off by default: the
+	// readiness probe is a route like any other, and an origin that answers it
+	// to anyone tells anyone the stack is there.
+	ExemptHealthz bool `json:"exemptHealthz"`
+}
+
+// Enabled reports whether the check is on, which is whether a secret is named.
+func (o OriginVerify) Enabled() bool { return strings.TrimSpace(o.SecretARN) != "" }
 
 // CORS covers http.cors.*. The allowed headers, methods and the 204 preflight
 // status are hardcoded in the reference and stay that way.
@@ -1029,7 +1072,10 @@ func Defaults() *Config {
 			// login request became a call to Cognito.
 			Migration: Migration{Mode: MigrationModeImportOnly},
 		},
-		HTTP: HTTP{APIPrefix: "/auth"},
+		HTTP: HTTP{
+			APIPrefix:    "/auth",
+			OriginVerify: OriginVerify{Header: DefaultOriginVerifyHeader},
+		},
 		Docs: Docs{Swagger: SwaggerAuto},
 		RuntimeSettings: RuntimeSettings{
 			LazyEmailVerificationGracePeriodDays: 7,

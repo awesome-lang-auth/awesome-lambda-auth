@@ -27,6 +27,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"inbound-webhooks-are-refused-without-a-runner",
 		"library-events-are-bridged-into-the-tools-fan-out",
 		"oauth-callback-skips-the-second-factor",
+		"origin-verify-refusal-is-a-bare-403",
 		"outgoing-webhook-delivery-races-the-response",
 		"production-by-default",
 		"queued-webhook-retries-reuse-the-delivery-id", // D9b

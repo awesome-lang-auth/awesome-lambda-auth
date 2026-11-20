@@ -121,6 +121,11 @@ func TestDefaultsMatchSpec(t *testing.T) {
 
 		// §1.18 HTTP and docs
 		{"http.apiPrefix", c.HTTP.APIPrefix, "/auth"},
+		// [new] — the origin check is off until a secret is named, and the
+		// header is the name AWS's CloudFront origin-verification pattern uses.
+		{"http.originVerify.header", c.HTTP.OriginVerify.Header, "X-Origin-Verify"},
+		{"http.originVerify.secretArn", c.HTTP.OriginVerify.SecretARN, ""},
+		{"http.originVerify.exemptHealthz", c.HTTP.OriginVerify.ExemptHealthz, false},
 		{"docs.swagger", c.Docs.Swagger, SwaggerAuto},
 
 		// §1.19 runtime settings

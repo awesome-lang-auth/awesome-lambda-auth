@@ -247,6 +247,11 @@ func (r *SSMResolver) fetch(ctx context.Context, name string) (string, error) {
 // calls, and it throttles. Adding one to every login would be the expensive
 // mistake this type makes unavailable.
 //
+// The one value that has to follow a rotation without the environment being
+// recycled — the origin check's front-door secret — is not a knob resolved
+// here: SecretStagesReader reads it, around this cache on purpose, on an
+// interval its caller bounds (secret_stages.go).
+//
 // Only definitive answers are cached — a value, or "no such secret". A denied
 // read or a throttle is transient by nature and caching it would freeze a
 // half-broken container until the platform recycled it.

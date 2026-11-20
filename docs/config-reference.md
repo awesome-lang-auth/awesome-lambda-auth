@@ -3017,3 +3017,190 @@ the default driver is `memory`, which RS-12 forbids in production.
   }
 }
 ```
+
+## 19. `http.originVerify.*` — only the front door may call the origin
+
+Both functions are reached through hosts nobody can make private from inside
+the stack: the auth function through its execute-api URL, the SSE function
+through a Function URL with `AuthType: NONE` (§17.3.3). Whatever a deployment
+puts in front of them — a CloudFront distribution, a WAF rate rule, an edge
+allow-list that routes only the auth routes it uses and blocks
+`POST <prefix>/register` — is advice for as long as the origin answers anyone
+who calls it by its own name.
+
+This block closes that. The front door adds a header holding a shared secret
+to every request it forwards — a CloudFront origin custom header — and with
+`http.originVerify.secretArn` set, both functions refuse every request that
+does not carry it, before anything else in the binary sees the request. It is
+off by default, and off changes nothing: no secret is read and no request is
+refused.
+
+| Knob | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `http.originVerify.secretArn` | Secrets Manager secret ARN, optionally `#<jsonKey>` | empty — the check is off | `AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN` | `OriginVerifySecretArn` |
+| `http.originVerify.header` | HTTP header name | `X-Origin-Verify` | `AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER` | `OriginVerifyHeader` |
+| `http.originVerify.exemptHealthz` | boolean | `false` | `AWESOME_AUTH_HTTP_ORIGIN_VERIFY_EXEMPT_HEALTHZ` | `OriginVerifyExemptHealthz` |
+
+`secretArn` is the switch, and it is a pointer rather than a secret-valued knob
+(§3): the binary reads the secret itself, under two rotation labels and on an
+interval, which a `{"secretsManager": …}` reference resolved once at cold start
+cannot do. What is refused at start:
+
+- `header` or `exemptHealthz` written — in the document or the environment, at
+  any value, the default included — without `secretArn`. A header that checks
+  nothing is the misconfiguration an operator cannot see from outside.
+- A `secretArn` that is not a Secrets Manager secret ARN. An ARN and not a
+  name, because the template scopes the role's read to it, and because the
+  secret is read in the region the ARN names. Give the **full** ARN, with the
+  six-character suffix Secrets Manager appends to the name (`…:secret:name-AbCdEf`):
+  a partial ARN passes this check, but the role's statement names it verbatim,
+  so IAM denies the read and the cold start refuses — closed, but with an
+  `AccessDenied` rather than this message.
+- A `header` that is not a valid header name, or that names a header the auth
+  surface reads — `Authorization`, `Cookie`, `Origin`, `Referer`,
+  `Content-Type`, `X-CSRF-Token`, `X-Api-Key`, `X-Auth-Strategy`,
+  `X-Correlation-Id`, `X-Forwarded-For`, `X-Forwarded-Proto`, `Last-Event-ID`,
+  `Accept`, `User-Agent`, and the framing headers — and the headers a proxy or
+  the platform sets, which a handler, a log line or the language negotiation
+  may read: `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Port`, `X-Real-IP`,
+  `X-Amzn-Trace-Id` and `Accept-Language`. The check removes its header from
+  every request, so naming one of those would take it from every route.
+- A secret whose `AWSCURRENT` value cannot be read, or is not usable: shorter
+  than 32 characters once trimmed (RS-1's floor), or holding anything outside
+  visible ASCII. The cold start fails with the knob's path and the reason,
+  never the value — a deployment that would answer `403` to every request, the
+  front door's included, is a failed deployment and not an outage.
+
+### 19.1 What a request meets
+
+The check is the **outermost** handler on both functions: on the auth
+function before the event-context carrier, the access log, the CORS layer and
+the rate limiters; on the SSE function outside its path gate too, so the
+Function URL is held to the same front door as the execute-api URL.
+
+- A request is admitted when it carries **exactly one** value of the header,
+  equal — after trimming the whitespace HTTP allows around a value — to the
+  secret's `AWSCURRENT` or `AWSPREVIOUS` value. The comparison is between
+  SHA-256 digests with a constant-time compare, against both values every time,
+  so neither its duration nor an early exit says how close a guess was.
+- Two values are refused whatever they hold. API Gateway and Function URLs join
+  a repeated header into one comma-separated value, and a value that arrived
+  beside another is not one the front door set alone.
+- A refusal is a **bare `403`**: no body, no `Content-Type`, no `Vary`, no CORS
+  header, no cookie, and no access-log line, the same for a missing, repeated
+  or wrong header. That is the registered deviation
+  `origin-verify-refusal-is-a-bare-403`.
+- **CORS preflights are refused too.** An `OPTIONS` a browser sends by itself is
+  still a request that did not come through the front door; it reaches the CORS
+  layer only with the header, which a front door adds to every request,
+  preflights included.
+- **`GET /healthz` is checked like any route** unless `exemptHealthz` is `true`,
+  which answers `GET` and `HEAD /healthz` without the header and nothing else.
+  Keep it off unless a health checker calls the origin directly: an origin that
+  answers the probe to anyone tells anyone the stack is there.
+- An admitted request reaches the routes **with the header removed**, so no
+  route, guard, script runner or log line behind the check can read it. The
+  default name is on the logging deny-list (`cmd/auth/logging.go`), and a
+  renamed header is added to it for that deployment at cold start.
+
+### 19.2 Wiring a front door
+
+1. Create the secret, with a value nobody types:
+
+   ```bash
+   aws secretsmanager create-secret --name auth/origin-verify \
+     --secret-string "$(openssl rand -hex 32)"
+   ```
+
+2. Add an origin custom header to every origin of your distribution that points
+   at this stack — the execute-api domain, and the SSE function's Function URL
+   if you route the stream — named as `http.originVerify.header` and holding the
+   secret's value. Anyone who can read the distribution's configuration
+   (`cloudfront:GetDistributionConfig`) can read the value, as with any custom
+   header; keep that permission as narrow as the secret's own.
+3. Deploy the front door first, then the function with `secretArn` set. The
+   other order refuses every request until the front door catches up; this one
+   costs nothing, because a function with the check off ignores the header.
+4. Set `AWESOME_AUTH_LOG_LEVEL=debug` while wiring it if requests are refused:
+   each refusal then writes one line with the reason (`missing`, `repeated`,
+   `empty` or `mismatch`), the method and the path — never the value.
+
+**Not with this stack's own distribution.** `EnableCloudFront` builds a
+distribution that does not add the header; giving it the value would need a
+rotation story of its own for a value CloudFormation resolves once, at deploy
+time. With both on, every request through it would be refused, so the Rule
+`OriginVerifyAndCloudFrontAreExclusive` refuses the combination at changeset
+time. A `ConfigFile` that sets `http.originVerify.secretArn` beside
+`EnableCloudFront` is not visible to the Rule, and fails the same way at run
+time.
+
+### 19.3 Rotating the secret
+
+The check accepts the secret's `AWSPREVIOUS` value beside its `AWSCURRENT`
+one, and re-reads both every **five minutes**, so a rotation needs no flag day
+and no redeploy:
+
+1. Put a new value. `AWSCURRENT` moves to it and `AWSPREVIOUS` to the value the
+   front door is still sending:
+
+   ```bash
+   aws secretsmanager put-secret-value --secret-id <arn> \
+     --secret-string "$(openssl rand -hex 32)"
+   ```
+
+2. **Wait at least five minutes.** Every warm execution environment re-reads
+   the secret within one interval of being asked to serve; a new one reads it
+   at cold start. A front door switched early is refused by an environment
+   that has not re-read yet, for the rest of its interval.
+3. Switch the front door to the new value.
+4. Do not rotate again until step 3 is done everywhere: after the next
+   rotation the old value is neither current nor previous.
+
+**Rotating because the value leaked takes two rotations.** After the first,
+the leaked value is the secret's `AWSPREVIOUS` and is still accepted. Once the
+front door sends the new value everywhere, rotate again: the leaked value then
+holds neither label, and every environment stops accepting it within five
+minutes **of its next successful read**. That condition matters: an environment
+whose refreshes fail keeps accepting what it read last, the leaked value
+included, for as long as they fail. During an incident, keep the execution
+role's `secretsmanager:GetSecretValue` (and the KMS key's decrypt) on the
+secret, rotate to a value that passes the refusals above, and watch for the
+`ERROR` below; if in doubt, publish a new version of the functions, which
+starts every environment cold.
+
+`AWSPENDING` is never accepted. A rotation function that moves the front door
+must do it after its `finishSecret` step, not in `setSecret`, or the front door
+sends a value the function does not accept yet.
+
+A refresh that cannot read the secret — a throttle, a revoked permission —
+keeps the values already read in force, writes a warning, and tries again
+after 30 seconds rather than on every request. It never widens what is
+accepted, and never empties it. A rotation to a value that is not usable
+(§19, the refusals above) is a failed refresh too: the warning names the
+reason and the old values stay. From the third failure in a row — a minute and
+a half of retries — the line is logged at `ERROR` instead, with
+`consecutiveFailures`, so an alarm on it (a CloudWatch metric filter on
+`"level":"ERROR"` and `origin verification`) fires while a rotation is still
+waiting on it; the next successful read resets the count.
+
+### 19.4 What it costs
+
+- One `GetSecretValue` pair per execution environment at cold start, and one
+  more per five minutes while the environment is serving: at most 576 calls a
+  day for an environment that serves around the clock, about USD 0.09 a month
+  at USD 0.05 per 10,000 calls, plus USD 0.40 a month for the secret. An idle
+  environment reads nothing, and a request without the header never triggers a
+  read.
+- A refused request is one invocation and nothing else: no store read, no
+  limiter write, no log line. It does not stop anyone invoking the function —
+  only reserved concurrency bounds that — but it gives them nothing for it.
+
+### 19.5 What the cold start says
+
+```json
+{"level":"INFO","msg":"origin verification on: a request without the front door's header is refused before any route","path":"http.originVerify","header":"X-Origin-Verify","previousAccepted":true,"healthz":"refused like every other path without the header","refreshInterval":"5m0s","refusal":"403 with no body, before CORS, the access log and every route"}
+```
+
+`previousAccepted: false` means the secret has never been rotated, or that its
+previous value is not usable — in which case a warning line says why. Neither
+the ARN nor any value is ever written.

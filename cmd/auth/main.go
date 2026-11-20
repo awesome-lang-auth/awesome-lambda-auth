@@ -15,6 +15,12 @@
 // id and dispatches. See the App type for why that split is a correctness
 // property and not only a performance one.
 //
+// One read is repeated on purpose, and only one: with http.originVerify on,
+// the front door's secret is read again every five minutes by the first
+// request that finds it stale, so that a rotation reaches an execution
+// environment that stays warm for hours (origin_verify.go says why the
+// alternative, recycling every environment before the edge moves, is worse).
+//
 // # Failing to start
 //
 // A configuration the loader refuses aborts the init with a non-zero exit,

@@ -59,6 +59,12 @@ const RedactedValue = "[REDACTED]"
 //     product inherited: the tempToken is a *full* access token — same secret,
 //     same verifier — so for its five minutes it passes authMiddleware. Logging
 //     one is logging a session.
+//   - `x-origin-verify`: the front door's shared secret, presented on every
+//     request it forwards (http.originVerify, origin_verify.go). Whoever holds
+//     it can call the origin as the front door does, past every WAF rule and
+//     edge allow-list in front of it. This is the default header name; a
+//     deployment that renames the header gets its own name redacted too, by
+//     withRedactedKeys at cold start.
 var redactedKeys = []string{
 	"accessToken",
 	"access_token",
@@ -95,6 +101,7 @@ var redactedKeys = []string{
 	"totp",
 	"x-api-key",
 	"x-csrf-token",
+	"x-origin-verify",
 	"x-webhook-signature",
 }
 

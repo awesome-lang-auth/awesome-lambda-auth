@@ -217,12 +217,14 @@ where they do not:
 Both statements are absent from the role entirely unless their half is
 configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
 
-There are three more `secretsmanager:GetSecretValue` statements, and each
+There are four more `secretsmanager:GetSecretValue` statements, and each
 follows the signing-secret one exactly: one present only when
 `EmailDeliveryWebhookSecretArn` is set, one only when `ClaimsWebhookSecretArn`
-is set, and one only when an OAuth provider is configured, each scoped to the
+is set, one only when an OAuth provider is configured, and one —
+`ReadOriginVerifySecret`, on the SSE function's role too, because it runs the
+same check — only when `OriginVerifySecretArn` is set, each scoped to the
 ARNs actually named with any `#<jsonKey>` selector stripped, because the
-selector is the function's and the resource is the secret. Three statements
+selector is the function's and the resource is the secret. Four statements
 rather than one with every ARN on it, so that a stack with one webhook grants
 nothing for the other; and a stack with one provider grants one read, while a
 stack with none grants nothing for OAuth at all.
@@ -532,6 +534,49 @@ cookies, `Authorization` for bearer clients, `Origin` and `Referer` for the
 redirect allowlist, `?lang=` on the UI routes and the whole OAuth and OIDC
 callback vocabulary elsewhere. `Host` is the exception because API Gateway
 routes on it and rejects the viewer's.
+
+## Origin verification
+
+The execute-api URL — and, with `EnableSse`, the SSE function's Function URL —
+answers anyone who calls it by name, so a front door you run in front of it (a
+distribution of your own with a WAF, an edge allow-list) can be walked around.
+Name a secret and both functions refuse, with a bare `403` before any route,
+every request that does not carry the header your front door adds:
+
+```
+OriginVerifySecretArn=arn:aws:secretsmanager:<region>:<account>:secret:auth/origin-verify-<suffix>
+OriginVerifyHeader=X-Origin-Verify        # the default
+OriginVerifyExemptHealthz=false           # the default: /healthz is checked too
+```
+
+- **Your front door sends the header.** Give every origin that points at this
+  stack a custom header named `OriginVerifyHeader` holding the secret's value
+  (at least 32 visible ASCII characters; `openssl rand -hex 32` makes one).
+  Deploy that first, then this stack with the ARN: a function with the check
+  off ignores the header, so that order costs nothing.
+- **Not with `EnableCloudFront`.** This stack's own distribution does not add
+  the header, so the Rule `OriginVerifyAndCloudFrontAreExclusive` refuses the
+  two together.
+- **The role reads one more secret.** `ReadOriginVerifySecret` grants
+  `secretsmanager:GetSecretValue` on that ARN, selector stripped, on both
+  functions, only when the ARN is set. A customer-managed key needs
+  `kms:Decrypt`, as for the signing secrets.
+- **Rotation needs no flag day.** The function accepts the secret's
+  `AWSCURRENT` and `AWSPREVIOUS` values and re-reads both every five minutes:
+  `put-secret-value`, wait five minutes, then switch the front door. The value
+  it was sending stays accepted until the next rotation — so if you are
+  rotating because that value leaked, rotate a second time once the front door
+  sends the new one.
+- **It fails closed.** A secret the function cannot read, or one too short to
+  accept, refuses the cold start; a later re-read that fails keeps the values
+  already read and retries every 30 seconds.
+- **Cost:** USD 0.40 a month for the secret and at most 576 `GetSecretValue`
+  calls a day per execution environment serving around the clock (about
+  USD 0.09 a month each). A refused request is one invocation and writes no log
+  line.
+
+The knobs, the refusals and the rotation procedure in full are in
+[docs/config-reference.md](../../docs/config-reference.md) §19.
 
 ## Server-Sent Events (D9c)
 

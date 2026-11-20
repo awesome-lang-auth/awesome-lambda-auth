@@ -84,6 +84,8 @@ Metadata:
         Parameters: [MemorySize, Timeout, ReservedConcurrentExecutions, SessionCheckOn]
       - Label: {default: Content delivery (CloudFront)}
         Parameters: [EnableCloudFront, CloudFrontAliases, CloudFrontCertificateArn, CloudFrontPriceClass]
+      - Label: {default: Origin verification (front door)}
+        Parameters: [OriginVerifySecretArn, OriginVerifyHeader, OriginVerifyExemptHealthz]
       - Label: {default: Admin console}
         Parameters: [EnableAdminConsole, AdminAccessPolicy, AdminRootEmail, AdminRootPasswordHashArn, EnableAdminUploads]
       - Label: {default: Outgoing webhook queue (D9b)}
@@ -1186,6 +1188,74 @@ Parameters:
       smoothing, not for hit rate.
 
   # -----------------------------------------------------------------------
+  # Origin verification (config-reference.md §19).
+  #
+  # The execute-api URL and, with EnableSse, the SSE function's Function URL
+  # are public by construction. A front door you run in front of them — your
+  # own CloudFront distribution with a WAF, an edge allow-list that routes
+  # only the auth routes one deployment uses — is advice for as long as the
+  # origin answers anyone who calls it by name. Name a secret here and both
+  # functions refuse, with a bare 403 and before any route, every request
+  # that does not carry OriginVerifyHeader holding that secret's value; your
+  # front door adds the header to every origin request (a CloudFront origin
+  # custom header).
+  #
+  # The function reads the secret's AWSCURRENT and AWSPREVIOUS versions at
+  # cold start, and refuses to start if it cannot read a usable current one,
+  # then again every five minutes. So a rotation needs no flag day: rotate
+  # the secret, wait five minutes, then switch the front door; the value it
+  # was sending stays accepted until the next rotation.
+  #
+  # Off by default: with OriginVerifySecretArn empty no variable below is
+  # set, no IAM read is granted and the stack is the stack it was.
+  #
+  # NOT with EnableCloudFront. This stack's own distribution does not add the
+  # header — giving it the value would need a rotation story of its own for a
+  # value CloudFormation resolves once at deploy time — so with both on every
+  # request through it would be refused. The Rule
+  # OriginVerifyAndCloudFrontAreExclusive refuses that combination at
+  # changeset time; a ConfigFile that sets http.originVerify.secretArn beside
+  # EnableCloudFront is not seen by it and fails the same way at run time.
+  # -----------------------------------------------------------------------
+
+  OriginVerifySecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN — ARN of an existing Secrets
+      Manager secret holding the value your front door sends in
+      OriginVerifyHeader: at least 32 visible ASCII characters (openssl rand
+      -hex 32 makes one). Empty — the default — turns the check off. Append
+      #<jsonKey> to select one key of a JSON secret document. Nothing is
+      generated for you: the front door has to be configured with the same
+      value, which only you can do. The function reads it; the value never
+      enters the template.
+
+  OriginVerifyHeader:
+    Type: String
+    Default: X-Origin-Verify
+    AllowedPattern: '^[A-Za-z0-9-]{1,128}$'
+    ConstraintDescription: >-
+      OriginVerifyHeader must be a header name of letters, digits and hyphens.
+    Description: >-
+      AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER — the request header your front
+      door sets. It is removed from every request after the check, so it must
+      not be one the auth surface reads; Authorization, Cookie, Origin,
+      X-Forwarded-For and the like are refused at start. Set only with
+      OriginVerifySecretArn.
+
+  OriginVerifyExemptHealthz:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_HTTP_ORIGIN_VERIFY_EXEMPT_HEALTHZ — "true" answers GET
+      /healthz without the header, for a health checker that calls the origin
+      directly. "false" — the default — keeps the probe behind the front door
+      with every other route. Set only with OriginVerifySecretArn.
+
+  # -----------------------------------------------------------------------
   # Admin console (config-schema.md §1.13, config-reference.md §16).
   #
   # The reference's admin router, mounted by the function at /admin beside
@@ -1588,6 +1658,12 @@ Conditions:
   HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
   HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
 
+  # Origin verification. The secret is the switch for all three variables and
+  # for the IAM read, on both functions: the header and the exemption are set
+  # only beside it, because the function refuses either one without a secret
+  # (a header that checks nothing is a misconfiguration, not a default).
+  HasOriginVerify: !Not [!Equals [!Ref OriginVerifySecretArn, '']]
+
   # D9c: the SSE function. SseEnabled carries ToolsEnabled as a term as well as
   # the Rule below, so that a stack which somehow bypassed the Rule still
   # creates nothing rather than a function whose cold start refuses. Its one
@@ -1871,6 +1947,22 @@ Rules:
           one. To have both, set AlarmTopicArn to your own topic and subscribe the
           address to it there — a topic you own is the one place a subscription
           list belongs.
+
+  # This stack's distribution does not send the origin-verification header
+  # (see the parameters), so with both on every request through it would be
+  # answered 403 by the function behind it. Parameter-only: a ConfigFile that
+  # sets http.originVerify.secretArn is invisible here, and the parameter
+  # description says so.
+  OriginVerifyAndCloudFrontAreExclusive:
+    RuleCondition: !Not [!Equals [!Ref OriginVerifySecretArn, '']]
+    Assertions:
+      - Assert: !Equals [!Ref EnableCloudFront, 'false']
+        AssertDescription: >-
+          OriginVerifySecretArn makes both functions refuse every request that
+          does not carry the front door's header, and this stack's CloudFront
+          distribution does not add it, so every request through it would be
+          refused. Put the header on a front door you run yourself and set
+          EnableCloudFront to "false", or leave OriginVerifySecretArn empty.
 
   # A monitor with no subscriber is a monitor that detects anomalies and tells
   # nobody, and AWS refuses the subscription without one anyway; failing at the
@@ -2258,6 +2350,15 @@ Resources:
           # --- http ------------------------------------------------------
           AWESOME_AUTH_HTTP_API_PREFIX: !Ref ApiPrefix
           AWESOME_AUTH_CORS_ORIGINS: !If [HasAllowedOrigins, !Ref AllowedOrigins, !Ref 'AWS::NoValue']
+          # Origin verification: all three behind the secret, so a stack that
+          # names none sets none and loads what it loaded before. The ARN is a
+          # pointer, like the signing-secret references below; the function
+          # reads the value itself, at cold start and every five minutes. The
+          # SSE function carries the same three lines, so its Function URL is
+          # held to the same front door.
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN: !If [HasOriginVerify, !Ref OriginVerifySecretArn, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER: !If [HasOriginVerify, !Ref OriginVerifyHeader, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_EXEMPT_HEALTHZ: !If [HasOriginVerify, !Ref OriginVerifyExemptHealthz, !Ref 'AWS::NoValue']
 
           # --- cookies and CSRF ------------------------------------------
           # Secure is unconditionally true: API Gateway only ever serves HTTPS.
@@ -2670,6 +2771,26 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Select [0, !Split ['#', !Ref ClaimsWebhookSecretArn]]
+          - !Ref 'AWS::NoValue'
+
+        # -----------------------------------------------------------------
+        # The origin-verification secret, on the same terms again: its own
+        # statement, present only when an ARN was named, scoped to that one
+        # secret with the '#<jsonKey>' selector stripped. One action covers
+        # both versions the function reads — GetSecretValue with VersionStage
+        # AWSCURRENT, then AWSPREVIOUS — and the SSE function holds the same
+        # statement, because it runs the same check.
+        # -----------------------------------------------------------------
+        - !If
+          - HasOriginVerify
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOriginVerifySecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Select [0, !Split ['#', !Ref OriginVerifySecretArn]]
           - !Ref 'AWS::NoValue'
 
         # -----------------------------------------------------------------
@@ -3351,9 +3472,10 @@ Resources:
   # CodeUri is the same zip and the 12 MiB budget is the one CI already checks.
   #
   # The environment is the subset of AuthFunction's that the stream path reads
-  # — deployment, store, prefix and CORS, cookies and CSRF, the session check,
-  # resource-server mode, the tools block, the SSE pair, the document, the two
-  # signing secrets — copied line for line, plus the entry point.
+  # — deployment, store, prefix, CORS and the origin check, cookies and CSRF,
+  # the session check, resource-server mode, the tools block, the SSE pair, the
+  # document, the two signing secrets — copied line for line, plus the entry
+  # point.
   # template_test.go TestTheSseFunctionIsASubsetOfTheAuthFunction fails the day
   # one of them differs. What is left out is what the stream never reaches:
   # mail, SMS, the claims webhook, OAuth, the identity provider, the migration
@@ -3386,6 +3508,9 @@ Resources:
 
           AWESOME_AUTH_HTTP_API_PREFIX: !Ref ApiPrefix
           AWESOME_AUTH_CORS_ORIGINS: !If [HasAllowedOrigins, !Ref AllowedOrigins, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN: !If [HasOriginVerify, !Ref OriginVerifySecretArn, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER: !If [HasOriginVerify, !Ref OriginVerifyHeader, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_HTTP_ORIGIN_VERIFY_EXEMPT_HEALTHZ: !If [HasOriginVerify, !Ref OriginVerifyExemptHealthz, !Ref 'AWS::NoValue']
 
           AWESOME_AUTH_COOKIES_SECURE: 'true'
           AWESOME_AUTH_COOKIES_SAMESITE: !Ref CookieSameSite
@@ -3490,6 +3615,19 @@ Resources:
                 - !If [GenerateSigningSecrets, !Ref JwtSigningSecrets, !Ref 'AWS::NoValue']
                 - !If [GenerateJwtAccessSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtAccessSecretArn]]]
                 - !If [GenerateJwtRefreshSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtRefreshSecretArn]]]
+        # The origin-verification secret, exactly as the auth function holds
+        # it: this function runs the same check, outermost, on its Function URL.
+        - !If
+          - HasOriginVerify
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOriginVerifySecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Select [0, !Split ['#', !Ref OriginVerifySecretArn]]
+          - !Ref 'AWS::NoValue'
 
   # The Function URL, declared rather than left to SAM's FunctionUrlConfig so
   # that both permissions it needs are in this file where a reader can see them.
@@ -3498,9 +3636,11 @@ Resources:
   # AWS_IAM URL is reachable only through CloudFront's origin access control,
   # which is off by default, and OAC signs the origin request with SigV4 in the
   # Authorization header, so a bearer client's own header could not reach the
-  # guard at all. With NONE the gate is the handler's own: the path gate, the
-  # function's outermost handler, 404s everything but GET <ToolsBasePath>/stream,
-  # and then the ToolsAuth guard the auth function applies. Every request that
+  # guard at all. With NONE the gate is the handler's own: the path gate
+  # 404s everything but GET <ToolsBasePath>/stream, and then the ToolsAuth
+  # guard the auth function applies. With OriginVerifySecretArn set, the
+  # origin check sits outside both and refuses, 403, whatever did not come
+  # through your front door. Every request that
   # reaches the URL is an invocation — about USD 0.38 a million for a 404, 0.51
   # for a guard's refusal, log lines included — bounded in rate by
   # SseReservedConcurrency and sharing its slots with the listeners

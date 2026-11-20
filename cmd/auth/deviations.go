@@ -759,6 +759,27 @@ func WireDeviations() []WireDeviation {
 				"fails the day the core answers 401 there.",
 			Spec: "docs/config-reference.md §17.6; upstream admin.go (AdminGuard.authorise, adminRelativePath)",
 		},
+		{
+			ID: "origin-verify-refusal-is-a-bare-403",
+			Surface: "every request to the auth function and to the SSE function while http.originVerify.secretArn is set — every route, " +
+				"CORS preflights included, and GET /healthz unless http.originVerify.exemptHealthz",
+			Behaviour: "A request that does not carry exactly one value of http.originVerify.header (X-Origin-Verify by default) equal " +
+				"to the secret's AWSCURRENT or AWSPREVIOUS value is answered 403 with no body, no Content-Type, no CORS header and " +
+				"no cookie, before any route, the CORS layer, the rate limiters or the access log see it — the same answer whether " +
+				"the header was missing, repeated or wrong. An admitted request reaches the routes with the header removed. Off " +
+				"by default: with no secretArn every request is served as before.",
+			Reference: "There is no such check: every request reaches the router, and a preflight reaches the CORS layer, whoever " +
+				"sent it (src/router/auth.router.ts:513-527).",
+			Why: "The reference is a library inside a server its integrator controls; this product is reached through an execute-api " +
+				"URL and a Function URL that are public by construction, so a CloudFront distribution, a WAF rule or an edge " +
+				"allow-list in front of them — the one place an invite-only deployment can block POST <prefix>/register, for one — " +
+				"is advice as long as the origin answers anyone who calls it by name. The refusal is bare so that it says nothing " +
+				"about which of the three checks failed and nothing about what stands behind it, and it is outermost so that a " +
+				"refused request costs one invocation and no log line on a URL nothing throttles. A client that comes through the " +
+				"front door never sees it. cmd/auth/origin_verify_test.go TestOriginVerifyRefusesWhatDidNotComeThroughTheFrontDoor " +
+				"pins the status, the empty body and the absent headers.",
+			Spec: "docs/config-reference.md §19; docs/spec/decisions.md D-23; infra/sam/README.md (Origin verification)",
+		},
 	}
 }
 
