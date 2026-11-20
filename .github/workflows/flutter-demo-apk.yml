@@ -98,3 +98,4 @@ jobs:
         with:
           name: app-release-apk
           path: examples/flutter-client/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 3

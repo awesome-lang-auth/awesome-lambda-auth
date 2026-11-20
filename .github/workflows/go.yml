@@ -88,3 +88,4 @@ jobs:
           name: lambda-artifacts
           path: dist/*.zip
           if-no-files-found: error
+          retention-days: 3
