@@ -37,7 +37,7 @@ With `idProvider.enabled: true` (or any key material configured — the schema's
 | `GET <prefix>/.well-known/jwks.json` | the signing keys, as a JWKS document. The path is `idProvider.jwksPath`. **Reproduced from the reference**, including `Cache-Control: public, max-age=3600` |
 | `GET <prefix>/.well-known/openid-configuration` | the discovery document |
 | `GET/POST <prefix>/authorize` | the authorization endpoint: `GET` renders a minimal login form, `POST` authenticates and redirects with a code |
-| `POST <prefix>/token` | the token endpoint: `authorization_code` grant, `client_secret_post` authentication |
+| `POST <prefix>/token` | the token endpoint: `authorization_code` grant, `client_secret_basic` or `client_secret_post` authentication, S256 PKCE (required of a public client), `redirect_uri` required, RFC 6749 §5.2 JSON refusals |
 | `GET <prefix>/userinfo` | `sub`, `email`, `name` for a bearer token |
 
 All five are mounted by the imported adapter, public and ahead of every
@@ -226,10 +226,16 @@ reference's `idProvider` block is for.
 
 Each of these is a decision, not an omission.
 
-- **No `refresh_token` from `/token`.** The response carries the HS256 session
-  pair and an RS256 `id_token`; the session refresh token in it is this
-  deployment's own, spent at `POST <prefix>/refresh` like any other. There is no
-  OIDC-specific refresh grant in v1 (D-3).
+- **No `refresh_token` from `/token`.** The response carries an HS256 session
+  access token and an RS256 `id_token`, and nothing a relying party can refresh
+  with. Since awesome-go-auth v0.13.0 the session's own refresh token stays
+  inside the session: it is no longer in the response, so a relying party cannot
+  spend it at `POST <prefix>/refresh` or `POST <prefix>/logout` as it could
+  before. The core's rotating `refresh_token` grant for `offline_access` is
+  turned off here (`DisableRefreshTokenGrant`, `cmd/auth/idp.go`), because with
+  no shared store it keeps its tokens in one execution environment's memory. It
+  comes back with a DynamoDB `IDPRefreshTokenStore`. Until then a relying party
+  runs `/authorize` again when its access token expires (D-3).
 - **No dynamic client registration** (RFC 7591), and no client-registration
   endpoint. Clients come from the configuration document, which means adding one
   is a deploy. That is the right trade for a stack whose relying parties are
