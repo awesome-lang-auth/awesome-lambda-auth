@@ -496,7 +496,15 @@ func (s *Store) GetUserByEmail(ctx context.Context, email, tenantID string) (aut
 	if err := checkVersion(out.Item, typeEmail); err != nil {
 		return auth.User{}, err
 	}
-	return s.GetUserByID(ctx, getS(out.Item, attrUserID), tenantID)
+	user, err := s.GetUserByID(ctx, getS(out.Item, attrUserID), tenantID)
+	if errors.Is(err, ErrUserNotFound) {
+		// A pointer whose profile is gone is this method's bare not-found, not
+		// GetUserByID's: only the by-id read reports the core's
+		// auth.ErrUserNotFound (see errUserByIDNotFound), and the lookups by
+		// address feed routes that must not tell a missing user apart.
+		return auth.User{}, ErrUserNotFound
+	}
+	return user, err
 }
 
 // GetUserByID reads the profile straight out of USER#<t>#<u>. There is no
@@ -518,7 +526,9 @@ func (s *Store) GetUserByID(ctx context.Context, id, tenantID string) (auth.User
 		return auth.User{}, wrap("get user", err)
 	}
 	if len(out.Item) == 0 {
-		return auth.User{}, ErrUserNotFound
+		// ErrUserNotFound that also matches the core's auth.ErrUserNotFound:
+		// the UserStore.GetUserByID contract since awesome-go-auth v0.13.0.
+		return auth.User{}, errUserByIDNotFound
 	}
 	// The migration marker is filed on the request context here and nowhere
 	// else, because this is the read the login path makes: GetUserByEmail

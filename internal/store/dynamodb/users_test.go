@@ -314,3 +314,27 @@ func TestCreateUserWritesTheMembership(t *testing.T) {
 		t.Fatalf("membership GSI1PK = %q, want %q", got, gsi1UserID(u.ID))
 	}
 }
+
+// TestGetUserByIDNotFoundMatchesTheCoreSentinel: since awesome-go-auth v0.13.0
+// (#31) the core tells a missing user from a store that failed by
+// auth.ErrUserNotFound, so the by-id read answers an error that matches it as
+// well as this package's ErrUserNotFound, with the message unchanged. The
+// lookup by address keeps the bare sentinel.
+func TestGetUserByIDNotFoundMatchesTheCoreSentinel(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	_, err := store.GetUserByID(ctx, uniqueID("usr"), "acme")
+	if !errors.Is(err, ErrUserNotFound) || !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("GetUserByID for a missing user: err = %v, want it to match ErrUserNotFound and auth.ErrUserNotFound", err)
+	}
+	if err.Error() != "user not found" {
+		t.Errorf("message = %q, want the unchanged %q", err.Error(), "user not found")
+	}
+
+	_, err = store.GetUserByEmail(ctx, uniqueEmail("nobody"), "acme")
+	if !errors.Is(err, ErrUserNotFound) || errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("GetUserByEmail for a missing user: err = %v, want the bare ErrUserNotFound only", err)
+	}
+}
