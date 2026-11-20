@@ -443,6 +443,16 @@ func derive(cfg *Config) {
 	if cfg.OAuth.Provisioning.OnEmailMatch == "" {
 		cfg.OAuth.Provisioning.OnEmailMatch = OAuthEmailMatchLink
 	}
+
+	// The origin check's two strings are compared, not typed at, so a stray
+	// space from a hand-edited template must not become part of a header name
+	// or of an ARN. An empty header asks for the default, as an empty
+	// onEmailMatch does; validateOriginVerify still sees that it was written.
+	cfg.HTTP.OriginVerify.SecretARN = strings.TrimSpace(cfg.HTTP.OriginVerify.SecretARN)
+	cfg.HTTP.OriginVerify.Header = strings.TrimSpace(cfg.HTTP.OriginVerify.Header)
+	if cfg.HTTP.OriginVerify.Header == "" {
+		cfg.HTTP.OriginVerify.Header = DefaultOriginVerifyHeader
+	}
 }
 
 // collectWarnings records the deploy-time warnings the spec asks for: things an

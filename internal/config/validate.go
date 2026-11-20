@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/textproto"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -790,6 +792,89 @@ func validateHTTPAndDocs(c *Config, d *diagnostics) {
 	}
 	enum(d, "docs.swagger", c.Docs.Swagger, SwaggerTrue, SwaggerFalse, SwaggerAuto)
 	absolutePath(d, "docs.basePath", c.Docs.BasePath)
+	validateOriginVerify(c, d)
+}
+
+// originVerifySecretARN is a Secrets Manager secret ARN with an optional
+// #<jsonKey> selector: the name characters Secrets Manager allows
+// (alphanumerics and /_+=.@-, which covers the six-character suffix it
+// appends), and a selector that is not empty and holds no second '#', since
+// the reader splits on the last one. An ARN and not a bare name, because the
+// stack template's IAM statement scopes the read to this exact resource, and
+// because the region the secret is read from is the ARN's.
+var originVerifySecretARN = regexp.MustCompile(`^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+(#[^#]+)?$`)
+
+// originVerifyReservedHeaders are the request headers http.originVerify.header
+// may not name: every one this binary, the imported core or the event adapter
+// reads, plus the framing headers no proxy lets an application own. The check
+// strips its header before anything else sees the request, so naming one of
+// these would take Authorization from every bearer client, the Origin from
+// every redirect check or the client address from the rate limiter — and
+// would make the front door's secret the value a route reads as a token.
+// Compared in canonical form.
+var originVerifyReservedHeaders = map[string]struct{}{
+	"Accept": {}, "Authorization": {}, "Connection": {}, "Content-Length": {},
+	"Content-Type": {}, "Cookie": {}, "Host": {}, "Last-Event-Id": {},
+	"Origin": {}, "Referer": {}, "Transfer-Encoding": {}, "User-Agent": {},
+	"X-Api-Key": {}, "X-Auth-Strategy": {}, "X-Correlation-Id": {},
+	"X-Csrf-Token": {}, "X-Forwarded-For": {}, "X-Forwarded-Proto": {},
+}
+
+// validateOriginVerify checks http.originVerify.*.
+//
+// With no secretArn the block is off, and the other two knobs then do nothing
+// at all; writing either of them is refused rather than accepted, because an
+// operator who set a header name believes the origin is checked. The source
+// decides, not the value: a template that passes the default header name with
+// a forgotten ARN is exactly the deployment this catches.
+func validateOriginVerify(c *Config, d *diagnostics) {
+	ov := c.HTTP.OriginVerify
+	if !ov.Enabled() {
+		for _, path := range []string{"http.originVerify.header", "http.originVerify.exemptHealthz"} {
+			if c.Source(path) == SourceDefault {
+				continue
+			}
+			d.errf("", path,
+				"is set while http.originVerify.secretArn is not, so the origin check is off and no request is refused for lacking the header",
+				"set http.originVerify.secretArn to the Secrets Manager secret the front door's header value is kept in, or remove this key")
+		}
+		return
+	}
+	if !originVerifySecretARN.MatchString(ov.SecretARN) {
+		d.errf("", "http.originVerify.secretArn",
+			"is not a Secrets Manager secret ARN",
+			"use arn:<partition>:secretsmanager:<region>:<account>:secret:<name>, optionally followed by #<jsonKey> to select one key of a JSON secret")
+	}
+	if !isHTTPToken(ov.Header) {
+		d.errf("", "http.originVerify.header",
+			fmt.Sprintf("%q is not a valid HTTP header name", ov.Header),
+			"use letters, digits and hyphens, e.g. "+DefaultOriginVerifyHeader)
+		return
+	}
+	if _, reserved := originVerifyReservedHeaders[textproto.CanonicalMIMEHeaderKey(ov.Header)]; reserved {
+		d.errf("", "http.originVerify.header",
+			fmt.Sprintf("%q is a header the auth surface reads, and the origin check removes its header from every request before anything else sees it", ov.Header),
+			"choose a header nothing else uses, e.g. "+DefaultOriginVerifyHeader)
+	}
+}
+
+// isHTTPToken reports whether s is an RFC 9110 token: the characters a header
+// field name may contain. Bounded at 128 bytes, which is longer than any name
+// a front door is configured with.
+func isHTTPToken(s string) bool {
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", ch) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isBuiltinOAuthProvider(name string) bool {

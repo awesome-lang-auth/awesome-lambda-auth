@@ -136,6 +136,16 @@ type Options struct {
 	// core's auth.InboundScriptRunner and not awsintegration.LambdaAPI, for the
 	// reason IDPKeySource is not KMSAPI.
 	ScriptRunner auth.InboundScriptRunner
+
+	// OriginSecret injects the reader of the secret http.originVerify.secretArn
+	// names, for the reason Mail and SMS are injectable: a composition that
+	// reads a front-door secret's two rotation stages has to be provable
+	// without an account. Nil builds the real Secrets Manager reader, lazily.
+	// Injecting it switches nothing on — whether the origin is checked at all
+	// is a question about http.originVerify.secretArn (origin_verify.go). It
+	// is a function of awsintegration.SecretStages, a plain struct, and not a
+	// SecretsManagerAPI, for the reason IDPKeySource is not KMSAPI.
+	OriginSecret OriginSecretReader
 }
 
 // App is one cold start's worth of state.
@@ -195,6 +205,11 @@ type App struct {
 	// stream is the SSE function's entry point (D9c, stream.go): the same
 	// composition, serving GET <tools>/stream alone over a Function URL.
 	stream bool
+
+	// origin is the front-door check outermost on Handler (origin_verify.go),
+	// nil when http.originVerify.secretArn is unset. Held here so that a test
+	// can walk its refresh clock; nothing on the request path reads it.
+	origin *originVerifier
 }
 
 // Close releases what a cold start subscribed: today the bridge between the
@@ -302,6 +317,21 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// UI that 404s every page on a stack every health check calls healthy. See
 	// checkUIAssets.
 	if err := checkUISupport(cfg); err != nil {
+		return nil, err
+	}
+
+	// The origin check (origin_verify.go). Its header joins the logging
+	// deny-list first, so that no line from here on — this block's own
+	// included — can carry the front door's secret under a name the static
+	// list does not know. Then the secret is read, before the stores are
+	// opened because it needs none of them: a front-door secret the role
+	// cannot read is a deployment that would refuse every request, and it
+	// fails here, as an init failure, rather than as a 403 per request.
+	if ov := cfg.HTTP.OriginVerify; ov.Enabled() {
+		log = withRedactedKeys(log, ov.Header)
+	}
+	origin, err := newOriginVerifier(ctx, cfg, opts.OriginSecret, log)
+	if err != nil {
 		return nil, err
 	}
 
@@ -441,7 +471,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		handler = streamOnly(cfg, handler)
 	}
 
-	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools, stream: stream}
+	// The origin check is outermost of all, on both functions: outside the
+	// SSE function's path gate, so the Function URL is held to the same front
+	// door as the execute-api URL, and outside everything assembleHandler
+	// adds, so a request that did not come through the front door reaches no
+	// carrier, no CORS layer — a preflight included — no access log, no
+	// limiter and no route. Identity when http.originVerify.secretArn is unset.
+	handler = origin.gate(handler)
+
+	app := &App{Config: cfg, Logger: log, Handler: handler, tools: tools, stream: stream, origin: origin}
 	if tools != nil {
 		app.Tools = tools.tools
 		app.Events = tools.bus

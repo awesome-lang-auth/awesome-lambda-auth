@@ -323,6 +323,14 @@ func envBindings() []envBinding {
 		// §1.18 HTTP surface and docs
 		envString("AWESOME_AUTH_HTTP_API_PREFIX", "http.apiPrefix", func(c *Config, v string) { c.HTTP.APIPrefix = v }),
 		envList("AWESOME_AUTH_CORS_ORIGINS", "http.cors.origins", func(c *Config, v []string) { c.HTTP.CORS.Origins = v }),
+		// http.originVerify.* is product-only, so the names are invented to the
+		// AWESOME_AUTH_ + upper-snaked-path convention the §1.19 seeds use. The
+		// secret's ARN is an ordinary value, not a secret: it names a secret,
+		// as AWESOME_AUTH_IDP_KMS_KEY_ID names a key, and the binary reads the
+		// value itself. A stack template sets all three from parameters.
+		envString("AWESOME_AUTH_HTTP_ORIGIN_VERIFY_HEADER", "http.originVerify.header", func(c *Config, v string) { c.HTTP.OriginVerify.Header = v }),
+		envString("AWESOME_AUTH_HTTP_ORIGIN_VERIFY_SECRET_ARN", "http.originVerify.secretArn", func(c *Config, v string) { c.HTTP.OriginVerify.SecretARN = v }),
+		envBool("AWESOME_AUTH_HTTP_ORIGIN_VERIFY_EXEMPT_HEALTHZ", "http.originVerify.exemptHealthz", func(c *Config, v bool) { c.HTTP.OriginVerify.ExemptHealthz = v }),
 		envString("AWESOME_AUTH_DOCS_SWAGGER", "docs.swagger", func(c *Config, v string) { c.Docs.Swagger = v }),
 		envString("AWESOME_AUTH_DOCS_BASE_PATH", "docs.basePath", func(c *Config, v string) { c.Docs.BasePath = v }),
 
