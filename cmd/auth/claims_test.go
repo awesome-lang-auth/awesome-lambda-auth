@@ -162,20 +162,16 @@ func jwsPayload(t *testing.T, token string) map[string]any {
 	return claims
 }
 
-// bearerTokens registers an account in bearer mode and returns the pair of
-// tokens the body carries.
+// bearerTokens registers an account, logs it in in bearer mode and returns the
+// pair of tokens the login's body carries.
 func bearerTokens(t *testing.T, app *App, email string) (access, refresh string) {
 	t.Helper()
-	resp := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(email))
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want 201 (body %s)", resp.StatusCode, resp.Body)
-	}
+	resp := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), email)
 	body := decodeBody(t, resp)
 	access, _ = body["accessToken"].(string)
 	refresh, _ = body["refreshToken"].(string)
 	if access == "" || refresh == "" {
-		t.Fatalf("bearer register returned no token pair: %s", resp.Body)
+		t.Fatalf("bearer login returned no token pair: %s", resp.Body)
 	}
 	return access, refresh
 }

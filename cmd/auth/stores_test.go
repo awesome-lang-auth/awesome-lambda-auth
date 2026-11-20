@@ -195,20 +195,17 @@ type sweepCredentials struct {
 	csrfToken   string
 }
 
-// registerAndToken registers the fixture user and harvests both credentials.
+// registerAndToken registers the fixture user, logs it in, and harvests both
+// credentials.
 func registerAndToken(t *testing.T, app *App, email string) sweepCredentials {
 	t.Helper()
-	resp := invoke(t, app, http.MethodPost, "/auth/register",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody(email))
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("register status = %d, want 201 (body %s)", resp.StatusCode, resp.Body)
-	}
+	resp := registerAndLogin(t, app, jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), email)
 	token, _ := decodeBody(t, resp)["accessToken"].(string)
 	if token == "" {
-		t.Fatalf("register returned no access token: %s", resp.Body)
+		t.Fatalf("login returned no access token: %s", resp.Body)
 	}
 
-	// A bearer registration is sent no cookies at all, deliberately, so the CSRF
+	// A bearer login is sent no cookies at all, deliberately, so the CSRF
 	// token has to come from a cookie-mode request. Any guarded route distributes
 	// one; a login with no credentials is the cheapest.
 	csrf := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(), nil, `{}`)
@@ -317,6 +314,56 @@ func TestDynamoDBBackedRoutesFindEveryStore(t *testing.T) {
 	sweepRoutes(t, app, registerAndToken(t, app, testEmail))
 }
 
+// TestDynamoDBDeletedAccountIsUserNotFound pins the store half of the core's
+// token-trusting gate (awesome-go-auth v0.13.0, #31) on the deployed driver. An
+// access token that outlives its account still verifies under the default
+// sessions.checkOn (refresh), and GET /me looks the user up itself; the
+// DynamoDB store's miss has to be the core's auth.ErrUserNotFound for that to
+// be the reference's 404 {"error":"User not found"} rather than a 500.
+func TestDynamoDBDeletedAccountIsUserNotFound(t *testing.T) {
+	endpoint, ok := localDynamoDBEndpoint()
+	if !ok {
+		t.Skip("DYNAMODB_ENDPOINT is not set; start DynamoDB Local and set it to run this end-to-end case")
+	}
+	// No t.Parallel, for the reason TestDynamoDBBackedRoutesFindEveryStore gives.
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	table := "authtest_cmd_auth_" + randomSuffix(t)
+	client, err := awsintegration.NewDynamoDBClient(ctx, awsintegration.DynamoDBOptions{Region: "us-east-1", Endpoint: endpoint})
+	if err != nil {
+		t.Skipf("cannot build a DynamoDB client for %s: %v", endpoint, err)
+	}
+	if err := ddbstore.CreateTable(ctx, client, table); err != nil {
+		t.Skipf("cannot create %s at %s (%v)", table, endpoint, err)
+	}
+	app, err := New(ctx, Options{
+		Getenv: envFunc(storeSweepEnv(
+			"AWESOME_AUTH_STORES_DRIVER", config.StoreDriverDynamoDB,
+			"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", table,
+			"AWESOME_AUTH_STORES_CONNECTION_REGION", "us-east-1",
+			"AWESOME_AUTH_STORES_CONNECTION_ENDPOINT", endpoint,
+		)),
+		Logger: discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New with the dynamodb driver: %v", err)
+	}
+	t.Cleanup(app.Close)
+
+	creds := registerAndToken(t, app, testEmail)
+	bearer := jsonHeaders("authorization", "Bearer "+creds.accessToken)
+	if del := invoke(t, app, http.MethodDelete, "/auth/account", bearer, nil, ""); del.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /auth/account = %d, want 200 (body %s)", del.StatusCode, del.Body)
+	}
+	me := invoke(t, app, http.MethodGet, "/auth/me", bearer, nil, "")
+	if me.StatusCode != http.StatusNotFound || decodeBody(t, me)["error"] != "User not found" {
+		t.Fatalf("GET /auth/me with a deleted account's token = %d %s, want 404 {\"error\":\"User not found\"}", me.StatusCode, me.Body)
+	}
+}
+
 // TestDynamoDBStoreSatisfiesTheOAuthWiring pins the assertion the sweep depends
 // on but cannot make visible: the concrete store is what the composition root
 // looks for, structurally.
@@ -333,6 +380,12 @@ func TestDynamoDBStoreSatisfiesTheOAuthWiring(t *testing.T) {
 	if provider.LinkedAccounts() == nil || provider.PendingLinks() == nil {
 		t.Fatal("the OAuth store views are nil")
 	}
+	// Not OAuth, but discovered the same structural way and silent the same
+	// way when it drifts: GET <admin>/api/users/{id} falls back to the empty
+	// tenant without it.
+	if !asserts[auth.UserLookupStore](store) {
+		t.Error("*dynamodb.Store does not satisfy auth.UserLookupStore, so the admin detail route cannot span tenants")
+	}
 	// And the memory bundle, so the development driver cannot drift out of shape
 	// either.
 	if _, ok := any(memoryStoreBundle{MemoryUserStore: auth.NewMemoryUserStore()}).(oauthStoreProvider); !ok {
@@ -347,6 +400,9 @@ func TestDynamoDBStoreSatisfiesTheOAuthWiring(t *testing.T) {
 		"EmailChangeStore":       asserts[auth.EmailChangeStore](bundle),
 		"TOTPStore":              asserts[auth.TOTPStore](bundle),
 		"UserPasswordStore":      asserts[auth.UserPasswordStore](bundle),
+		// The admin detail route's tenant-spanning lookup (core v0.12.0):
+		// hidden, the route quietly falls back to the empty tenant.
+		"UserLookupStore": asserts[auth.UserLookupStore](bundle),
 	} {
 		if !satisfied {
 			t.Errorf("memoryStoreBundle hides %s from the core's type assertion", name)

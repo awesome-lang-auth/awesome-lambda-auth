@@ -1052,15 +1052,18 @@ func TestAdminLoginSkipsTheSecondFactor(t *testing.T) {
 	}
 }
 
-// ── the single-tenant detail route ───────────────────────────────────────────
+// ── the detail route spans tenants ───────────────────────────────────────────
 
-// TestAdminUserDetailIsSingleTenant pins the product deviation
-// admin-user-detail-is-single-tenant: the listing shows a row under a tenant
-// and the detail route beside it answers 404 for the same id, because the
-// pinned core looks the id up in the empty tenant. It fails the day the pin
-// moves to a core whose detail route spans tenants (UserLookupStore, upstream
-// PR #92), which is when the entry is retired.
-func TestAdminUserDetailIsSingleTenant(t *testing.T) {
+// TestAdminUserDetailSpansTenants: a user the listing shows under a tenant is
+// a user the detail route beside it answers, as the reference's findById(id)
+// does (admin.router.ts:789-800). On core v0.11.0 this was the product
+// deviation admin-user-detail-is-single-tenant — the detail asked
+// GetUserByID(id, "") and answered 404 — and v0.12.0 retired it: the core
+// resolves the id through auth.UserLookupStore when the store has it, the
+// memory bundle promotes MemoryUserStore's and the DynamoDB store implements
+// its own (internal/store/dynamodb user_lookup.go, whose tests drive it against
+// DynamoDB Local).
+func TestAdminUserDetailSpansTenants(t *testing.T) {
 	t.Parallel()
 	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin)), Options{}, nil)
 	cookie := s.rootLogin(t)
@@ -1074,13 +1077,19 @@ func TestAdminUserDetailIsSingleTenant(t *testing.T) {
 	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), tenantedID) || !strings.Contains(listing.Body.String(), plainID) {
 		t.Fatalf("GET /admin/api/users answered %d and does not list both accounts: %s", listing.Code, listing.Body.String())
 	}
-	if rec := s.call(t, http.MethodGet, "/admin/api/users/"+plainID, nil, withCookie(cookie)); rec.Code != http.StatusOK {
-		t.Errorf("detail of an empty-tenant user answered %d, want 200: %s", rec.Code, rec.Body.String())
+	for id, tenant := range map[string]string{plainID: "", tenantedID: "acme"} {
+		rec := s.call(t, http.MethodGet, "/admin/api/users/"+id, nil, withCookie(cookie))
+		if rec.Code != http.StatusOK {
+			t.Errorf("detail of the user the listing shows under tenant %q answered %d, want 200: %s", tenant, rec.Code, rec.Body.String())
+			continue
+		}
+		if got := decodeJSON(t, rec)["id"]; got != id {
+			t.Errorf("detail of %s answered the user %v", id, got)
+		}
 	}
-	rec := s.call(t, http.MethodGet, "/admin/api/users/"+tenantedID, nil, withCookie(cookie))
+	rec := s.call(t, http.MethodGet, "/admin/api/users/usr_nobody", nil, withCookie(cookie))
 	if rec.Code != http.StatusNotFound || decodeJSON(t, rec)["error"] != "User not found" {
-		t.Fatalf("detail of a tenanted user answered %d %s, want 404 {\"error\":\"User not found\"} on the v0.11.0 core\n"+
-			"If the pinned core now spans tenants on this route, retire admin-user-detail-is-single-tenant", rec.Code, rec.Body.String())
+		t.Errorf("detail of an unknown id answered %d %s, want 404 {\"error\":\"User not found\"}", rec.Code, rec.Body.String())
 	}
 }
 

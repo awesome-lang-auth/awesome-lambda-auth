@@ -19,7 +19,6 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"admin-actions-list-omits-the-runner-manifest", // D9d
 		"admin-first-user-policy-is-refused",
 		"admin-login-skips-the-second-factor",
-		"admin-user-detail-is-single-tenant",
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",
@@ -47,6 +46,10 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		// the upload store is the writer D7 said was missing, and the read
 		// path now serves it. docs/deviations.md keeps the entry under
 		// "Retired" so the id stays resolvable.
+		// admin-user-detail-is-single-tenant was retired by the v0.12.0 pin:
+		// the core resolves the detail route through UserLookupStore and the
+		// DynamoDB store implements it. cmd/auth/admin_test.go
+		// TestAdminUserDetailSpansTenants pins the positive behaviour.
 	}
 	var got []string
 	for _, d := range WireDeviations() {

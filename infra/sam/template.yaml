@@ -2547,12 +2547,14 @@ Resources:
         #
         #   * TransactWriteItems has no IAM action of its own — it is
         #     authorised by the per-item actions of the operations inside it.
-        #   * No ConditionCheckItem. Nothing in the P1 subset puts a bare
-        #     ConditionCheck into a transaction; a Put or Update carrying a
-        #     ConditionExpression is authorised by PutItem/UpdateItem. It goes
-        #     back in with the RBAC and tenant stores, which do use one
-        #     (data-model.md #29 and #43). Granting it early would make the
-        #     first line of this comment false, which is the whole point.
+        #   * No ConditionCheckItem. A Put, Update or Delete carrying a
+        #     ConditionExpression is authorised by PutItem/UpdateItem/
+        #     DeleteItem, and the user store asserts items that way rather than
+        #     with a bare ConditionCheck (internal/store/dynamodb/iam_test.go
+        #     pins every transaction against this list, since DynamoDB Local
+        #     enforces no IAM). The RBAC and tenant stores do put a bare one
+        #     into AddRoleToUser and AssociateUserWithTenant (data-model.md
+        #     #29 and #43); that test names them as a known gap, still open.
         #   * No Scan: the store never scans. No DescribeTable: New() performs
         #     no I/O, deliberately, so a cold start does not pay for one.
         #   * No CreateTable/UpdateTimeToLive: the helper in table.go exists for

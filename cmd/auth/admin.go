@@ -267,7 +267,10 @@ import (
 // GET <admin>/api/users reads AdminUserStore.ListUsers, which on the DynamoDB
 // driver is a Query over a sparse index that only profiles written since D6
 // are in. A table with older rows under-reports, and the failure is not visible
-// from outside. `migrate backfill-users` is the one-time sweep that closes it
+// from outside. GET <admin>/api/users/{id} reads auth.UserLookupStore through
+// a by-id pointer that only profiles written since the v0.12.0 pin carry; on an
+// older table it finds the empty tenant's users and no one else's, which is
+// what it did before. `migrate backfill-users` is the sweep that closes both
 // (cmd/migrate, internal/store/dynamodb backfill.go); logAdminSurface names it
 // at cold start whenever the console mounts on that driver, because the log is
 // the only place this deployment can say it.
@@ -704,9 +707,10 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
 		log.Warn("the admin user directory is only as complete as the backfill",
 			slog.String("path", "stores.driver"),
-			slog.String("problem", "GET "+mount+"/api/users reads a sparse index that only profiles written since the D6 release are in; "+
-				"older profiles are found by every other method and missing from this one"),
-			slog.String("remedy", "run `migrate backfill-users --table "+cfg.Stores.Connection.TableName+" --region <region>` once against this table (idempotent, safe while serving); "+
+			slog.String("problem", "GET "+mount+"/api/users reads a sparse index that only profiles written since the D6 release are in, "+
+				"and GET "+mount+"/api/users/{id} a by-id pointer that only profiles written since the v0.12.0 pin carry; "+
+				"older profiles are found by every other method and missing from the first, and from the second unless they live under the empty tenant"),
+			slog.String("remedy", "run `migrate backfill-users --table "+cfg.Stores.Connection.TableName+" --region <region>` against this table once the current release serves every request (idempotent, safe while serving); "+
 				"nothing in this function can do it, because the sweep is a Scan the execution role does not grant"))
 	}
 }

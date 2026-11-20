@@ -19,12 +19,40 @@ import (
 // can resume from, and a dry run reaches no write.
 
 // fakeBackfillAPI serves a fixed sequence of Scan pages and records every
-// UpdateItem. failAt fails the UpdateItem for that user id, once.
+// UpdateItem. failAt fails the UpdateItem for that user id, once. Every pointer
+// read answers "absent" unless elsewhere names the tenant the id's pointer
+// already gives it to, and every pointer transaction succeeds and is recorded.
 type fakeBackfillAPI struct {
-	pages   [][]string // user ids per page
-	scans   int
-	updates []string
-	failAt  string
+	pages     [][]string // user ids per page
+	scans     int
+	updates   []string
+	pointers  []string
+	elsewhere map[string]string
+	failAt    string
+}
+
+func (f *fakeBackfillAPI) GetItem(_ context.Context, in *awsddb.GetItemInput, _ ...func(*awsddb.Options)) (*awsddb.GetItemOutput, error) {
+	id := strings.TrimPrefix(in.Key["PK"].(*types.AttributeValueMemberS).Value, "UID#")
+	tenant, ok := f.elsewhere[id]
+	if !ok {
+		return &awsddb.GetItemOutput{}, nil
+	}
+	return &awsddb.GetItemOutput{Item: map[string]types.AttributeValue{
+		"PK":       &types.AttributeValueMemberS{Value: "UID#" + id},
+		"SK":       &types.AttributeValueMemberS{Value: "UID"},
+		"_t":       &types.AttributeValueMemberS{Value: "userid"},
+		"userId":   &types.AttributeValueMemberS{Value: id},
+		"tenantId": &types.AttributeValueMemberS{Value: tenant},
+	}}, nil
+}
+
+func (f *fakeBackfillAPI) TransactWriteItems(_ context.Context, in *awsddb.TransactWriteItemsInput, _ ...func(*awsddb.Options)) (*awsddb.TransactWriteItemsOutput, error) {
+	for _, op := range in.TransactItems {
+		if op.Put != nil {
+			f.pointers = append(f.pointers, op.Put.Item["userId"].(*types.AttributeValueMemberS).Value)
+		}
+	}
+	return &awsddb.TransactWriteItemsOutput{}, nil
 }
 
 func (f *fakeBackfillAPI) Scan(_ context.Context, in *awsddb.ScanInput, _ ...func(*awsddb.Options)) (*awsddb.ScanOutput, error) {
@@ -95,6 +123,9 @@ func TestBackfillPagesToTheEndAndWritesEveryMatch(t *testing.T) {
 	if got := strings.Join(api.updates, ","); got != "a,b,c" {
 		t.Errorf("updates = %q, want every profile on every page", got)
 	}
+	if got := strings.Join(api.pointers, ","); got != "a,b,c" {
+		t.Errorf("pointers = %q, want one per unpointed profile", got)
+	}
 	if api.scans != 3 {
 		t.Errorf("scans = %d, want one per page", api.scans)
 	}
@@ -115,8 +146,8 @@ func TestBackfillDryRunReachesNoWrite(t *testing.T) {
 	if err := backfillAll(context.Background(), api, backfillFlags{table: "t", pageSize: 1, dryRun: true}, stdout, stderr); err != nil {
 		t.Fatalf("backfillAll: %v", err)
 	}
-	if len(api.updates) != 0 {
-		t.Fatalf("dry run wrote %v", api.updates)
+	if len(api.updates) != 0 || len(api.pointers) != 0 {
+		t.Fatalf("dry run wrote %v and pointed %v", api.updates, api.pointers)
 	}
 	if s := out(); !strings.Contains(s, "would index a") || !strings.Contains(s, "would index b") {
 		t.Errorf("dry run did not report what it would have written:\n%s", s)
@@ -154,6 +185,36 @@ func TestBackfillFailedPagePrintsTheKeyToResumeFrom(t *testing.T) {
 	}
 	if got := strings.Join(api2.updates, ","); got != "b,c,d" {
 		t.Errorf("resumed run wrote %q, want the failed page and everything after it", got)
+	}
+}
+
+// TestBackfillConflictIsReportedAsNeedingAttention: an id whose pointer names
+// another tenant is the one outcome the summary must not file under "none needs
+// attention", and it is listed even under --quiet.
+func TestBackfillConflictIsReportedAsNeedingAttention(t *testing.T) {
+	t.Parallel()
+	api := &fakeBackfillAPI{pages: [][]string{{"a", "b"}}, elsewhere: map[string]string{"b": "acme"}}
+	stdout, out := captureOut(t)
+	stderr, errOut := captureOut(t)
+
+	if err := backfillAll(context.Background(), api, backfillFlags{table: "t", pageSize: 2, quietList: true}, stdout, stderr); err != nil {
+		t.Fatalf("backfillAll: %v", err)
+	}
+	if got := strings.Join(api.pointers, ","); got != "a" {
+		t.Errorf("pointers = %q, want only the unconflicted id", got)
+	}
+	if s := out(); !strings.Contains(s, "pointed 1, pointer skipped 0, conflicts 1") {
+		t.Errorf("summary does not count the conflict:\n%s", s)
+	}
+	s := errOut()
+	for _, want := range []string{
+		`CONFLICT user id b: a profile under the empty tenant "", and the pointer names tenant acme`,
+		"NEED ATTENTION",
+		"PK=UID#<id> SK=UID",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, s)
+		}
 	}
 }
 

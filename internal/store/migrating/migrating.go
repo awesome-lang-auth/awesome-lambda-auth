@@ -206,6 +206,7 @@ var (
 	_ auth.UserPhoneStore         = (*MigratingUserStore)(nil)
 	_ auth.TemplateStore          = (*MigratingUserStore)(nil)
 	_ auth.AuthCodeStore          = (*MigratingUserStore)(nil)
+	_ auth.UserLookupStore        = (*MigratingUserStore)(nil)
 )
 
 // New validates opts and returns the wrapper. It performs no I/O: the directory

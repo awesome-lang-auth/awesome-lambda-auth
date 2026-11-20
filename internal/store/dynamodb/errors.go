@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	auth "github.com/nik2208/awesome-go-auth"
 )
 
 // ErrUserNotFound is returned wherever the in-memory reference returns a bare
@@ -12,6 +13,33 @@ import (
 // sentinel exists so port code can match with errors.Is, which the reference
 // cannot.
 var ErrUserNotFound = errors.New("user not found")
+
+// errUserByIDNotFound is what GetUserByID answers for a profile that is not
+// there. It is ErrUserNotFound — the same message, and errors.Is matches it —
+// and it also matches the core's auth.ErrUserNotFound, which
+// UserStore.GetUserByID has to report since awesome-go-auth v0.13.0 (#31). The
+// core's auth gate trusts the token and reads no store since that release, so
+// GET /me, /change-password, /send-verification-email and /change-email/request
+// look the user up themselves: auth.ErrUserNotFound is their
+// 404 {"error":"User not found"}, and any other error their generic 500.
+//
+// Only GetUserByID answers it, as only the core's MemoryUserStore.GetUserByID
+// returns the core's sentinel; every other method keeps the bare
+// ErrUserNotFound, so nothing else changes on the wire.
+var errUserByIDNotFound error = userByIDNotFoundError{}
+
+type userByIDNotFoundError struct{}
+
+func (userByIDNotFoundError) Error() string { return ErrUserNotFound.Error() }
+
+// Is makes errors.Is(err, ErrUserNotFound) hold, so this package's own
+// callers and tests see the sentinel they always saw.
+func (userByIDNotFoundError) Is(target error) bool { return target == ErrUserNotFound }
+
+// Unwrap exposes the core's sentinel: errors.Is(err, auth.ErrUserNotFound)
+// holds, and through the core's own Is, errors.Is(err,
+// auth.ErrInvalidCredentials) too, exactly as for the core's store.
+func (userByIDNotFoundError) Unwrap() error { return auth.ErrUserNotFound }
 
 // ErrNoPendingEmailChange means ApplyEmailChange was called with no pending
 // address on the profile. It is a fault rather than an authentication outcome:

@@ -295,23 +295,16 @@ func WireDeviations() []WireDeviation {
 				"auth routes.",
 			Spec: "docs/config-reference.md §16.5; docs-page-carries-a-content-security-policy (the same shape, on the documentation pair)",
 		},
-		{
-			ID:      "admin-user-detail-is-single-tenant",
-			Surface: "GET <admin>/api/users/{id}, for a user who lives under a tenant",
-			Behaviour: "Answers 404 {\"error\":\"User not found\"} for a row the listing beside it, GET <admin>/api/users, shows: " +
-				"the listing spans every tenant and the detail looks the id up in the empty tenant only.",
-			Reference: "findById(id) carries no tenant at all (src/router/admin.router.ts:789-800), so the detail spans tenants " +
-				"exactly as the listing does.",
-			Why: "Core-caused and not fixable here: the pinned core's adminGetUser calls GetUserByID(id, \"\") with the empty " +
-				"tenant as a literal (admin_read.go:396), because the UserStore seam has no tenant-free lookup; the fix is " +
-				"written upstream as UserLookupStore (awesome-go-auth PR #92) and not tagged, so this build stays on v0.11.0 " +
-				"and serves what v0.11.0 serves. Every account this binary registers lives in the empty tenant, so the two " +
-				"routes agree on a table this deployment filled itself; migrate cognito --tenant is what produces the rows " +
-				"they disagree on. A product-side route would be a route under the admin path, and this binary adds none. " +
-				"cmd/auth/admin_test.go TestAdminUserDetailIsSingleTenant fails the day the pin moves to a core whose detail " +
-				"route spans tenants, which is when this entry is retired.",
-			Spec: "docs/config-reference.md §16.4; upstream awesome-go-auth PR #92 (UserLookupStore)",
-		},
+		// admin-user-detail-is-single-tenant was registered by the admin
+		// surface and retired by the v0.12.0 pin: the core's adminGetUser now
+		// resolves the id through auth.UserLookupStore, and the DynamoDB store
+		// implements it with a by-id pointer (internal/store/dynamodb
+		// user_lookup.go), so the detail route finds every user the listing
+		// shows. What the core still leaves on the empty tenant -- DELETE
+		// <admin>/api/users/{id} and promote with method=flag -- is the core's
+		// own register entry, admin-user-detail-spans-tenants-only-through-a-
+		// lookup-store; the retired entry is kept in docs/deviations.md under
+		// "Retired" so the id keeps resolving.
 		{
 			ID:      "admin-first-user-policy-is-refused",
 			Surface: "admin.accessPolicy: first-user, and therefore who the console admits",
