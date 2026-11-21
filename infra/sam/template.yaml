@@ -405,6 +405,8 @@ Parameters:
       oauth.provisioning.autoCreate is false, or allowedEmailDomains narrows it
       AND requireVerifiedEmail is true (the domain is matched on the address
       the provider asserts, so without verification it narrows nothing).
+      Beside CognitoMigrationMode "dual-read" the Rule
+      ClosedRegistrationRefusesDualRead refuses the stack (RS-21).
 
   TwoFactorRequired:
     Type: String
@@ -2170,6 +2172,27 @@ Rules:
           a ConfigFile that sets oauth.provisioning.autoCreate to false, or
           narrows it with oauth.provisioning.allowedEmailDomains together with
           oauth.provisioning.requireVerifiedEmail true.
+
+  # RS-21 at changeset time. Dual-read creates the local account for any
+  # address the pool holds on an unauthenticated lookup (POST /login,
+  # /forgot-password), without reading whether the pool still has the user
+  # enabled or confirmed, so a closed realm cannot dual-read. Not
+  # document-aware: both knobs reach the function as environment variables,
+  # which beat ConfigFile.
+  ClosedRegistrationRefusesDualRead:
+    RuleCondition: !And
+      - !Equals [!Ref ClosedRegistration, 'true']
+      - !Not [!Equals [!Ref CognitoUserPoolId, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoMigrationMode, 'dual-read']]
+        AssertDescription: >-
+          ClosedRegistration is "true" and CognitoMigrationMode is "dual-read",
+          which creates the local account for any address the pool holds the
+          first time a login or a password reset names it, so the realm would
+          not be closed and the function would refuse to start (RS-21). Import
+          the pool with cmd/migrate and keep CognitoMigrationMode at
+          import-only, or set ClosedRegistration to "false" for the migration
+          window.
 
   # RS-20 at changeset time, its two halves the parameters can see. The OAuth
   # callback completes with a session and no second-factor step, and nothing

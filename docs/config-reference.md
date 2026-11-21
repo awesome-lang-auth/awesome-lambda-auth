@@ -3639,7 +3639,8 @@ Nothing else closes: every other route answers as it did.
 has no user-creating route and the core reproduces it, so neither the console
 nor a machine caller on it (§16.9) can create one — they list, flag, promote and
 delete. On a closed realm accounts come from outside the HTTP surface:
-`cmd/migrate cognito` imports them from a Cognito pool; an OAuth callback narrowed
+`cmd/migrate cognito` imports them from a Cognito pool (with
+`stores.migration.mode` at `import-only`: dual-read is refused here, see below); an OAuth callback narrowed
 with `oauth.provisioning.allowedEmailDomains` and `requireVerifiedEmail` provisions
 whoever the provider vouches for at your own domains (see below — and not on a
 realm with `twoFactor.required`, where providers are refused); or a provisioning
@@ -3686,6 +3687,28 @@ provider that asserts it (Google does). With no provider configured
 template refuses the same combination at changeset time when no `ConfigFile` is
 supplied (Rule `ClosedRegistrationRefusesOAuthSignUp`), since nothing in it can
 turn `autoCreate` off or set a domain list.
+
+**Dual-read is a third sign-up door, and a closed realm refuses it (RS-21).**
+With `stores.migration.mode: dual-read` a lookup that misses the local store
+falls through to the migration source and creates the local account on the
+spot (`internal/store/migrating`), and the lookup is made by unauthenticated
+routes: a `POST <prefix>/login` or `/forgot-password` naming any address the
+pool holds provisions it, and the reset mail then goes out as for any account.
+The pool's own state is not read on the way — a user disabled or unconfirmed in
+the pool is provisioned like any other — and a pool that allows self sign-up
+would make its sign-up this realm's for as long as the mode stayed on. So
+`registration.closed` beside `dual-read` does not start, with the remedy named:
+run `cmd/migrate cognito` to completion and keep the mode at `import-only` (its
+default), or leave the realm open for the migration window if accounts are meant
+to arrive from the pool on first use. An inactive block (no
+`stores.migration.source`) is not refused, since its mode reads nothing. The SAM
+template refuses the same at changeset time (Rule
+`ClosedRegistrationRefusesDualRead`); it does not step aside for a
+`ConfigFile`, because both knobs reach the function as environment variables,
+which beat the document. `cmd/migrate` itself imports every record with an
+email, whatever its pool state, as it always has: it runs with the operator's
+credentials and not over HTTP, so what it imports is the operator's choice, and
+skipping disabled or unconfirmed pool users there is a separate change.
 
 A front door that blocks `POST <prefix>/register` at the edge is still worth
 keeping as a second layer, and before this switch it was the only one.

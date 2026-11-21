@@ -106,6 +106,22 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage: "no second factor",
 		},
 		{
+			// RS-21: a closed realm whose migration source provisions an
+			// account on an unauthenticated lookup. internal/config
+			// realm_test.go walks the shapes around it.
+			name: "RS-21 closed registration beside a dual-read migration",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+				set(doc, "stores.migration.region", "eu-west-1")
+				set(doc, "stores.migration.mode", MigrationModeDualRead)
+			},
+			wantRule:    RuleClosedRegistrationDualRead,
+			wantPath:    "stores.migration.mode",
+			wantMessage: "unauthenticated lookup is a sign-up",
+		},
+		{
 			name: "RS-3 CSRF disabled in cookie mode",
 			mutate: func(doc Document) {
 				set(doc, "security.csrf.enabled", false)

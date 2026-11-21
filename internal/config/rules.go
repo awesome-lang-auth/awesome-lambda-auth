@@ -44,7 +44,41 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS18AdminCrossSiteCookie(c, d)
 	checkRS19ClosedRegistrationOAuth(c, d)
 	checkRS20TwoFactorRequiredSignIn(c, d)
+	checkRS21ClosedRegistrationDualRead(c, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS21ClosedRegistrationDualRead: a closed realm that dual-reads a
+// migration source is refused.
+//
+// registration.closed promises that no route creates an account (config
+// reference §20). Dual-read breaks that promise on two unauthenticated routes:
+// a GetUserByEmail miss falls through to the source, and the row is created
+// locally for whatever the pool holds (internal/store/migrating
+// provisionFromSource). The account so created is then an ordinary local
+// account — POST /forgot-password mails its reset link, POST /login signs it
+// in — and the pool's state is not read on the way: a user disabled or
+// unconfirmed in the pool is provisioned like any other, and a pool that
+// allows self sign-up is a sign-up form for this realm for as long as the
+// mode stays on.
+//
+// Refused rather than warned, because the two settings contradict each other
+// rather than combine: a closed realm's accounts are the ones its operator
+// put there, and the import (cmd/migrate cognito, which runs with operator
+// credentials and is not reachable over HTTP) is the way to put them there.
+// The mode is only a safety net for an incomplete import; a realm that is
+// closed runs the import to completion and keeps the mode at import-only.
+// Inactive blocks are not refused: DualRead is false without a source.
+func checkRS21ClosedRegistrationDualRead(c *Config, d *diagnostics) {
+	if !c.Registration.Closed || !c.Stores.Migration.DualRead() {
+		return
+	}
+	d.errf(RuleClosedRegistrationDualRead, "stores.migration.mode",
+		fmt.Sprintf("registration.closed is on, and stores.migration.mode is dual-read: a POST <prefix>/login or /forgot-password naming any address the %s source holds creates the local account on the spot, "+
+			"without reading whether the source still has the user enabled or confirmed -- an unauthenticated lookup is a sign-up for every account in the source, and on a source that allows self sign-up for anyone",
+			c.Stores.Migration.Source),
+		"import the accounts with cmd/migrate cognito and set stores.migration.mode: import-only (AWESOME_AUTH_STORES_MIGRATION_MODE=import-only) on the closed realm, "+
+			"or set registration.closed: false for the migration window if accounts are meant to arrive from the source on first use")
 }
 
 // checkRS19ClosedRegistrationOAuth: a closed realm whose OAuth callback still

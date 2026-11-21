@@ -281,6 +281,96 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 	}
 }
 
+// TestClosedRegistrationBesideDualRead is RS-21 and the shapes around it.
+// Dual-read provisions the local account for any address the migration source
+// holds, on an unauthenticated lookup, so a closed realm beside it is refused;
+// the import-only mode, an open realm and an inactive block each load. Every
+// source of the two knobs counts: the environment layer as well as the
+// document.
+func TestClosedRegistrationBesideDualRead(t *testing.T) {
+	migration := func(mode string) func(Document) {
+		return func(doc Document) {
+			set(doc, "stores.migration.source", MigrationSourceCognito)
+			set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+			set(doc, "stores.migration.region", "eu-west-1")
+			set(doc, "stores.migration.mode", mode)
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(Document)
+		env     map[string]string
+		refused bool
+		// otherRule is a different rule the shape is refused by, if any.
+		otherRule string
+	}{
+		{
+			name:    "closed, dual-read",
+			mutate:  func(doc Document) { set(doc, "registration.closed", true); migration(MigrationModeDualRead)(doc) },
+			refused: true,
+		},
+		{
+			name:    "closed from the environment, dual-read from the environment",
+			mutate:  migration(MigrationModeImportOnly),
+			env:     map[string]string{"AWESOME_AUTH_REGISTRATION_CLOSED": "true", "AWESOME_AUTH_STORES_MIGRATION_MODE": MigrationModeDualRead},
+			refused: true,
+		},
+		{
+			name:   "closed, import-only",
+			mutate: func(doc Document) { set(doc, "registration.closed", true); migration(MigrationModeImportOnly)(doc) },
+		},
+		{
+			name:   "open, dual-read",
+			mutate: migration(MigrationModeDualRead),
+		},
+		{
+			// The mode is inert without a source. RS-13 refuses the block as
+			// half-configured; RS-21 has nothing to say about it.
+			name: "closed, a dual-read mode with no source",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				set(doc, "stores.migration.mode", MigrationModeDualRead)
+			},
+			otherRule: RuleMigrationIncomplete,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if tc.refused {
+				d := requireRule(t, err, RuleClosedRegistrationDualRead, "stores.migration.mode")
+				for _, want := range []string{"registration.closed", "dual-read", "cognito", "enabled or confirmed", "cmd/migrate cognito", "import-only"} {
+					if !strings.Contains(d.Error(), want) {
+						t.Errorf("the RS-21 diagnostic does not mention %q:\n%s", want, d.Error())
+					}
+				}
+				if n := len(validationError(t, err).Diagnostics); n != 1 {
+					t.Errorf("RS-21 reported %d diagnostics, want exactly one: %v", n, err)
+				}
+				return
+			}
+			if tc.otherRule != "" {
+				for _, d := range validationError(t, err).Diagnostics {
+					if d.Rule == RuleClosedRegistrationDualRead {
+						t.Errorf("RS-21 refused a block with no source: %v", d)
+					}
+				}
+				requireRule(t, err, tc.otherRule, "stores.migration.source")
+				return
+			}
+			if err != nil {
+				t.Fatalf("this configuration must load:\n%v", err)
+			}
+		})
+	}
+}
+
 // TestTwoFactorPolicyWarnings: the loader says, where the deployment tooling
 // reads it, what each 2FA knob does where it meets a surface that does not
 // follow it — forced enrolment is trust on first use, and the identity

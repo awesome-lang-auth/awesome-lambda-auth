@@ -139,6 +139,17 @@ const (
 	// config-require2fa-is-a-system-policy-term).
 	RuleTwoFactorRequiredSignIn = "RS-20"
 
+	// RuleClosedRegistrationDualRead refuses registration.closed beside
+	// stores.migration.mode: dual-read. Dual-read creates the local account
+	// for any address the source pool holds on an unauthenticated lookup — a
+	// POST <prefix>/login or /forgot-password naming it — and the pool's own
+	// state is not consulted: a user disabled or unconfirmed in the pool is
+	// provisioned like any other, and on a pool that allows self sign-up the
+	// pool's sign-up becomes this realm's. So the realm would not be closed
+	// for the length of the migration window, whatever registration.closed
+	// says. A product rule: the reference has neither knob.
+	RuleClosedRegistrationDualRead = "RS-21"
+
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start
 	// with the same posture as any §2 rule.

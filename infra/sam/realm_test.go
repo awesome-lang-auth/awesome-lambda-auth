@@ -87,6 +87,27 @@ func TestClosedRegistrationRefusesOAuthSignUpIsARule(t *testing.T) {
 	}
 }
 
+// TestClosedRegistrationRefusesDualReadIsARule pins RS-21 at changeset time: a
+// closed realm migrating from a pool may not dual-read it, whatever ConfigFile
+// says, since both knobs reach the function as environment variables.
+func TestClosedRegistrationRefusesDualReadIsARule(t *testing.T) {
+	t.Parallel()
+	text := rule(t, "ClosedRegistrationRefusesDualRead")
+	for _, want := range []string{
+		"- !Equals [!Ref ClosedRegistration, 'true']",
+		"- !Not [!Equals [!Ref CognitoUserPoolId, '']]",
+		"- Assert: !Not [!Equals [!Ref CognitoMigrationMode, 'dual-read']]",
+		"RS-21",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("ClosedRegistrationRefusesDualRead lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "ConfigFile, ''") {
+		t.Errorf("ClosedRegistrationRefusesDualRead steps aside for a ConfigFile, which cannot override either environment variable:\n%s", text)
+	}
+}
+
 // TestAdminMachineApiIsConditionalAndIAMAuthorized pins the internal API:
 // nothing exists without a principal and the console, its one route is ANY
 // /admin/{proxy+} under AWS_IAM, it invokes the auth function with payload

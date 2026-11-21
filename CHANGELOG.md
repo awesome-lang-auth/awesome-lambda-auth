@@ -21,7 +21,12 @@ under [Unreleased].
   off — the domain is matched on the address the provider asserts, so without
   verification it narrows nothing; with both it loads and warns. The SAM Rule
   `ClosedRegistrationRefusesOAuthSignUp` refuses the same at changeset time when no
-  `ConfigFile` is supplied. No route creates an account on a closed realm — the
+  `ConfigFile` is supplied. New refuse-to-start rule **RS-21**: a closed realm
+  beside `stores.migration.mode: dual-read`, which creates the local account for
+  any address the migration source holds the first time a login or a password
+  reset names it, without reading whether the source still has the user enabled
+  or confirmed; the SAM Rule `ClosedRegistrationRefusesDualRead` refuses it at
+  changeset time. No route creates an account on a closed realm — the
   admin console has none — so accounts come from `cmd/migrate`, a domain-narrowed
   OAuth callback or a tool on the store. The earlier advice to keep registration
   open and put an `AWS_IAM` route for `POST <prefix>/register` in front of the
