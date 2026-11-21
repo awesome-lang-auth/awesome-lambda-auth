@@ -3848,7 +3848,7 @@ The loader refuses, at cold start:
 - `invitations.enabled` with no `email.mailer`, no `email.deliveryWebhook` and no `admin.revealInvitationToken` — the invite route would answer `501` to every call;
 - `admin.revealInvitationToken` beside `email.mailer` or `email.deliveryWebhook` — the core mails the token and ignores the flag, and a deployment that mails tokens must never hand them to an HTTP caller;
 - `admin.revealInvitationToken` or `invitations.reinvite` while `invitations.enabled` is off;
-- `invitations.ttl` above `30d`.
+- `invitations.ttl` above `30d`, or one that is not a positive span (RS-9).
 
 The first-user console policy is already refused on every driver (RS-17), which is
 the one policy the core's invite route also refuses.
@@ -3857,6 +3857,23 @@ It warns, without refusing, about `invitations.enabled` under
 `twoFactor.required` without `twoFactor.enrolOnLogin`. No invitee can reach a
 session alone there (§21.4), but an operator can still enrol each one out of
 band after it has accepted.
+
+The SAM template refuses the same configurations earlier, at changeset time,
+wherever its parameters decide them alone. A refusal at cold start takes every
+route of the realm down, login included, until a rollback.
+
+- `InvitationsTtl`'s pattern admits a whole number of minutes, hours or days
+  from `1m` to `30d`, written without a leading zero, or empty.
+- The Rules `InvitationsRefuseResourceServer` and `RevealRefusesASender` refuse
+  their pairs whatever `ConfigFile` says, because the variables they read beat
+  the document.
+- With no `ConfigFile`, the Rules `InvitationsNeedTheConsole`,
+  `InvitationsNeedADelivery`, `RevealNeedsInvitations` and
+  `ReinviteNeedsInvitations` refuse the rest. With one, they step aside: the
+  document may supply what the parameters leave out, and the loader decides.
+
+The open console has no Rule, since the template does not offer `open`. The
+`twoFactor.required` warning has none either, since it refuses nothing.
 
 ### 21.2 Delivery
 

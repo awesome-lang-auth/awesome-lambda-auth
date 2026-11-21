@@ -458,7 +458,17 @@ Parameters:
   # SHA-256 is stored (the table's INV#, INVTOKEN# and INVUSER# items, which
   # the AuthTableItems grants already cover). It needs EnableAdminConsole and
   # a sender (MailerFromAddress or EmailDeliveryWebhookUrl) or
-  # AdminRevealInvitationToken; the function refuses to start otherwise.
+  # AdminRevealInvitationToken.
+  #
+  # The function refuses at cold start what these four parameters can get
+  # wrong (config-reference §21.1), and a refusal there is every route of the
+  # realm down, login included, until a rollback. So whatever the parameters
+  # decide alone is refused here first, at changeset time: InvitationsTtl by
+  # its pattern, the rest by the Rules Invitations*, Reveal* and Reinvite* in
+  # the Rules section. Like the realm switches above, each of the four sets
+  # its variable only when switched on or given, so "false" or empty leaves a
+  # ConfigFile's value in place; with a ConfigFile, the Rules a document could
+  # satisfy step aside, and the function decides with both sources in view.
   InvitationsEnabled:
     Type: String
     Default: 'false'
@@ -482,7 +492,16 @@ Parameters:
   InvitationsTtl:
     Type: String
     Default: ''
-    AllowedPattern: '^$|^[0-9]+(m|h|d)$'
+    # The loader's bound as a pattern: one whole number of minutes, hours or
+    # days, from 1m to 30d (43200m, 720h), with no leading zero. The loader
+    # reads more spellings than this ("1w", "3 days", "072h") and refuses zero
+    # and anything past 30d at cold start; this admits no value it refuses
+    # (infra/sam TestInvitationsTtlPatternIsTheLoaders).
+    AllowedPattern: '^$|^([1-9][0-9]{0,3}|[1-3][0-9]{4}|4[0-2][0-9]{3}|43[01][0-9]{2}|43200)m$|^([1-9][0-9]?|[1-6][0-9]{2}|7[01][0-9]|720)h$|^([1-9]|[12][0-9]|30)d$'
+    ConstraintDescription: >-
+      InvitationsTtl must be a whole number of minutes, hours or days with no
+      leading zero, from 1m to 30d (at most 43200m, 720h or 30d), such as 72h
+      or 3d; or empty.
     Description: >-
       AWESOME_AUTH_INVITATIONS_TTL. How long an invitation's token is honoured,
       as "72h" or "3d"; at most 30d. Empty — the default — keeps 72h.
@@ -2299,6 +2318,107 @@ Rules:
           flag the first one with a promote through AdminMachinePrincipalArns,
           in the table, or with the root user on a deploy before
           TwoFactorRequired is turned on.
+
+  # Staff invitations (config-reference §21.1) at changeset time. These six
+  # and InvitationsTtl's pattern are every refusal of the loader's
+  # (internal/config validateInvitations) that the parameters can reach, and
+  # infra/sam TestInvitationRulesRefuseWhatTheLoaderRefuses holds them to it
+  # both ways, over every combination of the switches involved.
+  #
+  # Unconditional, the two the environment decides alone: the variables they
+  # read beat any document. AWESOME_AUTH_RS_ENABLED is always set, and a
+  # reveal flag or a sender this template sets cannot be unset by one.
+  RevealRefusesASender:
+    RuleCondition: !Equals [!Ref AdminRevealInvitationToken, 'true']
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref MailerFromAddress, '']
+          - !Equals [!Ref EmailDeliveryWebhookUrl, '']
+        AssertDescription: >-
+          AdminRevealInvitationToken is "true" beside MailerFromAddress or
+          EmailDeliveryWebhookUrl. With a sender wired the core mails the
+          token and ignores the flag, and a deployment that mails tokens must
+          not also hand them to an HTTP caller, so the function would refuse
+          to start. Set AdminRevealInvitationToken to "false": it is for a
+          deployment with no sender, whose back office delivers the token
+          itself.
+
+  InvitationsRefuseResourceServer:
+    RuleCondition: !Equals [!Ref InvitationsEnabled, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref EnableResourceServer, 'false']
+        AssertDescription: >-
+          InvitationsEnabled is "true" and EnableResourceServer is "true", but
+          resource-server mode mounts no credential route, so POST
+          <ApiPrefix>/invitations/accept would answer 404 and the function
+          would refuse to start. Turn invitations on in the stack that issues
+          the tokens, not in the resource server.
+
+  # Document-aware, the four a ConfigFile can satisfy: admin.enabled, a
+  # sender, admin.revealInvitationToken and invitations.enabled are all
+  # document knobs too, and each variable these parameters set is set only
+  # when "true", so a "false" parameter leaves the document's value in place.
+  # With a document supplied they step aside and the function decides, with
+  # both sources in view.
+  #
+  # Not here, on purpose: invitations behind an open console (this template
+  # offers no "open" AdminAccessPolicy, so only a ConfigFile reaches that
+  # refusal); invitations under TwoFactorRequired without
+  # TwoFactorEnrolOnLogin (the function warns and starts, so a Rule would be
+  # stricter than the code); and InvitationsTtl given while invitations are
+  # off (the loader reads the TTL only with them on).
+  InvitationsNeedTheConsole:
+    RuleCondition: !And
+      - !Equals [!Ref InvitationsEnabled, 'true']
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Equals [!Ref EnableAdminConsole, 'true']
+        AssertDescription: >-
+          InvitationsEnabled is "true", so set EnableAdminConsole to "true":
+          POST <AdminPath>/api/users/invitations is the only route that
+          creates an invitation, and with the console off nothing mounts it,
+          so the function would refuse to start. A ConfigFile that turns the
+          console on lifts this Rule.
+
+  InvitationsNeedADelivery:
+    RuleCondition: !And
+      - !Equals [!Ref InvitationsEnabled, 'true']
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref MailerFromAddress, '']]
+          - !Not [!Equals [!Ref EmailDeliveryWebhookUrl, '']]
+          - !Equals [!Ref AdminRevealInvitationToken, 'true']
+        AssertDescription: >-
+          InvitationsEnabled is "true" with no way to deliver a token, so every
+          invite would answer 501 and the function would refuse to start. Set
+          MailerFromAddress (the invitation mail) or EmailDeliveryWebhookUrl
+          (kind "invitation"); or, for a back office that delivers the token
+          itself, set AdminRevealInvitationToken to "true".
+
+  RevealNeedsInvitations:
+    RuleCondition: !And
+      - !Equals [!Ref AdminRevealInvitationToken, 'true']
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Equals [!Ref InvitationsEnabled, 'true']
+        AssertDescription: >-
+          AdminRevealInvitationToken is "true" while InvitationsEnabled is
+          "false", so no invitation route is mounted and the function would
+          refuse to start. Set InvitationsEnabled to "true", or
+          AdminRevealInvitationToken to "false".
+
+  ReinviteNeedsInvitations:
+    RuleCondition: !And
+      - !Equals [!Ref InvitationsReinvite, 'true']
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Equals [!Ref InvitationsEnabled, 'true']
+        AssertDescription: >-
+          InvitationsReinvite is "true" while InvitationsEnabled is "false", so
+          no invitation route is mounted and the function would refuse to
+          start. Set InvitationsEnabled to "true", or InvitationsReinvite to
+          "false".
 
 Resources:
 

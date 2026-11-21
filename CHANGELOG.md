@@ -33,7 +33,11 @@ under [Unreleased].
   deliver a token. It warns about invitations under `twoFactor.required`
   without `twoFactor.enrolOnLogin`. That realm loads, but no invitee can
   enrol alone: each waits for an out-of-band enrolment after accepting, and
-  enrolling before the acceptance makes it spend and refuse the token.
+  enrolling before the acceptance makes it spend and refuse the token. The
+  SAM template refuses at changeset time every one of these refusals that its
+  parameters reach: six Rules, and an `InvitationsTtl` pattern that admits
+  `1m` to `30d`. A mistyped parameter then fails the changeset, not every
+  cold start (`docs/config-reference.md` §21.1).
 - **DynamoDB `InvitationStore`** (`internal/store/dynamodb/invitations.go`) in
   the single table: `INV#<id>` (the record; the token's SHA-256 only),
   `INVTOKEN#<hash>` (the pointer the consume finds it by) and
