@@ -10,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	auth "github.com/nik2208/awesome-go-auth"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
@@ -227,6 +228,111 @@ func TestStaffInvitationRealmOnDynamoDB(t *testing.T) {
 	}
 	if invitations == 0 {
 		t.Fatal("no invitation record reached the table: the DynamoDB store was not the one handed to the core")
+	}
+}
+
+// TestPendingInvitationOutlivesTheTTLSweep: DynamoDB TTL never reaps a pending
+// invitation. The sweep is simulated at the end of time — every item that
+// carries a ttl is deleted — and the invitation must still be what the core
+// says a pending one is until it is revoked: listed, holding its account
+// against /forgot-password (a reset there would leave a password on an
+// unverified address, which neither the login nor an invitation accepts),
+// replaceable by a re-invitation, and revocable with its account.
+func TestPendingInvitationOutlivesTheTTLSweep(t *testing.T) {
+	endpoint, ok := localDynamoDBEndpoint()
+	if !ok {
+		t.Skip("DYNAMODB_ENDPOINT is not set; start DynamoDB Local and set it to run invitations on the deployed driver")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	table := "authtest_cmd_auth_sweep_" + randomSuffix(t)
+	client, err := awsintegration.NewDynamoDBClient(ctx, awsintegration.DynamoDBOptions{Region: "us-east-1", Endpoint: endpoint})
+	if err != nil {
+		t.Skipf("cannot build a DynamoDB client for %s: %v", endpoint, err)
+	}
+	if err := ddbstore.CreateTable(ctx, client, table); err != nil {
+		t.Skipf("cannot create %s at %s (%v)", table, endpoint, err)
+	}
+	t.Cleanup(func() {
+		_, _ = client.DeleteTable(context.Background(), &awsddb.DeleteTableInput{TableName: aws.String(table)})
+	})
+	d := newDeliveryAppWith(t, mailerEnv(staffRealmEnv(
+		"AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN", "false",
+		"AWESOME_AUTH_INVITATIONS_REINVITE", "true",
+		"AWESOME_AUTH_STORES_DRIVER", config.StoreDriverDynamoDB,
+		"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", table,
+		"AWESOME_AUTH_STORES_CONNECTION_REGION", "us-east-1",
+		"AWESOME_AUTH_STORES_CONNECTION_ENDPOINT", endpoint,
+	)), func(o *Options) { o.Stores = nil })
+	t.Cleanup(d.app.Close)
+
+	sweep := func() {
+		t.Helper()
+		var start map[string]types.AttributeValue
+		for {
+			page, err := client.Scan(ctx, &awsddb.ScanInput{TableName: aws.String(table), ExclusiveStartKey: start})
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			for _, it := range page.Items {
+				if _, hasTTL := it["ttl"]; !hasTTL {
+					continue
+				}
+				if _, err := client.DeleteItem(ctx, &awsddb.DeleteItemInput{
+					TableName: aws.String(table),
+					Key:       map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]},
+				}); err != nil {
+					t.Fatalf("delete: %v", err)
+				}
+			}
+			if start = page.LastEvaluatedKey; len(start) == 0 {
+				return
+			}
+		}
+	}
+	invite := func(want int) string {
+		t.Helper()
+		resp := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, `{"email":"lapsed@example.test","role":"staff"}`)
+		id, _ := decodeBody(t, resp)["invitationId"].(string)
+		if resp.StatusCode != want || id == "" {
+			t.Fatalf("invite answered %d %s, want %d and an invitation id", resp.StatusCode, resp.Body, want)
+		}
+		return id
+	}
+	listed := func() string {
+		t.Helper()
+		resp := invokeIAM(t, d.app, http.MethodGet, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("the listing answered %d %s", resp.StatusCode, resp.Body)
+		}
+		return resp.Body
+	}
+
+	first := invite(http.StatusCreated)
+	sweep()
+	if !strings.Contains(listed(), first) {
+		t.Fatalf("the sweep took the pending invitation %s out of the listing", first)
+	}
+	d.mail.reset()
+	if fp := invoke(t, d.app, http.MethodPost, "/auth/forgot-password", jsonHeaders(), nil, `{"email":"lapsed@example.test"}`); fp.StatusCode != http.StatusOK {
+		t.Fatalf("forgot-password answered %d %s", fp.StatusCode, fp.Body)
+	}
+	if msgs := d.mail.messages(); len(msgs) != 0 {
+		t.Fatalf("after the sweep /forgot-password mailed the reserved account %d message(s); a reset would lock the invitee out", len(msgs))
+	}
+
+	// The account is still the invitation's: a re-invitation replaces it.
+	second := invite(http.StatusOK)
+	sweep()
+	if body := listed(); !strings.Contains(body, second) || strings.Contains(body, first) {
+		t.Fatalf("after the re-invitation the listing is %s, want %s and not the retired %s", body, second, first)
+	}
+	rev := invokeIAM(t, d.app, http.MethodDelete, "/admin/api/users/invitations/"+second, jsonHeaders(), testMachineCaller, "")
+	if rev.StatusCode != http.StatusOK || decodeBody(t, rev)["accountRemoved"] != true {
+		t.Fatalf("revoking the swept-over invitation answered %d %s, want 200 accountRemoved true", rev.StatusCode, rev.Body)
 	}
 }
 
