@@ -469,6 +469,32 @@ func singleQuotedPattern(t *testing.T, tpl *template, param string) *regexp.Rege
 	return pattern
 }
 
+// parameterText returns one parameter's definition, from its name to the
+// blank line after it, with its lines joined by single spaces, so that a
+// phrase reads the same wherever the folded description breaks it.
+func parameterText(t *testing.T, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	_, params, ok := strings.Cut(body, "\nParameters:\n")
+	if ok {
+		params, _, ok = strings.Cut(params, "\nConditions:\n")
+	}
+	if !ok {
+		t.Fatal("found no Parameters section ahead of Conditions")
+	}
+	params = "\n" + params
+	i := strings.Index(params, "\n  "+name+":\n")
+	if i < 0 {
+		t.Fatalf("parameter %s is gone", name)
+	}
+	text, _, _ := strings.Cut(params[i+1:], "\n\n")
+	return strings.Join(strings.Fields(text), " ")
+}
+
 // TestInvitationsTtlPatternIsTheLoaders holds InvitationsTtl's AllowedPattern
 // to what the loader does with invitations.ttl, as
 // TestAdminMachinePrincipalPatternIsTheLoaders does for the principals: what
@@ -758,5 +784,28 @@ func TestInvitationRulesRefuseWhatTheLoaderRefuses(t *testing.T) {
 	}
 	if disagreements > 0 {
 		t.Errorf("the Rules and config.Load disagree on %d of %d parameter sets", disagreements, combinations)
+	}
+}
+
+// TestInvitationParameterDescriptionsLeaveTheConfigFileItsSay: the four
+// invitation parameters set their variable only when switched on or given, so
+// their off value says nothing about a ConfigFile's, and a description must
+// not promise what "false" cannot enforce. Each also names the Rules that
+// refuse, at changeset time, what the function would refuse at cold start.
+func TestInvitationParameterDescriptionsLeaveTheConfigFileItsSay(t *testing.T) {
+	t.Parallel()
+	const off = `"false" — the default — leaves the ConfigFile's value (off unless the document turns it on); "true" forces it on.`
+	for param, wants := range map[string][]string{
+		"InvitationsEnabled":         {off, "InvitationsRefuseResourceServer", "InvitationsNeedTheConsole", "InvitationsNeedADelivery"},
+		"InvitationsReinvite":        {off, "ReinviteNeedsInvitations"},
+		"AdminRevealInvitationToken": {off, "RevealRefusesASender", "RevealNeedsInvitations"},
+		"InvitationsTtl":             {"Empty — the default — leaves the ConfigFile's invitations.ttl", "30d"},
+	} {
+		text := parameterText(t, param)
+		for _, want := range wants {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s's definition lacks %q:\n%s", param, want, text)
+			}
+		}
 	}
 }

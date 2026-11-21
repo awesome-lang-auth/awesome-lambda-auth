@@ -483,11 +483,17 @@ Parameters:
       opens. Without TwoFactorEnrolOnLogin no invitee can enrol alone: each
       waits for an out-of-band enrolment after accepting, and enrolling
       before acceptance makes the acceptance spend and refuse the token. The
-      function warns about this. Needs EnableAdminConsole and a sender or
-      AdminRevealInvitationToken. The accept route is outside the default
-      rate-limit scope: name accept-invitation in rateLimit.scope (ConfigFile)
-      to limit it per client address. "false" — the default — mounts none of
-      them.
+      function warns about this. Refused beside EnableResourceServer "true",
+      whatever the ConfigFile says (Rule InvitationsRefuseResourceServer).
+      With no ConfigFile it needs EnableAdminConsole "true" (Rule
+      InvitationsNeedTheConsole) and a sender — MailerFromAddress or
+      EmailDeliveryWebhookUrl — or AdminRevealInvitationToken "true" (Rule
+      InvitationsNeedADelivery); with one, the document may supply them, and
+      the function refuses to start if it does not. The accept route is
+      outside the default rate-limit scope: name accept-invitation in
+      rateLimit.scope (ConfigFile) to limit it per client address. "false" —
+      the default — leaves the ConfigFile's value (off unless the document
+      turns it on); "true" forces it on.
 
   InvitationsTtl:
     Type: String
@@ -503,8 +509,11 @@ Parameters:
       leading zero, from 1m to 30d (at most 43200m, 720h or 30d), such as 72h
       or 3d; or empty.
     Description: >-
-      AWESOME_AUTH_INVITATIONS_TTL. How long an invitation's token is honoured,
-      as "72h" or "3d"; at most 30d. Empty — the default — keeps 72h.
+      AWESOME_AUTH_INVITATIONS_TTL. How long an invitation's token is
+      honoured: a whole number of minutes, hours or days, such as "72h" or
+      "3d", from 1m to 30d. Zero and anything longer than 30d are refused
+      here, as the function would refuse them at cold start. Empty — the
+      default — leaves the ConfigFile's invitations.ttl, or 72h without one.
 
   InvitationsReinvite:
     Type: String
@@ -513,8 +522,11 @@ Parameters:
     Description: >-
       AWESOME_AUTH_INVITATIONS_REINVITE. "true" lets an address whose account
       is still pending be invited again (200, a fresh token, the earlier
-      tokens retired). "false" — the default — answers 409, and the way to
-      re-send is revoke, then invite.
+      tokens retired); with it off, such an invitation answers 409, and the
+      way to re-send is revoke, then invite. With no ConfigFile it needs
+      InvitationsEnabled "true" (Rule ReinviteNeedsInvitations). "false" —
+      the default — leaves the ConfigFile's value (off unless the document
+      turns it on); "true" forces it on.
 
   AdminRevealInvitationToken:
     Type: String
@@ -527,8 +539,11 @@ Parameters:
       on the strength of the token having reached that mailbox, and a revealed
       token reaches whoever called the admin API instead — its logs, and the
       channel it forwards the link through. Refused beside MailerFromAddress
-      or EmailDeliveryWebhookUrl (the function would mail the token anyway).
-      "false" — the default — never puts a token in an admin answer.
+      or EmailDeliveryWebhookUrl, whatever the ConfigFile says (Rule
+      RevealRefusesASender: the function would mail the token anyway), and,
+      with no ConfigFile, without InvitationsEnabled "true" (Rule
+      RevealNeedsInvitations). "false" — the default — leaves the ConfigFile's
+      value (off unless the document turns it on); "true" forces it on.
 
   # -----------------------------------------------------------------------
   # Second factor and token claims (config-schema.md §1.1, §1.8). The TOTP
@@ -2650,7 +2665,10 @@ Resources:
             MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
       TimeToLiveSpecification:
         # §4.5. Sessions, refresh pointers, all four single-use token pointers,
-        # pending OAuth links, telemetry and rate-limit counters carry `ttl`.
+        # pending OAuth links, telemetry and rate-limit counters carry `ttl`,
+        # and so does an accepted or revoked invitation record (INV#), 30 days
+        # past its expiry or its end, whichever is later. A pending invitation
+        # never does, expired or not (config-reference §21.5).
         # TTL is not a security boundary — deletion is best-effort within ~48h
         # and every read re-checks the expiry attribute in code.
         AttributeName: ttl
