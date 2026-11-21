@@ -161,9 +161,11 @@ type Options struct {
 	// Defaults to DefaultTelemetryRetention.
 	TelemetryRetention time.Duration
 
-	// InvitationRetention is how long past its ExpiresAt an invitation's three
-	// items are kept before DynamoDB TTL may delete them (invitations.go).
-	// Defaults to DefaultInvitationRetention.
+	// InvitationRetention is how long an accepted or revoked invitation's
+	// record is kept — past its expiry or its end, whichever is later — before
+	// DynamoDB TTL may delete it. A pending invitation, expired or not, is never
+	// given a ttl (invitations.go, retention). Defaults to
+	// DefaultInvitationRetention.
 	InvitationRetention time.Duration
 
 	// Logger receives the once-per-process warnings this store emits. Defaults
@@ -315,7 +317,6 @@ func (s *Store) CompatibilityNotes() []string {
 		"Listing users without naming a tenant orders them by tenant then id, which GET /admin/api/users exposes; the reference's normative order is id alone (data-model.md §1.4 #47).",
 		"Webhook subscriptions are listed, matched and looked up by provider in id order rather than in first-insertion order, so a deployment holding two inbound webhooks for one provider gets whichever has the lower id (data-model.md §1.5 #72).",
 		"Telemetry queries treat an absent tenant as the untenanted tenant rather than as every tenant, and refuse outright in multi-tenant mode; the reference reads an absent tenant as no filter at all (data-model.md §1.5 #60).",
-		"An invitation is deleted by DynamoDB TTL once Options.InvitationRetention (30 days by default) has passed since it expired, whether it was accepted, revoked or is still pending: an expired invitation nobody revoked stays listed by GET <admin>/api/users/invitations, and keeps reserving its account, until then; the core's in-memory store keeps a pending one until it is revoked (internal/store/dynamodb/invitations.go).",
 	}
 	if s.consumeOnRead {
 		notes = append(notes,

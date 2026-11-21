@@ -330,8 +330,8 @@ type Invitations struct {
 	// Config.InvitationTTL). Defaults to 72h, the core's own default; at most
 	// 30d, since an unredeemed invitation is a standing credential for an
 	// account with no password. The token expires; the pending account and
-	// the listed invitation do not, until an administrator revokes it or the
-	// store's retention runs out (CompatibilityNotes).
+	// the listed invitation do not, until an administrator revokes the
+	// invitation — no store reaps a pending one (config-reference §21.5).
 	TTL Duration `json:"ttl"`
 
 	// Reinvite lets an administrator invite again an address whose account is

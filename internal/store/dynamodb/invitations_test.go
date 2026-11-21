@@ -3,7 +3,6 @@ package dynamodb
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -313,31 +312,90 @@ func TestInvitationCreateRefusesACollision(t *testing.T) {
 	}
 }
 
-// The token is the credential: only its hash may be in the table, and every
-// item of an invitation carries the TTL of ExpiresAt plus the retention.
-func TestInvitationStoresOnlyTheHashAndATTL(t *testing.T) {
-	s, client := newStore(t)
+// The token is the credential: only its hash may be in the table.
+//
+// And no item of a pending invitation carries a ttl. The core keeps a pending
+// record — expired or not — listed, revocable and reserving its account until
+// it is revoked (invitation.go, Invitation), and the account it created has no
+// ttl: a sweep that reaped the invitation would leave a passwordless account
+// nothing lists or revokes, that a re-invitation answers 409 for, and that
+// /forgot-password then reaches. So the ttl is written by the transaction that
+// ends the invitation — retention past its expiry or its end, whichever is
+// later — the token pointer and the membership item leave in that transaction,
+// and a release hands all three back as they were, with no ttl.
+func TestInvitationCarriesNoTTLWhilePending(t *testing.T) {
+	const retention = 5 * 24 * time.Hour
+	s, client := newStore(t, func(o *Options) { o.InvitationRetention = retention })
+	ctx := context.Background()
 	inv, token := newInvitation(t, "usr_hana")
 	mustCreate(t, s, inv)
 
-	out, err := client.Scan(context.Background(), &awsddb.ScanInput{TableName: aws.String(s.table)})
-	if err != nil {
-		t.Fatalf("scan: %v", err)
+	record := func() map[string]types.AttributeValue {
+		return rawItem(t, client, s.table, invitationPK(inv.ID), skInvitation)
 	}
-	if len(out.Items) != 3 {
-		t.Fatalf("an invitation wrote %d items, want 3 (record, token pointer, membership)", len(out.Items))
+	pointer := func() map[string]types.AttributeValue {
+		return rawItem(t, client, s.table, invitationTokenPK(inv.TokenHash), skInvitationToken)
 	}
-	wantTTL := strconv.FormatInt(inv.ExpiresAt.Add(DefaultInvitationRetention).Unix(), 10)
-	for _, it := range out.Items {
-		for name, av := range it {
-			if strings.Contains(attrString(av), token) {
-				t.Fatalf("the plaintext token is stored in %s of %s", name, getS(it, attrPK))
+	member := func() map[string]types.AttributeValue {
+		return rawItem(t, client, s.table, invitationUserPK(inv.UserID), invitationMemberSK(inv.ID))
+	}
+	pendingAsCreated := func(when string) {
+		t.Helper()
+		out, err := client.Scan(ctx, &awsddb.ScanInput{TableName: aws.String(s.table)})
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if len(out.Items) != 3 {
+			t.Fatalf("%s: the table holds %d items, want 3 (record, token pointer, membership)", when, len(out.Items))
+		}
+		for _, it := range out.Items {
+			for name, av := range it {
+				if strings.Contains(attrString(av), token) {
+					t.Fatalf("%s: the plaintext token is stored in %s of %s", when, name, getS(it, attrPK))
+				}
+			}
+			if ttl, ok := it[attrTTL]; ok {
+				t.Fatalf("%s: pending item %s carries ttl %v; DynamoDB would reap a pending invitation and orphan its account",
+					when, getS(it, attrPK), ttl)
 			}
 		}
-		if ttl, ok := it[attrTTL].(*types.AttributeValueMemberN); !ok || ttl.Value != wantTTL {
-			t.Fatalf("item %s ttl = %v, want %s", getS(it, attrPK), it[attrTTL], wantTTL)
+	}
+	endedWith := func(when string, want time.Time) {
+		t.Helper()
+		if got := getN(record(), attrTTL); got != want.Unix() {
+			t.Fatalf("%s: record ttl = %d, want %d (%s)", when, got, want.Unix(), want.UTC().Format(time.RFC3339))
+		}
+		if len(pointer()) != 0 || len(member()) != 0 {
+			t.Fatalf("%s: the token pointer (%v) or the membership item (%v) outlived the invitation", when, pointer(), member())
 		}
 	}
+
+	pendingAsCreated("created")
+	// Expired and never revoked: still pending, still no ttl.
+	if _, err := s.ConsumeInvitation(ctx, inv.TokenHash, inv.ExpiresAt.Add(time.Hour)); !errors.Is(err, auth.ErrInvitationNotFound) {
+		t.Fatalf("consume after expiry = %v, want ErrInvitationNotFound", err)
+	}
+	pendingAsCreated("expired")
+
+	// Accepted before its expiry: retention runs from the expiry.
+	consumed, err := s.ConsumeInvitation(ctx, inv.TokenHash, invitationEpoch.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	endedWith("accepted", inv.ExpiresAt.Add(retention))
+
+	// Handed back: pending again, exactly as created.
+	if err := s.ReleaseInvitation(ctx, inv.ID, *consumed.AcceptedAt); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	pendingAsCreated("released")
+
+	// Revoked long after its expiry: retention runs from the revocation.
+	revokedAt := inv.ExpiresAt.Add(10 * 24 * time.Hour)
+	if _, err := s.RevokeInvitation(ctx, inv.ID, revokedAt); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	endedWith("revoked", revokedAt.Add(retention))
 }
 
 func attrString(av types.AttributeValue) string {

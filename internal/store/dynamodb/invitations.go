@@ -30,12 +30,13 @@ import (
 //	                                 while pending — GSI1PK=INVITATION,
 //	                                 GSI1SK=<id>, the listing's sparse entry.
 //	INVTOKEN#<tokenHash> / INVTOKEN  the pointer ConsumeInvitation finds the id
-//	                                 by; it carries the id and nothing else.
+//	                                 by, while the invitation is pending; it
+//	                                 carries the id and nothing else.
 //	INVUSER#<userId>     / INV#<id>  one membership item per *pending*
 //	                                 invitation, in the user's own partition.
 //
 // All three are written by one transaction, each Put conditioned on
-// attribute_not_exists(PK), and all three carry the same ttl.
+// attribute_not_exists(PK), and none of them carries a ttl (see retention).
 //
 // The membership item is the per-user access pattern, and it is an item rather
 // than an index on purpose: PendingInvitationsForUser must be a consistent read
@@ -59,12 +60,13 @@ import (
 // that a write does not re-assert:
 //
 //   - consume: attribute_not_exists(acceptedAt) AND attribute_not_exists(
-//     revokedAt) AND expiresAt > :now AND tokenHash = :hash, SET acceptedAt,
-//     REMOVE the GSI1 pair; and Delete of the membership item.
+//     revokedAt) AND expiresAt > :now AND tokenHash = :hash, SET acceptedAt
+//     and the record's ttl, REMOVE the GSI1 pair; and Delete of the
+//     membership item and of the token pointer.
 //   - revoke: the same with the expiry clause dropped, SET revokedAt.
 //   - release: acceptedAt = :acceptedAt AND attribute_not_exists(revokedAt),
-//     REMOVE acceptedAt, SET the GSI1 pair again; and Put of the membership
-//     item.
+//     REMOVE acceptedAt and the ttl, SET the GSI1 pair again; and Put of the
+//     membership item and of the token pointer.
 //
 // Timestamps use this table's fixed-width tsLayout (item.go), so the string
 // comparison expiresAt > :now is chronological and acceptedAt = :acceptedAt
@@ -73,21 +75,32 @@ import (
 // different one. The expiry is decided against the now the call is given, never
 // left to TTL.
 //
-// Every call is a GetItem, Query, BatchGetItem or a transaction of conditioned
+// Every call is a GetItem, Query, BatchGetItem or a transaction of
 // Put/Update/Delete — no bare ConditionCheck — so the function role's existing
 // AuthTableItems and AuthTableIndexQuery grants cover all of it, and
 // iam_test.go pins that.
 //
 // ── retention ───────────────────────────────────────────────────────────────
 //
-// The ttl of all three items is ExpiresAt + Options.InvitationRetention (30
-// days by default). DynamoDB deletes them some time after that — best effort,
-// within about 48 hours — and until then nothing reads ttl: an expired token
-// is refused by the consume's condition, not by the sweep. That makes one
-// difference to the core's memory store, which keeps a pending record until it
-// is revoked: here an expired invitation nobody revoked stays listed (as
-// "expired") and keeps reserving its account for the retention, and then goes.
-// CompatibilityNotes says so.
+// A pending invitation carries no ttl, on any of its three items, expired or
+// not. The core keeps a pending record listed, revocable and reserving its
+// account until it is revoked (invitation.go, Invitation), and the account it
+// created carries no ttl: a sweep that reaped the invitation would leave a
+// passwordless account that nothing lists or revokes, that a re-invitation
+// answers 409 for, and that /forgot-password reaches — a reset there leaves a
+// password on an unverified address, which neither the login nor an
+// invitation accepts. An offer that is meant to lapse is revoked, through the
+// core, which also removes the untouched account; never by TTL.
+//
+// The transaction that ends an invitation — the consume or the revoke — sets
+// the record's ttl to Options.InvitationRetention (30 days by default) past
+// its expiry or its end, whichever is later, and deletes the other two items;
+// a release removes the ttl and puts them back. DynamoDB deletes the ended
+// record some time after its ttl — best effort, within about 48 hours — and a
+// second revocation then answers ErrInvitationNotFound where it answered
+// ErrInvitationNotPending, as the core's memory store does once it forgets an
+// ended record a day after its end. Nothing reads ttl: an expired token is
+// refused by the consume's condition, never by the sweep.
 
 var _ auth.InvitationStore = (*Store)(nil)
 
@@ -97,8 +110,9 @@ var _ auth.InvitationStore = (*Store)(nil)
 // the shape of AuthCodes().
 func (s *Store) Invitations() auth.InvitationStore { return s }
 
-// DefaultInvitationRetention is how long past its ExpiresAt an invitation's
-// items are kept before TTL may delete them.
+// DefaultInvitationRetention is how long an accepted or revoked invitation's
+// record is kept — past its expiry or its end, whichever is later — before TTL
+// may delete it. A pending invitation is never given a ttl.
 const DefaultInvitationRetention = 30 * 24 * time.Hour
 
 // maxPendingInvitationsPerUser caps PendingInvitationsForUser, which takes no
@@ -152,18 +166,22 @@ func invitationMemberKey(userID, id string) itemKey {
 // itemKey is a main-table primary key.
 type itemKey = map[string]types.AttributeValue
 
-// invitationTTL is the ttl every item of one invitation carries.
-func (s *Store) invitationTTL(inv auth.Invitation) (time.Time, bool) {
-	if inv.ExpiresAt.IsZero() {
-		return time.Time{}, false
+// endedTTL is the ttl the transaction that ends inv at ended gives its record:
+// the retention past its expiry or its end, whichever is later. The ttl is an
+// attribute of an ended record only; see retention in the file comment.
+func (s *Store) endedTTL(inv auth.Invitation, ended time.Time) types.AttributeValue {
+	from := inv.ExpiresAt
+	if ended.After(from) {
+		from = ended
 	}
-	return inv.ExpiresAt.Add(s.invitationRetention), true
+	return avN(from.Add(s.invitationRetention).Unix())
 }
 
 // CreateInvitation writes the record, the token pointer and — for a pending
 // record, which is every record the core creates — the membership item, in one
-// transaction. An id or a token hash already held is auth.ErrAlreadyExists,
-// as MemoryInvitationStore answers; both are random, so it is a caller's bug.
+// transaction, none of them with a ttl. An id or a token hash already held is
+// auth.ErrAlreadyExists, as MemoryInvitationStore answers; both are random, so
+// it is a caller's bug.
 func (s *Store) CreateInvitation(ctx context.Context, inv auth.Invitation) error {
 	if inv.ID == "" || inv.TokenHash == "" {
 		return errors.New("dynamodb: invitation needs an id and a token hash")
@@ -185,25 +203,15 @@ func (s *Store) CreateInvitation(ctx context.Context, inv auth.Invitation) error
 	if err != nil {
 		return err
 	}
-	pointer := item{}.
-		sAlways(attrPK, invitationTokenPK(inv.TokenHash)).
-		sAlways(attrSK, skInvitationToken).
-		stamp(typeInvitationToken).
-		sAlways(attrInvitationID, inv.ID)
-	ttl, hasTTL := s.invitationTTL(inv)
-	if hasTTL {
-		record = record.ttl(ttl)
-		pointer = pointer.ttl(ttl)
-	}
 
 	notThere := aws.String("attribute_not_exists(#PK)")
 	names := exprNames(attrPK)
 	items := []types.TransactWriteItem{
 		{Put: &types.Put{TableName: aws.String(s.table), Item: record, ConditionExpression: notThere, ExpressionAttributeNames: names}},
-		{Put: &types.Put{TableName: aws.String(s.table), Item: pointer, ConditionExpression: notThere, ExpressionAttributeNames: names}},
+		{Put: &types.Put{TableName: aws.String(s.table), Item: invitationPointerItem(inv), ConditionExpression: notThere, ExpressionAttributeNames: names}},
 	}
 	if inv.Pending() {
-		member := s.invitationMemberItem(inv)
+		member := invitationMemberItem(inv)
 		items = append(items, types.TransactWriteItem{
 			Put: &types.Put{TableName: aws.String(s.table), Item: member, ConditionExpression: notThere, ExpressionAttributeNames: names},
 		})
@@ -262,16 +270,23 @@ func (s *Store) ConsumeInvitation(ctx context.Context, tokenHash string, now tim
 			Key:       invitationRecordKey(id),
 			ConditionExpression: aws.String("attribute_exists(#PK) AND attribute_not_exists(#acceptedAt) AND " +
 				"attribute_not_exists(#revokedAt) AND #expiresAt > :now AND #tokenHash = :hash"),
-			UpdateExpression:         aws.String("SET #acceptedAt = :now REMOVE #GSI1PK, #GSI1SK"),
-			ExpressionAttributeNames: exprNames(attrPK, attrAcceptedAt, attrRevokedAt, attrExpiresAt, attrTokenHash, attrGSI1PK, attrGSI1SK),
+			UpdateExpression:         aws.String("SET #acceptedAt = :now, #ttl = :ttl REMOVE #GSI1PK, #GSI1SK"),
+			ExpressionAttributeNames: exprNames(attrPK, attrAcceptedAt, attrRevokedAt, attrExpiresAt, attrTokenHash, attrTTL, attrGSI1PK, attrGSI1SK),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":now":  avS(formatTime(accepted)),
 				":hash": avS(tokenHash),
+				":ttl":  s.endedTTL(inv, accepted),
 			},
 		}},
 		{Delete: &types.Delete{
 			TableName: aws.String(s.table),
 			Key:       invitationMemberKey(inv.UserID, id),
+		}},
+		// The pointer lives exactly as long as the pending state: a replay
+		// finds nothing, and ReleaseInvitation puts it back.
+		{Delete: &types.Delete{
+			TableName: aws.String(s.table),
+			Key:       key(invitationTokenPK(tokenHash), skInvitationToken),
 		}},
 	}})
 	if reasons, cancelled := txConditionFailures(err); cancelled && anyConditionFailed(reasons) {
@@ -307,17 +322,26 @@ func (s *Store) RevokeInvitation(ctx context.Context, id string, now time.Time) 
 	revoked := now.UTC()
 	err = s.transactWrite(ctx, &awsddb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
-			TableName:                           aws.String(s.table),
-			Key:                                 invitationRecordKey(id),
-			ConditionExpression:                 aws.String("attribute_exists(#PK) AND attribute_not_exists(#acceptedAt) AND attribute_not_exists(#revokedAt)"),
-			UpdateExpression:                    aws.String("SET #revokedAt = :now REMOVE #GSI1PK, #GSI1SK"),
-			ExpressionAttributeNames:            exprNames(attrPK, attrAcceptedAt, attrRevokedAt, attrGSI1PK, attrGSI1SK),
-			ExpressionAttributeValues:           map[string]types.AttributeValue{":now": avS(formatTime(revoked))},
+			TableName:                aws.String(s.table),
+			Key:                      invitationRecordKey(id),
+			ConditionExpression:      aws.String("attribute_exists(#PK) AND attribute_not_exists(#acceptedAt) AND attribute_not_exists(#revokedAt)"),
+			UpdateExpression:         aws.String("SET #revokedAt = :now, #ttl = :ttl REMOVE #GSI1PK, #GSI1SK"),
+			ExpressionAttributeNames: exprNames(attrPK, attrAcceptedAt, attrRevokedAt, attrTTL, attrGSI1PK, attrGSI1SK),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":now": avS(formatTime(revoked)),
+				":ttl": s.endedTTL(inv, revoked),
+			},
 			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		}},
+		// Both unconditioned: the record's condition is the only one, so a
+		// cancellation below is always the record's (index 0).
 		{Delete: &types.Delete{
 			TableName: aws.String(s.table),
 			Key:       invitationMemberKey(inv.UserID, id),
+		}},
+		{Delete: &types.Delete{
+			TableName: aws.String(s.table),
+			Key:       key(invitationTokenPK(inv.TokenHash), skInvitationToken),
 		}},
 	}})
 	if reasons, cancelled := txConditionFailures(err); cancelled && anyConditionFailed(reasons) {
@@ -349,9 +373,10 @@ func (s *Store) RevokeInvitation(ctx context.Context, id string, now time.Time) 
 
 // ReleaseInvitation hands back the consume that accepted invitation id at
 // acceptedAt, when the acceptance that made it could not be completed: the
-// record is pending again, listed, and its membership item is back. Anything
-// else — an unknown id, a pending or revoked record, one accepted at another
-// instant — is auth.ErrInvitationNotFound and changes nothing.
+// record is pending again, listed, with no ttl, and its membership item and
+// token pointer are back. Anything else — an unknown id, a pending or revoked
+// record, one accepted at another instant — is auth.ErrInvitationNotFound and
+// changes nothing.
 func (s *Store) ReleaseInvitation(ctx context.Context, id string, acceptedAt time.Time) error {
 	if checkID("invitation id", id) != nil {
 		return auth.ErrInvitationNotFound
@@ -360,7 +385,8 @@ func (s *Store) ReleaseInvitation(ctx context.Context, id string, acceptedAt tim
 	if err != nil {
 		return err
 	}
-	if !found || inv.AcceptedAt == nil || inv.RevokedAt != nil || !inv.AcceptedAt.Equal(acceptedAt) || checkID("user id", inv.UserID) != nil {
+	if !found || inv.AcceptedAt == nil || inv.RevokedAt != nil || !inv.AcceptedAt.Equal(acceptedAt) ||
+		checkID("user id", inv.UserID) != nil || checkOpaque("invitation token hash", inv.TokenHash, maxTokenHashLen) != nil {
 		return auth.ErrInvitationNotFound
 	}
 
@@ -371,8 +397,8 @@ func (s *Store) ReleaseInvitation(ctx context.Context, id string, acceptedAt tim
 			TableName:                aws.String(s.table),
 			Key:                      invitationRecordKey(id),
 			ConditionExpression:      aws.String("#acceptedAt = :acceptedAt AND attribute_not_exists(#revokedAt)"),
-			UpdateExpression:         aws.String("SET #GSI1PK = :gsi1pk, #GSI1SK = :id REMOVE #acceptedAt"),
-			ExpressionAttributeNames: exprNames(attrAcceptedAt, attrRevokedAt, attrGSI1PK, attrGSI1SK),
+			UpdateExpression:         aws.String("SET #GSI1PK = :gsi1pk, #GSI1SK = :id REMOVE #acceptedAt, #ttl"),
+			ExpressionAttributeNames: exprNames(attrAcceptedAt, attrRevokedAt, attrTTL, attrGSI1PK, attrGSI1SK),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":acceptedAt": avS(formatTime(acceptedAt)),
 				":gsi1pk":     avS(gsi1PendingInvitationsPK),
@@ -381,7 +407,11 @@ func (s *Store) ReleaseInvitation(ctx context.Context, id string, acceptedAt tim
 		}},
 		{Put: &types.Put{
 			TableName: aws.String(s.table),
-			Item:      s.invitationMemberItem(pending),
+			Item:      invitationMemberItem(pending),
+		}},
+		{Put: &types.Put{
+			TableName: aws.String(s.table),
+			Item:      invitationPointerItem(pending),
 		}},
 	}})
 	if reasons, cancelled := txConditionFailures(err); cancelled && anyConditionFailed(reasons) {
@@ -516,17 +546,25 @@ func invitationItem(inv auth.Invitation) (item, error) {
 	return it, nil
 }
 
-// invitationMemberItem is the membership item of a pending invitation.
-func (s *Store) invitationMemberItem(inv auth.Invitation) item {
-	it := item{}.
+// invitationMemberItem is the membership item of a pending invitation. It
+// carries no ttl: it exists only while the invitation is pending.
+func invitationMemberItem(inv auth.Invitation) item {
+	return item{}.
 		sAlways(attrPK, invitationUserPK(inv.UserID)).
 		sAlways(attrSK, invitationMemberSK(inv.ID)).
 		stamp(typeInvitationMember).
 		sAlways(attrInvitationID, inv.ID)
-	if ttl, ok := s.invitationTTL(inv); ok {
-		it = it.ttl(ttl)
-	}
-	return it
+}
+
+// invitationPointerItem is the token pointer of a pending invitation. Like the
+// membership item it carries no ttl and exists only while the invitation is
+// pending.
+func invitationPointerItem(inv auth.Invitation) item {
+	return item{}.
+		sAlways(attrPK, invitationTokenPK(inv.TokenHash)).
+		sAlways(attrSK, skInvitationToken).
+		stamp(typeInvitationToken).
+		sAlways(attrInvitationID, inv.ID)
 }
 
 func invitationFromItem(m map[string]types.AttributeValue) (auth.Invitation, error) {

@@ -2992,9 +2992,9 @@ Resources:
         #     INVTOKEN#<hash> pointer and the INV#<id> record, a consistent
         #     Query of the INVUSER#<userId> partition with a BatchGetItem of
         #     the records it names, a Query of GSI1's INVITATION partition,
-        #     and transactions of conditioned Put/Update/Delete for create,
-        #     consume, revoke and release — no bare ConditionCheck, so the
-        #     list below already covers them, and iam_test.go pins it.
+        #     and transactions of Put/Update/Delete for create, consume,
+        #     revoke and release — no bare ConditionCheck, so the list below
+        #     already covers them, and iam_test.go pins it.
         #
         # If you copy one thing out of this template, copy this. A wildcard
         # resource in an auth service's execution role is a bad example that
