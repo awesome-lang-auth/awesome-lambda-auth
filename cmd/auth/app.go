@@ -751,7 +751,7 @@ func loadDocument(getenv func(string) (string, bool), readFile func(string) ([]b
 // Only knobs the core actually accepts appear here. The ones it does not are
 // reported by unwiredKnobs rather than quietly dropped.
 func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.SessionStore, log *slog.Logger) []auth.Option {
-	return []auth.Option{
+	opts := []auth.Option{
 		auth.WithSecret(cfg.AccessTokenSecret()),
 		auth.WithTokenTTLs(cfg.Security.JWT.AccessTokenTTL.Duration(), cfg.Security.JWT.RefreshTokenTTL.Duration()),
 		// The cost every password this deployment hashes is written at. It
@@ -769,6 +769,29 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 			log.Warn("auth core", slog.String("message", fmt.Sprintf(format, args...)))
 		}),
 	}
+	// The refresh token's own key: the reference's refreshTokenSecret, which
+	// signs and verifies every refresh token (token.service.ts:25-29, :154).
+	// The core takes it since v0.13.0 (WithRefreshSecret) and falls back to the
+	// access secret without it (core deviation refresh-secret-falls-back-to-secret),
+	// which is how every refresh token this product minted until now was
+	// signed. Passing it separates the two trust domains — a component that
+	// holds the access secret to verify sessions can no longer mint a refresh
+	// token, and rotating this secret alone signs every session out while
+	// access tokens already handed out run to their expiry — and it is a
+	// one-time global sign-out on the deploy that brings it: every refresh
+	// token outstanding then was signed with the access secret and stops
+	// verifying (CHANGELOG, docs/config-reference.md §3.1).
+	//
+	// Passed whenever it resolved to a value, which is every deployment that
+	// mints refresh tokens: RS-1 requires it — at least 32 characters, and not
+	// the access secret — unless resourceServer.enabled, where no route mints
+	// or verifies one. It is passed only when set because WithRefreshSecret
+	// refuses an empty value rather than reading it as "fall back", and a
+	// resource server may legitimately configure none.
+	if refresh := cfg.RefreshTokenSecret(); refresh != "" {
+		opts = append(opts, auth.WithRefreshSecret(refresh))
+	}
+	return opts
 }
 
 // coreOptionSet is one contributor to the core's option list: the block it
@@ -1344,16 +1367,6 @@ type knobGap struct {
 func unwiredKnobs(cfg *config.Config) []knobGap {
 	defaults := config.Defaults()
 	var gaps []knobGap
-
-	if cfg.RefreshTokenSecret() != "" {
-		gaps = append(gaps, knobGap{
-			Path: "security.jwt.refreshTokenSecret",
-			Problem: "the auth core takes a second secret since awesome-go-auth v0.13.0 (WithRefreshSecret), but this build does not " +
-				"pass it yet, so security.jwt.accessTokenSecret still signs the refresh tokens and this one signs nothing",
-			Remedy: "keep it set — RS-1 requires it, and it becomes live when this product wires it, which signs every outstanding " +
-				"session out once — but do not rely on rotating it to invalidate refresh tokens today",
-		})
-	}
 
 	if cfg.Email.Verification.Mode != defaults.Email.Verification.Mode {
 		gaps = append(gaps, knobGap{

@@ -954,25 +954,26 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 		want []string
 	}{
 		{
-			// The one gap every deployment has: RS-1 requires the second
-			// secret and the core signs both tokens with the first.
+			// None: since security.jwt.refreshTokenSecret reaches the core
+			// (WithRefreshSecret), a document that sets nothing it cannot
+			// honour hears nothing.
 			name: "the defaults",
 			env:  baseEnv(),
-			want: []string{"security.jwt.refreshTokenSecret"},
+			want: nil,
 		},
 		{
 			// The tools block on this runtime adds one: the stream knob, true
 			// by default, which API Gateway cannot carry (tools.go).
 			name: "the tools block",
 			env:  toolsEnv(),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"tools.stream.enabled"},
 		},
 		{
 			// And a second when the manager is asked for: built, listened to
 			// by nobody, without the event log as its distributor.
 			name: "the tools block with the SSE manager",
 			env:  toolsEnv("AWESOME_AUTH_SSE_ENABLED", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.sse.enabled", "tools.stream.enabled"},
+			want: []string{"tools.sse.enabled", "tools.stream.enabled"},
 		},
 		{
 			// D9c: with the event log as the distributor both are live — the
@@ -986,7 +987,7 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_SSE_ENABLED", "true",
 				"AWESOME_AUTH_TOOLS_SSE_DISTRIBUTOR_TYPE", config.DistributorDynamoDB,
 				"AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT", "50"),
-			want: []string{"security.jwt.refreshTokenSecret"},
+			want: nil,
 		},
 		{
 			// D9c: the event log's three knobs are read by the log alone, so
@@ -996,14 +997,14 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_TOOLS_SSE_POLL_INTERVAL_MS", "500",
 				"AWESOME_AUTH_TOOLS_SSE_EVENT_LOG_RETENTION_SECONDS", "3600",
 				"AWESOME_AUTH_TOOLS_SSE_REPLAY_LIMIT", "50"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.sse.eventLogRetentionSeconds", "tools.sse.pollIntervalMs", "tools.sse.replayLimit", "tools.stream.enabled"},
+			want: []string{"tools.sse.eventLogRetentionSeconds", "tools.sse.pollIntervalMs", "tools.sse.replayLimit", "tools.stream.enabled"},
 		},
 		{
 			// The stream knob written off is honoured — there is nothing to
 			// report about a route the operator did not ask for.
 			name: "the tools block with the stream off",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_STREAM", "false"),
-			want: []string{"security.jwt.refreshTokenSecret"},
+			want: nil,
 		},
 		// ── D9b: the webhook queue ──
 		{
@@ -1011,20 +1012,20 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			// queue is where their attempts go. Not a gap.
 			name: "a webhook queue under the tools block",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"tools.stream.enabled"},
 		},
 		{
 			// With the block off nothing is fanned out, so nothing is enqueued.
 			name: "a webhook queue with the tools block off",
 			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.outboundWebhooks.queueUrl"},
+			want: []string{"tools.outboundWebhooks.queueUrl"},
 		},
 		{
 			// With the webhook store off no subscription can match.
 			name: "a webhook queue with the webhook store off",
 			env: toolsEnv("AWESOME_AUTH_TOOLS_OUTBOUND_WEBHOOKS_QUEUE_URL", testQueueURL,
 				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "false"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.outboundWebhooks.queueUrl", "tools.stream.enabled"},
+			want: []string{"tools.outboundWebhooks.queueUrl", "tools.stream.enabled"},
 		},
 		// ── end D9b ──
 		{
@@ -1036,7 +1037,7 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
 				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true",
 				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "stores.enable.telemetry", "stores.enable.webhooks"},
+			want: []string{"stores.enable.apiKeys", "stores.enable.telemetry", "stores.enable.webhooks"},
 		},
 		{
 			// The same flags beside a mounted console: the console's key and
@@ -1050,13 +1051,13 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
 				"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "true",
 				"AWESOME_AUTH_STORES_ENABLE_TELEMETRY", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.telemetry"},
+			want: []string{"stores.enable.telemetry"},
 		},
 		{
 			// The API-key store under a posture that never opens it.
 			name: "the apiKey store under the session posture",
 			env:  toolsEnv("AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "stores.enable.apiKeys", "tools.stream.enabled"},
+			want: []string{"stores.enable.apiKeys", "tools.stream.enabled"},
 		},
 		{
 			// The same posture beside a mounted console: the console mints and
@@ -1066,13 +1067,13 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true",
 				"AWESOME_AUTH_ADMIN_ENABLED", "true",
 				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"tools.stream.enabled"},
 		},
 		{
 			// And under the posture that does: consumed, so not a gap.
 			name: "the apiKey store under the apiKey posture",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"tools.stream.enabled"},
 		},
 		{
 			// The admin block's two knobs over reference constants, reported
@@ -1084,14 +1085,14 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
 				"AWESOME_AUTH_ADMIN_SESSION_TTL", "8h",
 				"AWESOME_AUTH_ADMIN_UPLOAD_MAX_FILE_SIZE_MB", "10"),
-			want: []string{"admin.sessionTtl", "admin.upload.maxFileSizeMb", "security.jwt.refreshTokenSecret"},
+			want: []string{"admin.sessionTtl", "admin.upload.maxFileSizeMb"},
 		},
 		{
 			// ui.uploadDir in the filesystem spelling: a family document
 			// loads, and this runtime says it names nothing durable.
 			name: "an upload directory in the filesystem spelling",
 			env:  with(baseEnv(), "AWESOME_AUTH_UI_UPLOAD_DIR", "/var/uploads"),
-			want: []string{"security.jwt.refreshTokenSecret", "ui.uploadDir"},
+			want: []string{"ui.uploadDir"},
 		},
 		{
 			// Both blocks at once: the list is one list, sorted by path.
@@ -1100,14 +1101,14 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 				"AWESOME_AUTH_ADMIN_ENABLED", "true",
 				"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
 				"AWESOME_AUTH_ADMIN_SESSION_TTL", "8h"),
-			want: []string{"admin.sessionTtl", "security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"admin.sessionTtl", "tools.stream.enabled"},
 		},
 		{
 			// D9d: a script runner named with the inbound route off is read
 			// by nothing (scriptrunner.go, scriptRunnerKnobGaps).
 			name: "a script runner named with the inbound route off",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION", "stack-script-runner"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.inboundWebhooks.scriptRunnerFunction", "tools.stream.enabled"},
+			want: []string{"tools.inboundWebhooks.scriptRunnerFunction", "tools.stream.enabled"},
 		},
 		{
 			// D9d: and with the route mounted it is consumed, so not a gap.
@@ -1115,7 +1116,7 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			env: toolsEnv(
 				"AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS", "true",
 				"AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_RUNNER_FUNCTION", "stack-script-runner"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.stream.enabled"},
+			want: []string{"tools.stream.enabled"},
 		},
 		{
 			// D9d: a script deadline changed with the route off is read by
@@ -1123,7 +1124,7 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			// lazyEmailVerificationGracePeriodDays is not.
 			name: "a script deadline changed with the inbound route off",
 			env:  toolsEnv("AWESOME_AUTH_TOOLS_INBOUND_WEBHOOKS_SCRIPT_TIMEOUT_MS", "8000"),
-			want: []string{"security.jwt.refreshTokenSecret", "tools.inboundWebhooks.scriptTimeoutMs", "tools.stream.enabled"},
+			want: []string{"tools.inboundWebhooks.scriptTimeoutMs", "tools.stream.enabled"},
 		},
 	}
 	for _, tc := range cases {
@@ -1147,7 +1148,7 @@ func TestUnwiredKnobsIsExactlyTheDocumentedList(t *testing.T) {
 			t.Fatalf("config.Load: %v", err)
 		}
 		cfg.Tools.SSE.Distributor.Endpoint = "redis://cache.example.test:6379"
-		if got, want := strings.Join(paths(cfg), ","), "security.jwt.refreshTokenSecret,tools.sse.distributor.endpoint"; got != want {
+		if got, want := strings.Join(paths(cfg), ","), "tools.sse.distributor.endpoint"; got != want {
 			t.Errorf("unwiredKnobs = %s, want %s", got, want)
 		}
 	})

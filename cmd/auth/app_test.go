@@ -631,7 +631,10 @@ func TestUnwiredKnobsAreReportedLoudly(t *testing.T) {
 
 	var buf bytes.Buffer
 	_, err := New(context.Background(), Options{
-		Getenv: envFunc(baseEnv()),
+		// A lifetime the core holds at a constant: the gap the next row of
+		// unwiredKnobs reports. The refresh secret used to be the one gap
+		// every deployment had; it reaches the core now (WithRefreshSecret).
+		Getenv: envFunc(with(baseEnv(), "AWESOME_AUTH_TOKENS_PASSWORD_RESET_TTL_MINUTES", "30")),
 		Logger: newLogger(&buf, slog.LevelDebug),
 		Stores: memoryStores,
 	})
@@ -640,9 +643,7 @@ func TestUnwiredKnobsAreReportedLoudly(t *testing.T) {
 	}
 
 	out := buf.String()
-	// One HS256 secret signs both tokens, so this gap is present in every
-	// deployment — RS-1 requires the second secret and nothing signs with it.
-	for _, want := range []string{"security.jwt.refreshTokenSecret"} {
+	for _, want := range []string{"tokens.passwordResetTtlMinutes"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cold-start log does not mention the unwired knob %s:\n%s", want, out)
 		}
@@ -655,7 +656,7 @@ func TestUnwiredKnobsAreReportedLoudly(t *testing.T) {
 func TestUnwiredKnobs(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(baseEnv())})
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(with(baseEnv(), "AWESOME_AUTH_TOKENS_PASSWORD_RESET_TTL_MINUTES", "30"))})
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
@@ -667,7 +668,7 @@ func TestUnwiredKnobs(t *testing.T) {
 			t.Errorf("gap %s has an empty problem or remedy", g.Path)
 		}
 	}
-	for _, want := range []string{"security.jwt.refreshTokenSecret"} {
+	for _, want := range []string{"tokens.passwordResetTtlMinutes"} {
 		if !paths[want] {
 			t.Errorf("unwiredKnobs did not report %s", want)
 		}
@@ -679,6 +680,9 @@ func TestUnwiredKnobs(t *testing.T) {
 	// operator to lower a value that is actually in force.
 	for _, unwanted := range []string{
 		"security.jwt.accessTokenSecret",
+		// Reported until the refresh secret reached the core; RS-1 required
+		// it while nothing signed with it.
+		"security.jwt.refreshTokenSecret",
 		"security.password.bcryptSaltRounds",
 		"sessions.checkOn",
 		"http.apiPrefix",
