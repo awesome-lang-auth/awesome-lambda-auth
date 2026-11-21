@@ -413,8 +413,10 @@ var rateLimitRoutes = map[string][]rateLimitRoute{
 //
 // It is one interface and not a provider plus a view, unlike Settings() and
 // Templates(), because there is nothing to hand over: the core never sees this
-// store. AllowRequest is called by the middleware in this file and by nothing
-// else, so the store can satisfy it directly.
+// store. AllowRequest is called by the middleware in this file and by the
+// per-account cap on failed second-factor checks (secondfactor_cap.go, which
+// also resets its own scope and so never counts through the local tier), so
+// the store can satisfy it directly.
 type rateLimitCounter interface {
 	AllowRequest(ctx context.Context, scope, subject string, max int, window time.Duration) (bool, time.Duration, error)
 }

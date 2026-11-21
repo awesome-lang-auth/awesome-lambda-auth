@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
@@ -486,5 +490,114 @@ func TestAccountSubjectKeepsAccountsApart(t *testing.T) {
 	}
 	if accountSubject("", "usr_a") == accountSubject("t1", "usr_a") {
 		t.Error("the same id in two tenants shares a subject")
+	}
+}
+
+// brokenCounter is a shared counter that cannot be reached.
+type brokenCounter struct{ resets int }
+
+func (*brokenCounter) AllowRequest(context.Context, string, string, int, time.Duration) (bool, time.Duration, error) {
+	return false, 0, errors.New("dynamodb: connection refused")
+}
+
+func (b *brokenCounter) ResetRateLimit(context.Context, string, string, time.Duration) error {
+	b.resets++
+	return errors.New("dynamodb: connection refused")
+}
+
+// TestSecondFactorLockoutKeepsAFloorWhenTheCounterIsDown: when the shared
+// counter cannot be reached the check is not refused — the store the check
+// reads is the same table — but it is not unbounded either: it is counted in
+// process, per execution environment, the floor the rate limiter's local tier
+// keeps for it. The degradation is logged once, at WARN.
+func TestSecondFactorLockoutKeepsAFloorWhenTheCounterIsDown(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(lockoutTestEnv(baseEnv()))})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	core, err := auth.New(auth.WithSecret(testAccessSecret))
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	token, err := core.IssueTempToken(context.Background(), auth.User{ID: "usr_floor"})
+	if err != nil {
+		t.Fatalf("IssueTempToken: %v", err)
+	}
+	var logs bytes.Buffer
+	mw := newSecondFactorCap(cfg, &brokenCounter{}, core, newLogger(&logs, slog.LevelDebug))
+	reached := 0
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	for i := 0; i < 2*lockoutTestMax; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/auth/2fa/verify", strings.NewReader(fmt.Sprintf(`{"tempToken":%q,"totpCode":"000000"}`, token)))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if want := http.StatusUnauthorized; i >= lockoutTestMax {
+			if w.Code != http.StatusTooManyRequests {
+				t.Fatalf("check %d with the counter down answered %d, want 429 once the in-process count is spent", i+1, w.Code)
+			}
+		} else if w.Code != want {
+			t.Fatalf("check %d with the counter down answered %d, want the handler's %d", i+1, w.Code, want)
+		}
+	}
+	if reached != lockoutTestMax {
+		t.Errorf("the handler ran %d times, want %d", reached, lockoutTestMax)
+	}
+	if n := strings.Count(logs.String(), "cannot reach its shared counter"); n != 1 {
+		t.Errorf("the degradation was logged %d times, want once:\n%s", n, logs.String())
+	}
+}
+
+// TestSecondFactorLockoutHoldsTheReviewedChain is the chain review 6 ran,
+// under the configuration it ran it on: twoFactor.required with a mailer, a
+// TOTP-enrolled account, and only its mailbox — POST /forgot-password, the
+// link from the mail, POST /reset-password with a chosen password, then logins
+// and a sweep of codes from fresh addresses. The sweep is checked at most
+// maxFailures times; the right code, on a fresh challenge and under a
+// percent-encoded spelling of the route, is then refused.
+func TestSecondFactorLockoutHoldsTheReviewedChain(t *testing.T) {
+	t.Parallel()
+	rig, d, _ := lockoutMemoryRig(t, with(mailerEnv(baseEnv()), "AWESOME_AUTH_2FA_REQUIRED", "true"))
+	owner := "chain-owner@example.test"
+	rig.enrolID(t, rig.register(t, owner), subjectOwnerSecret)
+	addr := freshAddresses(t)
+	post := func(path, body string) events.APIGatewayV2HTTPResponse {
+		t.Helper()
+		return invokeFrom(t, d.app, addr(), http.MethodPost, path, body)
+	}
+	if resp := post("/auth/forgot-password", fmt.Sprintf(`{"email":%q}`, owner)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("forgot-password answered %d %s", resp.StatusCode, resp.Body)
+	}
+	resetToken := tokenIn(t, linkIn(t, d.mail.only(t).Body))
+	const chosen = "Chosen-by-the-mailbox-1!"
+	if resp := post("/auth/reset-password", fmt.Sprintf(`{"token":%q,"password":%q}`, resetToken, chosen)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("reset-password answered %d %s", resp.StatusCode, resp.Body)
+	}
+	checked := 0
+	for i := 0; i < 3; i++ {
+		challenge := stepUpChallenge(t, post("/auth/login", loginBody(owner, chosen)))
+		for j := 0; j < 3; j++ {
+			resp := post("/auth/2fa/verify", fmt.Sprintf(`{"tempToken":%q,"totpCode":%q}`, challenge, wrongTOTP(t, subjectOwnerSecret)))
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
+				checked++
+			case http.StatusTooManyRequests:
+			default:
+				t.Fatalf("a wrong code answered %d %s", resp.StatusCode, resp.Body)
+			}
+		}
+	}
+	if checked != lockoutTestMax {
+		t.Fatalf("%d wrong codes were checked for the account, want exactly %d", checked, lockoutTestMax)
+	}
+	fresh := stepUpChallenge(t, post("/auth/login", loginBody(owner, chosen)))
+	for _, path := range []string{"/auth/2fa/verify", "/auth/2fa/%76erify"} {
+		resp := post(path, fmt.Sprintf(`{"tempToken":%q,"totpCode":%q}`, fresh, totpAt(t, subjectOwnerSecret, time.Now())))
+		if resp.StatusCode != http.StatusTooManyRequests || opensSession(resp) {
+			t.Errorf("the right code at %s after the sweep answered %d %.160s, want 429 and no session", path, resp.StatusCode, resp.Body)
+		}
 	}
 }

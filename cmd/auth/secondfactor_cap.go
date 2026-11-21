@@ -67,7 +67,9 @@ import (
 // delete on success); on the memory driver an in-process counter with the same
 // semantics stands in, which is per execution environment exactly as the
 // rate limiter's local tier is there (RS-12 keeps that driver out of
-// production).
+// production). The same in-process counter is the floor on DynamoDB while the
+// shared counter cannot be reached: the check is not refused for that, since
+// it reads the same table, but it is still counted, per environment.
 //
 // ── where it sits ────────────────────────────────────────────────────────────
 //
@@ -124,9 +126,13 @@ type secondFactorCap struct {
 	max     int
 	window  time.Duration
 	counter secondFactorCounter
-	core    *auth.Auth
-	routes  map[string]secondFactorCheck
-	log     *slog.Logger
+	// fallback counts in process while counter cannot be reached, so a store
+	// failure leaves a bound per account and per execution environment rather
+	// than none — the floor the rate limiter's local tier is for it.
+	fallback *localAccountCounter
+	core     *auth.Auth
+	routes   map[string]secondFactorCheck
+	log      *slog.Logger
 
 	degradedOnce sync.Once
 	resetOnce    sync.Once
@@ -147,10 +153,11 @@ func newSecondFactorCap(cfg *config.Config, store any, core *auth.Auth, log *slo
 	}
 	prefix := httpConfig(cfg).Prefix()
 	c := &secondFactorCap{
-		max:     lockout.MaxFailures,
-		window:  time.Duration(lockout.WindowSeconds) * time.Second,
-		counter: counter,
-		core:    core,
+		max:      lockout.MaxFailures,
+		window:   time.Duration(lockout.WindowSeconds) * time.Second,
+		counter:  counter,
+		fallback: newLocalAccountCounter(nil),
+		core:     core,
 		routes: map[string]secondFactorCheck{
 			http.MethodPost + " " + prefix + "/2fa/verify":        stepUpCheck,
 			http.MethodPost + " " + prefix + "/magic-link/verify": stepUpInTwoFactorMode,
@@ -189,19 +196,23 @@ func (c *secondFactorCap) middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		allowed, retryAfter, err := c.counter.AllowRequest(r.Context(), secondFactorAccountScope, subject, c.max, c.window)
+		counter := c.counter
+		allowed, retryAfter, err := counter.AllowRequest(r.Context(), secondFactorAccountScope, subject, c.max, c.window)
 		if err != nil {
-			// Fail open, for the rate limiter's reason (ratelimit.go file
-			// header): the counter is in the table the check itself reads, so
-			// a check refused here would have failed behind it anyway.
+			// The shared counter cannot count. Not refused, for the rate
+			// limiter's reason (ratelimit.go file header): the counter is in
+			// the table the check itself reads, so a check refused here would
+			// have failed behind it anyway. But not unbounded either: the
+			// check is counted in process instead, per execution environment,
+			// which is the floor the limiter's local tier keeps for it.
 			c.degradedOnce.Do(func() {
-				c.log.Warn("the second-factor lockout cannot reach its shared counter and is failing open",
+				c.log.Warn("the second-factor lockout cannot reach its shared counter and is counting in process",
 					slog.String("path", "twoFactor.lockout"),
 					slog.String("error", err.Error()),
-					slog.String("effect", "second-factor checks are not counted per account while this lasts; the rateLimit budgets in front of them still apply"))
+					slog.String("effect", "while this lasts each execution environment holds its own count per account, so the bound is maxFailures per account per environment"))
 			})
-			next.ServeHTTP(w, r)
-			return
+			counter = c.fallback
+			allowed, retryAfter, _ = counter.AllowRequest(r.Context(), secondFactorAccountScope, subject, c.max, c.window)
 		}
 		if !allowed {
 			writeRateLimited(w, retryAfter)
@@ -215,7 +226,7 @@ func (c *secondFactorCap) middleware(next http.Handler) http.Handler {
 		// A check went through: the count starts again. Detached from the
 		// request's cancellation, since the response is already written and
 		// the reset must not be lost to a client that hung up.
-		if err := c.counter.ResetRateLimit(context.WithoutCancel(r.Context()), secondFactorAccountScope, subject, c.window); err != nil {
+		if err := counter.ResetRateLimit(context.WithoutCancel(r.Context()), secondFactorAccountScope, subject, c.window); err != nil {
 			c.resetOnce.Do(func() {
 				c.log.Warn("the second-factor lockout could not clear an account's count after a successful check",
 					slog.String("path", "twoFactor.lockout"),

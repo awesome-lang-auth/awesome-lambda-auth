@@ -41,8 +41,9 @@ import (
 // PK=RL#<scope>#<subject>#<window>, SK=RL, with the window index — wall-clock
 // seconds divided by the window length — inside the partition key. A window
 // therefore has its own item, a past window is unreachable rather than stale,
-// and there is nothing to reset: the next window starts at zero because it
-// starts at a key nothing has written yet.
+// and nothing has to be reset between windows: the next window starts at zero
+// because it starts at a key nothing has written yet. (ResetRateLimit, below,
+// clears the current window's item early; only the second-factor cap uses it.)
 //
 // That is a fixed window and it has the property every fixed window has: the
 // boundary is a seam. A subject may spend its whole budget in the last instant

@@ -839,9 +839,12 @@ conditional write per check, one delete per success), shared by every execution
 environment and not routed through the rate limiter's in-process pre-filter,
 which cannot follow a count that goes down. On the memory driver it counts in
 process, per execution environment, like every limiter there. When the shared
-counter cannot be reached it fails open, as `rateLimit` does (§14.5), and says
-so once per cold start: the check reads the same table and would have failed
-behind it.
+counter cannot be reached the check is not refused for it — the check reads the
+same table and would have failed behind it, the argument of §14.5 — but it is
+not left unbounded either: it is counted in process instead, so while the
+outage lasts the bound is `maxFailures` per account per execution environment,
+the floor `rateLimit`'s local tier keeps for it. The cold start's log says so
+once, at `WARN`.
 
 ## 8. `oauth.*`, knob by knob
 
