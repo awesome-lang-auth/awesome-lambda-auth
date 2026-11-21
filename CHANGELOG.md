@@ -28,8 +28,9 @@ under [Unreleased].
   carries the other credential mails — the mailer (the reference's `invitation`
   template) or the delivery webhook (kind `invitation`) — or, with neither,
   `admin.revealInvitationToken` hands it to the admin caller (see Security).
-  The loader refuses invitations without the console, in resource-server mode,
-  or with no way to deliver a token.
+  The loader refuses invitations without the console, behind an open console
+  (`admin.accessPolicy: open`), in resource-server mode, or with no way to
+  deliver a token.
 - **DynamoDB `InvitationStore`** (`internal/store/dynamodb/invitations.go`) in
   the single table: `INV#<id>` (the record; the token's SHA-256 only),
   `INVTOKEN#<hash>` (the pointer the consume finds it by) and
@@ -209,6 +210,11 @@ under [Unreleased].
   principal, its logs, the channel it forwards the link through. It is off by
   default, refused beside a mailer or the delivery webhook, refused without
   `invitations.enabled`, and the loader warns whenever it is on.
+- **Invitations are refused behind an open console.** Under
+  `admin.accessPolicy: open` the invite route admits anonymous callers. Anyone
+  could invite their own mailbox with a role of their choosing, accept the
+  invitation and sign in, which turns `registration.closed` into
+  self-registration. The loader refuses `invitations.enabled` there.
 - **An expired invitation nobody revoked keeps reserving its account** — listed
   as `expired`, revocable, its account passwordless and unverified, reachable by
   magic link — until it is revoked; no store lets it lapse by itself. An offer

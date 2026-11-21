@@ -3838,6 +3838,12 @@ off mounts nothing.
 The loader refuses, at cold start:
 
 - `invitations.enabled` without `admin.enabled` — the invite route is on the console;
+- `invitations.enabled` behind `admin.accessPolicy: open`. That console admits
+  every request with no credential, so anyone could invite a mailbox of their
+  own with the role they name, accept the invitation and sign in. That is
+  self-registration with a chosen role, which `registration.closed` would not
+  close. The template does not offer `open`, so this refusal concerns
+  `ConfigFile`;
 - `invitations.enabled` with `resourceServer.enabled` — no credential route is mounted there;
 - `invitations.enabled` with no `email.mailer`, no `email.deliveryWebhook` and no `admin.revealInvitationToken` — the invite route would answer `501` to every call;
 - `admin.revealInvitationToken` beside `email.mailer` or `email.deliveryWebhook` — the core mails the token and ignores the flag, and a deployment that mails tokens must never hand them to an HTTP caller;

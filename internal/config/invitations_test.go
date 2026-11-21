@@ -75,6 +75,12 @@ func TestInvitationsRefusals(t *testing.T) {
 			withMailer(doc)
 			set(doc, "admin.enabled", false)
 		}, "invitations.enabled"},
+		// A sender and no twoFactor.required, so that neither the no-sender
+		// refusal nor RS-20 is what fails it.
+		{"behind an open console", func(doc Document, _ map[string]string) {
+			withMailer(doc)
+			set(doc, "admin.accessPolicy", AdminAccessPolicyOpen)
+		}, "invitations.enabled"},
 		{"a ttl over 30d", func(doc Document, _ map[string]string) {
 			withMailer(doc)
 			set(doc, "invitations.ttl", "31d")

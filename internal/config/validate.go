@@ -1306,6 +1306,15 @@ const maxInvitationTTL = 30 * 24 * time.Hour
 //
 //   - invitations.enabled without admin.enabled: the invite route is on the
 //     admin router, so nothing could ever create an invitation.
+//   - invitations.enabled behind admin.accessPolicy: open: the invite route is
+//     behind the console's guard, and that guard admits everyone. An anonymous
+//     caller would invite a mailbox of their own with the role they name,
+//     accept and sign in: self-registration with a chosen role, on a realm whose
+//     registration.closed says there is none. It is refused for the reason
+//     RS-19 refuses an OAuth callback that still signs anyone up to a closed
+//     realm. The open console is the reference's default, and it is only
+//     warned about elsewhere (collectWarnings). This refusal is narrower: it
+//     covers the one route through which that console creates accounts.
 //   - invitations.enabled in resource-server mode: the accept route is never
 //     mounted there (the core gates every credential route).
 //   - invitations.enabled with no way to deliver a token — no mailer, no
@@ -1331,6 +1340,12 @@ func validateInvitations(c *Config, d *diagnostics) {
 			d.errf("", "invitations.enabled",
 				"is on while admin.enabled is off: POST <admin>/api/users/invitations is the only route that creates an invitation, and no console is mounted",
 				"set admin.enabled: true with an access policy (admin.machineAccess for a back office), or turn invitations off")
+		}
+		if c.Admin.Enabled && c.Admin.AccessPolicy == AdminAccessPolicyOpen {
+			d.errf("", "invitations.enabled",
+				"is on while admin.accessPolicy is open: the console admits every request with no credential, so anyone can invite an address of their own with the role of their choosing, accept it and sign in -- "+
+					"an account-creating route open to the internet, which registration.closed then does not close",
+				"set admin.accessPolicy to is-admin-flag, rbac:<role> or permission:<perm> (admin.machineAccess for a back office), or turn invitations off")
 		}
 		if c.ResourceServer.Enabled {
 			d.errf("", "invitations.enabled",
