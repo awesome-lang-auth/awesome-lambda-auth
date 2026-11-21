@@ -10,6 +10,57 @@ under [Unreleased].
 
 ### Added
 
+- **Staff invitations** (awesome-go-auth **v0.15.0**; `invitations.enabled`, off
+  by default; `AWESOME_AUTH_INVITATIONS_ENABLED`; SAM `InvitationsEnabled`). How a
+  closed realm gets its accounts over HTTP: an administrator — or a back office
+  through `admin.machineAccess` — calls `POST <admin>/api/users/invitations`
+  `{email, role?, tenantId?, metadata?, emailLang?}`, which creates a pending
+  account (no password, address unverified) and a single-use token valid
+  `invitations.ttl` (`72h` by default, at most `30d`); `GET` lists the outstanding
+  invitations and `DELETE <admin>/api/users/invitations/{id}` revokes one, taking
+  its account with it if nobody used it. The invitee redeems the token once at the
+  public `POST <prefix>/invitations/accept` `{token, password}` — mounted under
+  `registration.closed` too — which sets the password, marks the address verified
+  and answers what the login would: under `twoFactor.required` the
+  `2FA_SETUP_REQUIRED` challenge, whose `tempToken` enrols TOTP and opens the
+  session with `twoFactor.enrolOnLogin`. `invitations.reinvite` lets a
+  still-pending address be invited again. The token travels by the transport that
+  carries the other credential mails — the mailer (the reference's `invitation`
+  template) or the delivery webhook (kind `invitation`) — or, with neither,
+  `admin.revealInvitationToken` hands it to the admin caller (see Security).
+  The loader refuses invitations without the console, behind an open console
+  (`admin.accessPolicy: open`), in resource-server mode, or with no way to
+  deliver a token. It warns about invitations under `twoFactor.required`
+  without `twoFactor.enrolOnLogin`. That realm loads, but no invitee can
+  enrol alone: each waits for an out-of-band enrolment after accepting, and
+  enrolling before the acceptance makes it spend and refuse the token. The
+  SAM template refuses at changeset time every one of these refusals that its
+  parameters reach: six Rules, and an `InvitationsTtl` pattern that admits
+  `1m` to `30d`. A mistyped parameter then fails the changeset, not every
+  cold start (`docs/config-reference.md` §21.1).
+- **DynamoDB `InvitationStore`** (`internal/store/dynamodb/invitations.go`) in
+  the single table: `INV#<id>` (the record; the token's SHA-256 only),
+  `INVTOKEN#<hash>` (the pointer the consume finds it by) and
+  `INVUSER#<userId>` (one membership item per pending invitation — the
+  consistent per-user read a re-invitation, a revocation and `/forgot-password`
+  depend on), with the pending listing on the sparse GSI1 partition `INVITATION`.
+  Consume, revoke and release are each one transaction whose condition carries the
+  whole state, so of any number of concurrent accepts exactly one wins. A pending
+  invitation carries no `ttl`, expired or not, so DynamoDB TTL never reaps one:
+  only the transaction that ends it (accept or revoke) gives the record a `ttl`,
+  30 days past its expiry or its end, whichever is later, and deletes the token
+  pointer and the membership item. No new IAM action: the existing
+  `AuthTableItems` and `AuthTableIndexQuery` grants cover every call. The user
+  store reads the acceptance depends on (`GetUserByID`, `GetUserByEmail`) were
+  already `ConsistentRead`.
+- **`rateLimit.scope` accepts `accept-invitation`**: `POST
+  <prefix>/invitations/accept`, keyed by client address like `reset-password`.
+  It is not in the default scope, so a realm that turns invitations on names
+  it (`docs/config-reference.md` §21.6). The SAM template has no scope
+  parameter, so that is done in `ConfigFile`. The token cannot be guessed. The
+  budget bounds a flood from one address, each call of which costs a
+  consistent read before the token is known to be bad.
+
 - **Closed registration** (`registration.closed`, off by default;
   `AWESOME_AUTH_REGISTRATION_CLOSED`; SAM `ClosedRegistration`).
   `POST <prefix>/register` is not mounted and answers `404`, `GET <prefix>/ui/config`
@@ -159,6 +210,23 @@ under [Unreleased].
   reads `docs/config-reference.md` §16.4 before upgrading.**
 
 ### Security
+
+- **`admin.revealInvitationToken` moves the trust an invitation rests on.**
+  Accepting marks the address verified because the token reached that mailbox; a
+  revealed token reaches whoever called the admin API instead — a machine
+  principal, its logs, the channel it forwards the link through. It is off by
+  default, refused beside a mailer or the delivery webhook, refused without
+  `invitations.enabled`, and the loader warns whenever it is on.
+- **Invitations are refused behind an open console.** Under
+  `admin.accessPolicy: open` the invite route admits anonymous callers. Anyone
+  could invite their own mailbox with a role of their choosing, accept the
+  invitation and sign in, which turns `registration.closed` into
+  self-registration. The loader refuses `invitations.enabled` there.
+- **An expired invitation nobody revoked keeps reserving its account** — listed
+  as `expired`, revocable, its account passwordless and unverified, reachable by
+  magic link — until it is revoked; no store lets it lapse by itself. An offer
+  that is meant to lapse is revoked (`DELETE <admin>/api/users/invitations/{id}`,
+  which also removes the untouched account), not left to expire.
 
 - **Counting windows have a one-year ceiling.** `twoFactor.lockout.windowSeconds` and `rateLimit.windowSeconds` above 31,536,000 seconds are refused at start: a window is multiplied by `time.Second`, and a value above ~292 years overflowed and turned the cap into a sub-second window.
 - **Rate-limit subject canonicalisation** (`rateLimit.keyBy: email`, the

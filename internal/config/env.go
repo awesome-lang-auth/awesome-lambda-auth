@@ -181,6 +181,12 @@ func envBindings() []envBinding {
 		// seeds use. A stack template sets it from a parameter.
 		envBool("AWESOME_AUTH_REGISTRATION_CLOSED", "registration.closed", func(c *Config, v bool) { c.Registration.Closed = v }),
 
+		// invitations.* is product-only too (config.go, Invitations), named by
+		// the same convention.
+		envBool("AWESOME_AUTH_INVITATIONS_ENABLED", "invitations.enabled", func(c *Config, v bool) { c.Invitations.Enabled = v }),
+		envDuration("AWESOME_AUTH_INVITATIONS_TTL", "invitations.ttl", func(c *Config, v Duration) { c.Invitations.TTL = v }),
+		envBool("AWESOME_AUTH_INVITATIONS_REINVITE", "invitations.reinvite", func(c *Config, v bool) { c.Invitations.Reinvite = v }),
+
 		// §1.5 email
 		envList("AWESOME_AUTH_EMAIL_SITE_URLS", "email.siteUrls", func(c *Config, v []string) { c.Email.SiteURLs = v }),
 		envString("AWESOME_AUTH_MAILER_ENDPOINT", "email.mailer.endpoint", func(c *Config, v string) { c.Email.Mailer.Endpoint = v }),
@@ -258,6 +264,7 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_ADMIN_ROOT_EMAIL", "admin.rootUser.email", func(c *Config, v string) { c.Admin.RootUser.Email = v }),
 		envString("AWESOME_AUTH_ADMIN_COOKIE_PREFIX", "admin.cookiePrefix", func(c *Config, v string) { c.Admin.CookiePrefix = v }),
 		envString("AWESOME_AUTH_ADMIN_LOGIN_PATH", "admin.loginPath", func(c *Config, v string) { c.Admin.LoginPath = v }),
+		envBool("AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN", "admin.revealInvitationToken", func(c *Config, v bool) { c.Admin.RevealInvitationToken = v }),
 		envString("AWESOME_AUTH_ADMIN_BASE_PATH", "admin.basePath", func(c *Config, v string) { c.Admin.BasePath = v }),
 		envDuration("AWESOME_AUTH_ADMIN_SESSION_TTL", "admin.sessionTtl", func(c *Config, v Duration) { c.Admin.SessionTTL = v }),
 		envInt("AWESOME_AUTH_ADMIN_UPLOAD_MAX_FILE_SIZE_MB", "admin.upload.maxFileSizeMb", func(c *Config, v int) { c.Admin.Upload.MaxFileSizeMb = v }),

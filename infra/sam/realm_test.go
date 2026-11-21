@@ -5,8 +5,11 @@ import (
 	"errors"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
 )
@@ -45,6 +48,10 @@ func TestRealmPolicyVariablesAreSetOnlyWhenTrue(t *testing.T) {
 		"ClosedRegistration":    {"RegistrationClosed", "AWESOME_AUTH_REGISTRATION_CLOSED"},
 		"TwoFactorRequired":     {"TwoFactorIsRequired", "AWESOME_AUTH_2FA_REQUIRED"},
 		"TwoFactorEnrolOnLogin": {"TwoFactorEnrolsOnLogin", "AWESOME_AUTH_2FA_ENROL_ON_LOGIN"},
+		// Staff invitations (v0.15.0), by the same rule.
+		"InvitationsEnabled":         {"InvitationsAreEnabled", "AWESOME_AUTH_INVITATIONS_ENABLED"},
+		"InvitationsReinvite":        {"InvitationsMayReinvite", "AWESOME_AUTH_INVITATIONS_REINVITE"},
+		"AdminRevealInvitationToken": {"AdminRevealsInvitationToken", "AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN"},
 	} {
 		p, ok := tpl.parameters[param]
 		if !ok {
@@ -352,5 +359,453 @@ func TestAdminMachinePrincipalPatternIsTheLoaders(t *testing.T) {
 	}
 	if loads(dup) == nil {
 		t.Errorf("the loader admits a principal named twice: %q", dup)
+	}
+}
+
+// TestInvitationsTtlIsSetOnlyWhenGiven: the one invitation knob that is not a
+// switch reaches the auth function only when the operator wrote a value, so
+// an empty parameter leaves a ConfigFile's invitations.ttl, or the 72h
+// default, in place.
+func TestInvitationsTtlIsSetOnlyWhenGiven(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	p, ok := tpl.parameters["InvitationsTtl"]
+	if !ok {
+		t.Fatal("parameter InvitationsTtl is gone")
+	}
+	if p.fields["Default"] != "''" {
+		t.Errorf("InvitationsTtl Default=%s, want ''", p.fields["Default"])
+	}
+	if got, want := tpl.conditions["HasInvitationsTtl"], "!Not [!Equals [!Ref InvitationsTtl, '']]"; got != want {
+		t.Errorf("condition HasInvitationsTtl = %q, want %q", got, want)
+	}
+	want := "AWESOME_AUTH_INVITATIONS_TTL: !If [HasInvitationsTtl, !Ref InvitationsTtl, !Ref 'AWS::NoValue']"
+	if got := envBlocks(t, tpl.resources["AuthFunction"])["AWESOME_AUTH_INVITATIONS_TTL"]; got != want {
+		t.Errorf("AuthFunction's AWESOME_AUTH_INVITATIONS_TTL is\n%s\nwant\n%s", got, want)
+	}
+	if _, ok := envBlocks(t, tpl.resources["SseFunction"])["AWESOME_AUTH_INVITATIONS_TTL"]; ok {
+		t.Error("SseFunction sets AWESOME_AUTH_INVITATIONS_TTL; the stream path reads no realm policy")
+	}
+}
+
+// ── staff invitations, refused at changeset time ────────────────────────────
+//
+// config.Load refuses seven invitation configurations at cold start
+// (internal/config validateInvitations, config-reference §21.1), and a refusal
+// there is every route of the realm down — login included — until a rollback.
+// Whatever of that the parameters alone decide is the template's to refuse
+// first: InvitationsTtl's pattern, and the Rules these tests pin and evaluate.
+
+// invitationEnv is what the invitation refusals read: the four invitation
+// variables, and the console, resource-server, mailer and delivery-webhook
+// variables they are weighed against.
+var invitationEnv = []string{
+	"AWESOME_AUTH_INVITATIONS_ENABLED",
+	"AWESOME_AUTH_INVITATIONS_TTL",
+	"AWESOME_AUTH_INVITATIONS_REINVITE",
+	"AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN",
+	"AWESOME_AUTH_ADMIN_ENABLED",
+	"AWESOME_AUTH_ADMIN_ACCESS_POLICY",
+	"AWESOME_AUTH_RS_ENABLED",
+	"AWESOME_AUTH_RS_JWKS_URL",
+	"AWESOME_AUTH_MAILER_ENDPOINT",
+	"AWESOME_AUTH_MAILER_FROM",
+	"AWESOME_AUTH_MAILER_DEFAULT_LANG",
+	"AWESOME_AUTH_MAILER_PROVIDER",
+	"AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL",
+}
+
+// invitationRefusals runs config.Load as the auth function does, over the
+// environment these parameters give it — the variables above, evaluated from
+// the template's AuthFunction, beside a development deployment's signing keys
+// — and doc, the ConfigFile's document, or nil for none. It returns the
+// refusals on invitations.* and admin.revealInvitationToken; every other
+// refusal is left to its own tests.
+func invitationRefusals(t *testing.T, tpl *template, params map[string]string, doc config.Document) []string {
+	t.Helper()
+	env := renderEnv(t, tpl, "AuthFunction", params, invitationEnv...)
+	env["AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT"] = "development"
+	env["AWESOME_AUTH_JWT_ACCESS_SECRET"] = strings.Repeat("a", 40)
+	env["AWESOME_AUTH_JWT_REFRESH_SECRET"] = strings.Repeat("b", 40)
+	if _, ok := env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL"]; ok {
+		// The template hands the signing key over as a Secrets Manager
+		// reference, which needs an account; this is the same knob, resolved.
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = strings.Repeat("w", 40)
+	}
+	_, err := config.Load(context.Background(), config.Options{
+		Document: doc,
+		Getenv:   func(k string) (string, bool) { v, ok := env[k]; return v, ok },
+	})
+	var ve *config.ValidationError
+	if err != nil && !errors.As(err, &ve) {
+		t.Fatalf("config.Load: %v", err)
+	}
+	var out []string
+	if ve != nil {
+		for _, d := range ve.Diagnostics {
+			if d.Severity == config.SeverityError && (strings.HasPrefix(d.Path, "invitations.") || d.Path == "admin.revealInvitationToken") {
+				out = append(out, d.Path+": "+d.Problem)
+			}
+		}
+	}
+	return out
+}
+
+// singleQuotedPattern compiles a parameter's AllowedPattern, which must be one
+// single-quoted scalar on one line for this reader. It is compiled by Go's RE2
+// here and by Java's engine in CloudFormation, so a pattern uses only syntax
+// the two read alike: anchors, alternation, groups, counted repetition and
+// bracket ranges.
+func singleQuotedPattern(t *testing.T, tpl *template, param string) *regexp.Regexp {
+	t.Helper()
+	raw := tpl.parameters[param].fields["AllowedPattern"]
+	if len(raw) < 2 || !strings.HasPrefix(raw, "'") || !strings.HasSuffix(raw, "'") || strings.Contains(raw[1:len(raw)-1], "'") {
+		t.Fatalf("%s's AllowedPattern is not one single-quoted scalar: %s", param, raw)
+	}
+	pattern, err := regexp.Compile(raw[1 : len(raw)-1])
+	if err != nil {
+		t.Fatalf("%s's AllowedPattern does not compile: %v", param, err)
+	}
+	return pattern
+}
+
+// parameterText returns one parameter's definition, from its name to the
+// blank line after it, with its lines joined by single spaces, so that a
+// phrase reads the same wherever the folded description breaks it.
+func parameterText(t *testing.T, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	_, params, ok := strings.Cut(body, "\nParameters:\n")
+	if ok {
+		params, _, ok = strings.Cut(params, "\nConditions:\n")
+	}
+	if !ok {
+		t.Fatal("found no Parameters section ahead of Conditions")
+	}
+	params = "\n" + params
+	i := strings.Index(params, "\n  "+name+":\n")
+	if i < 0 {
+		t.Fatalf("parameter %s is gone", name)
+	}
+	text, _, _ := strings.Cut(params[i+1:], "\n\n")
+	return strings.Join(strings.Fields(text), " ")
+}
+
+// TestInvitationsTtlPatternIsTheLoaders holds InvitationsTtl's AllowedPattern
+// to what the loader does with invitations.ttl, as
+// TestAdminMachinePrincipalPatternIsTheLoaders does for the principals: what
+// the pattern admits the loader admits, so a change set that passes cannot
+// deploy a function that refuses every cold start over its TTL. The loader
+// reads the TTL only with invitations on, so it is asked with them on.
+//
+// The pattern is narrower than the loader's grammar on purpose, and never
+// wider: one whole number of minutes, hours or days, written without a leading
+// zero. The other ms spellings the loader reads ("072h", "1w", "3 days",
+// "2.5h") are refused here, which costs an operator a rewrite and never a
+// cold start.
+func TestInvitationsTtlPatternIsTheLoaders(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	pattern := singleQuotedPattern(t, tpl, "InvitationsTtl")
+
+	// config.Load's verdict on one value, with invitations on and nothing else
+	// to refuse: the console, and a mailer to deliver.
+	loads := func(ttl string) bool {
+		return len(invitationRefusals(t, tpl, parameterValues(t, tpl, map[string]string{
+			"InvitationsEnabled": "true",
+			"EnableAdminConsole": "true",
+			"MailerFromAddress":  "auth@example.com",
+			"InvitationsTtl":     ttl,
+		}), nil)) == 0
+	}
+
+	// The same verdict as a predicate — one ms-syntax term that resolves to
+	// more than zero and at most 30 days — tied to config.Load at every edge
+	// here, so the sweep below can run on it.
+	const ceiling = 30 * 24 * time.Hour
+	admits := func(ttl string) bool {
+		d, err := config.ParseDuration(ttl)
+		return err == nil && d.Duration() > 0 && d.Duration() <= ceiling
+	}
+	for _, ttl := range []string{
+		"1m", "43200m", "43201m", "0m",
+		"1h", "720h", "721h", "0h",
+		"1d", "30d", "31d", "0d",
+		"072h", "1w", "5w", "3 days", "2.5h", "72H", "-1h",
+	} {
+		if got, want := loads(ttl), admits(ttl); got != want {
+			t.Errorf("config.Load admits %q: %v; the predicate says %v", ttl, got, want)
+		}
+	}
+
+	// Every whole number of each unit, and the same with a leading zero.
+	for _, unit := range []struct {
+		suffix string
+		upTo   int
+	}{{"m", 50000}, {"h", 1000}, {"d", 40}} {
+		for n := 0; n <= unit.upTo; n++ {
+			ttl := strconv.Itoa(n) + unit.suffix
+			if got, want := pattern.MatchString(ttl), admits(ttl); got != want {
+				t.Errorf("the pattern admits %q: %v; the loader: %v", ttl, got, want)
+			}
+			if padded := "0" + ttl; pattern.MatchString(padded) {
+				t.Errorf("the pattern admits %q, a leading zero", padded)
+			}
+		}
+	}
+
+	// Empty is the default, and leaves the variable unset: a ConfigFile's
+	// invitations.ttl, or the loader's 72h.
+	if !pattern.MatchString("") || !loads("") {
+		t.Error(`InvitationsTtl "" must pass the pattern and leave the loader its default`)
+	}
+	for _, ttl := range []string{"072h", "1w", "3 days", "2.5h", "72H", "+3d", " 3d", "3d ", "1h30m", "-1h", "3"} {
+		if pattern.MatchString(ttl) {
+			t.Errorf("the pattern admits %q, a spelling it is meant to refuse", ttl)
+		}
+	}
+}
+
+// TestInvitationRefusalsAreRules pins the six Rules' text, as the other
+// ...IsARule tests do. Two refuse whatever a ConfigFile says, because the
+// variables they read beat the document: AWESOME_AUTH_RS_ENABLED is always
+// set, and a reveal flag or a sender this template sets cannot be unset by
+// one. Four step aside for a ConfigFile, because their parameters set a
+// variable only when "true" and a document can supply what they leave out.
+func TestInvitationRefusalsAreRules(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		documentAware bool
+		wants         []string
+	}{
+		"RevealRefusesASender": {false, []string{
+			"RuleCondition: !Equals [!Ref AdminRevealInvitationToken, 'true']",
+			"- !Equals [!Ref MailerFromAddress, '']",
+			"- !Equals [!Ref EmailDeliveryWebhookUrl, '']",
+		}},
+		"InvitationsRefuseResourceServer": {false, []string{
+			"RuleCondition: !Equals [!Ref InvitationsEnabled, 'true']",
+			"- Assert: !Equals [!Ref EnableResourceServer, 'false']",
+		}},
+		"InvitationsNeedTheConsole": {true, []string{
+			"- !Equals [!Ref InvitationsEnabled, 'true']",
+			"- Assert: !Equals [!Ref EnableAdminConsole, 'true']",
+		}},
+		"InvitationsNeedADelivery": {true, []string{
+			"- !Equals [!Ref InvitationsEnabled, 'true']",
+			"- !Not [!Equals [!Ref MailerFromAddress, '']]",
+			"- !Not [!Equals [!Ref EmailDeliveryWebhookUrl, '']]",
+			"- !Equals [!Ref AdminRevealInvitationToken, 'true']",
+		}},
+		"RevealNeedsInvitations": {true, []string{
+			"- !Equals [!Ref AdminRevealInvitationToken, 'true']",
+			"- Assert: !Equals [!Ref InvitationsEnabled, 'true']",
+		}},
+		"ReinviteNeedsInvitations": {true, []string{
+			"- !Equals [!Ref InvitationsReinvite, 'true']",
+			"- Assert: !Equals [!Ref InvitationsEnabled, 'true']",
+		}},
+	} {
+		text := rule(t, name)
+		if got := strings.Contains(text, "- !Equals [!Ref ConfigFile, '']"); got != c.documentAware {
+			t.Errorf("%s steps aside for a ConfigFile: %v, want %v:\n%s", name, got, c.documentAware, text)
+		}
+		for _, want := range c.wants {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s lacks %q:\n%s", name, want, text)
+			}
+		}
+	}
+}
+
+// TestInvitationRulesRefuseWhatTheLoaderRefuses evaluates the Rules and runs
+// config.Load on the same parameters. With no ConfigFile they must agree both
+// ways, over every combination of the switches the refusals weigh: a refusal
+// with no Rule is a stack that deploys and then fails every cold start, and a
+// Rule the loader does not share blocks a stack that would have run. With a
+// ConfigFile, the two unconditional Rules still refuse what the loader still
+// refuses, and the four others step aside, which is right exactly when a
+// document can make the loader accept.
+func TestInvitationRulesRefuseWhatTheLoaderRefuses(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	rules := readRules(t)
+	const configFile = "/var/task/awesome-auth.json"
+	const jwks = "https://issuer.example.com/.well-known/jwks.json"
+	// A delivery webhook is deployed with its signing key, which the function
+	// requires beside the URL, so every set below that names one carries both.
+	const webhook = "https://delivery.example.com/hook"
+	const webhookKey = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:delivery-webhook"
+	consoleDoc := map[string]any{"enabled": true, "accessPolicy": "is-admin-flag"}
+	mailerDoc := map[string]any{"endpoint": "https://mail.example.com/send", "from": "auth@example.com"}
+
+	for _, c := range []struct {
+		name      string
+		given     map[string]string
+		doc       config.Document // the ConfigFile's; nil for none
+		refusedBy []string        // sorted; nil when the change set passes
+		loads     bool
+	}{
+		{name: "the defaults", loads: true},
+		{
+			name:      "invitations alone",
+			given:     map[string]string{"InvitationsEnabled": "true"},
+			refusedBy: []string{"InvitationsNeedADelivery", "InvitationsNeedTheConsole"},
+		},
+		{
+			name:  "invitations with the console and the mailer",
+			given: map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "MailerFromAddress": "auth@example.com"},
+			loads: true,
+		},
+		{
+			name:  "invitations with the console and the delivery webhook",
+			given: map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "EmailDeliveryWebhookUrl": webhook, "EmailDeliveryWebhookSecretArn": webhookKey},
+			loads: true,
+		},
+		{
+			name:  "invitations with the console, revealed, re-invitable, for 30d",
+			given: map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "AdminRevealInvitationToken": "true", "InvitationsReinvite": "true", "InvitationsTtl": "30d"},
+			loads: true,
+		},
+		{
+			name:      "reveal beside the mailer",
+			given:     map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "AdminRevealInvitationToken": "true", "MailerFromAddress": "auth@example.com"},
+			refusedBy: []string{"RevealRefusesASender"},
+		},
+		{
+			name:      "reveal beside the delivery webhook",
+			given:     map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "AdminRevealInvitationToken": "true", "EmailDeliveryWebhookUrl": webhook, "EmailDeliveryWebhookSecretArn": webhookKey},
+			refusedBy: []string{"RevealRefusesASender"},
+		},
+		{
+			name:      "reveal beside the mailer with invitations off",
+			given:     map[string]string{"AdminRevealInvitationToken": "true", "MailerFromAddress": "auth@example.com"},
+			refusedBy: []string{"RevealNeedsInvitations", "RevealRefusesASender"},
+		},
+		{
+			name:      "invitations in resource-server mode",
+			given:     map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "MailerFromAddress": "auth@example.com", "EnableResourceServer": "true", "ResourceServerJwksUrl": jwks},
+			refusedBy: []string{"InvitationsRefuseResourceServer"},
+		},
+		{
+			name:      "reinvite with invitations off",
+			given:     map[string]string{"InvitationsReinvite": "true"},
+			refusedBy: []string{"ReinviteNeedsInvitations"},
+		},
+		{
+			name:      "reveal with invitations off",
+			given:     map[string]string{"AdminRevealInvitationToken": "true"},
+			refusedBy: []string{"RevealNeedsInvitations"},
+		},
+
+		// A ConfigFile that supplies what the parameters leave out: the four
+		// document-aware Rules step aside, and the loader accepts — a Rule
+		// there would be stricter than the function.
+		{
+			name:  "invitations, the console and the mailer in the ConfigFile",
+			given: map[string]string{"InvitationsEnabled": "true", "ConfigFile": configFile},
+			doc:   config.Document{"schemaVersion": 1, "admin": consoleDoc, "email": map[string]any{"mailer": mailerDoc}},
+			loads: true,
+		},
+		{
+			name:  "reinvite and reveal, invitations and the console in the ConfigFile",
+			given: map[string]string{"InvitationsReinvite": "true", "AdminRevealInvitationToken": "true", "ConfigFile": configFile},
+			doc:   config.Document{"schemaVersion": 1, "admin": consoleDoc, "invitations": map[string]any{"enabled": true}},
+			loads: true,
+		},
+		// A ConfigFile that does not: the refusal a Rule cannot see, left to
+		// the function at cold start.
+		{
+			name:  "invitations alone, a ConfigFile without the console",
+			given: map[string]string{"InvitationsEnabled": "true", "ConfigFile": configFile},
+			doc:   config.Document{"schemaVersion": 1},
+		},
+		// The two unconditional Rules, with a ConfigFile trying to undo what
+		// they refuse: the environment beats the document, so the loader
+		// refuses all the same.
+		{
+			name:      "reveal beside the mailer, a ConfigFile clearing both",
+			given:     map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "AdminRevealInvitationToken": "true", "MailerFromAddress": "auth@example.com", "ConfigFile": configFile},
+			doc:       config.Document{"schemaVersion": 1, "admin": map[string]any{"revealInvitationToken": false}, "email": map[string]any{"mailer": map[string]any{"from": ""}}},
+			refusedBy: []string{"RevealRefusesASender"},
+		},
+		{
+			name:      "invitations in resource-server mode, a ConfigFile turning both off",
+			given:     map[string]string{"InvitationsEnabled": "true", "EnableAdminConsole": "true", "MailerFromAddress": "auth@example.com", "EnableResourceServer": "true", "ResourceServerJwksUrl": jwks, "ConfigFile": configFile},
+			doc:       config.Document{"schemaVersion": 1, "resourceServer": map[string]any{"enabled": false}, "invitations": map[string]any{"enabled": false}},
+			refusedBy: []string{"InvitationsRefuseResourceServer"},
+		},
+	} {
+		params := parameterValues(t, tpl, c.given)
+		if got := refusedBy(t, rules, params); !slices.Equal(got, c.refusedBy) {
+			t.Errorf("%s: refused by %v, want %v", c.name, got, c.refusedBy)
+		}
+		if got := invitationRefusals(t, tpl, params, c.doc); (len(got) == 0) != c.loads {
+			t.Errorf("%s: config.Load refuses %v, want loads=%v", c.name, got, c.loads)
+		}
+	}
+
+	switches := []struct{ param, on, off string }{
+		{"InvitationsEnabled", "true", "false"},
+		{"InvitationsReinvite", "true", "false"},
+		{"AdminRevealInvitationToken", "true", "false"},
+		{"EnableAdminConsole", "true", "false"},
+		{"EnableResourceServer", "true", "false"},
+		{"MailerFromAddress", "auth@example.com", ""},
+		{"EmailDeliveryWebhookUrl", webhook, ""},
+	}
+	combinations, disagreements := 0, 0
+	for _, ttl := range []string{"", "1m", "72h", "30d", "720h", "43200m"} {
+		for mask := 0; mask < 1<<len(switches); mask++ {
+			given := map[string]string{"InvitationsTtl": ttl, "ResourceServerJwksUrl": jwks}
+			for i, s := range switches {
+				given[s.param] = s.off
+				if mask&(1<<i) != 0 {
+					given[s.param] = s.on
+				}
+			}
+			if given["EmailDeliveryWebhookUrl"] != "" {
+				given["EmailDeliveryWebhookSecretArn"] = webhookKey
+			}
+			params := parameterValues(t, tpl, given)
+			refused, loader := refusedBy(t, rules, params), invitationRefusals(t, tpl, params, nil)
+			combinations++
+			if (len(refused) > 0) != (len(loader) > 0) {
+				disagreements++
+				if disagreements <= 10 {
+					t.Errorf("%v:\n  the Rules refuse %v\n  config.Load refuses %v", given, refused, loader)
+				}
+			}
+		}
+	}
+	if disagreements > 0 {
+		t.Errorf("the Rules and config.Load disagree on %d of %d parameter sets", disagreements, combinations)
+	}
+}
+
+// TestInvitationParameterDescriptionsLeaveTheConfigFileItsSay: the four
+// invitation parameters set their variable only when switched on or given, so
+// their off value says nothing about a ConfigFile's, and a description must
+// not promise what "false" cannot enforce. Each also names the Rules that
+// refuse, at changeset time, what the function would refuse at cold start.
+func TestInvitationParameterDescriptionsLeaveTheConfigFileItsSay(t *testing.T) {
+	t.Parallel()
+	const off = `"false" — the default — leaves the ConfigFile's value (off unless the document turns it on); "true" forces it on.`
+	for param, wants := range map[string][]string{
+		"InvitationsEnabled":         {off, "InvitationsRefuseResourceServer", "InvitationsNeedTheConsole", "InvitationsNeedADelivery"},
+		"InvitationsReinvite":        {off, "ReinviteNeedsInvitations"},
+		"AdminRevealInvitationToken": {off, "RevealRefusesASender", "RevealNeedsInvitations"},
+		"InvitationsTtl":             {"Empty — the default — leaves the ConfigFile's invitations.ttl", "30d"},
+	} {
+		text := parameterText(t, param)
+		for _, want := range wants {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s's definition lacks %q:\n%s", param, want, text)
+			}
+		}
 	}
 }

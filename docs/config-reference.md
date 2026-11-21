@@ -397,13 +397,15 @@ rather than advertising admin routes whose every write goes nowhere:
 
 Set `email.deliveryWebhook.url` and it becomes **the** sender for all five
 credential seams: magic link, password reset, email verification, email change
-and SMS code. Each one is POSTed to that receiver and nothing goes through SES
-or SNS for those routes, even when the mailer and sms blocks are also
+and SMS code. With `invitations.enabled` it also takes a sixth, the staff
+invitation (§21.2). Each one is POSTed to that receiver and nothing goes through
+SES or SNS for those routes, even when the mailer and sms blocks are also
 configured. It is what a deployment whose transport is neither mail nor SMS — or
 is not reachable from a Lambda — wires, and it replaces the reference's
 in-process send-callback functions, which a configuration document cannot
 express. Under `twoFactor.required` it is handed three of the five: the magic
-link and the SMS code are not sender seams there (§7.1, §5.2).
+link and the SMS code are not sender seams there (§7.1, §5.2). The invitation is
+not withheld under the policy.
 
 The request:
 
@@ -419,11 +421,16 @@ X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the exact body>
 ```
 
 `<kind>` is one of `magic-link`, `password-reset`, `email-verification`,
-`email-change`, `sms-code`. `delivery` carries the recipient, the token or code,
-its expiry, and `linkBase` — the base this request resolved (§5.1), which the
-receiver should build the link on. Any 2xx is a delivery; anything else, a
-transport failure or the timeout is an error, which each route handles under its
-existing contract (`/forgot-password` still answers 200 whatever happens).
+`email-change`, `sms-code`, and `invitation` with `invitations.enabled`.
+`delivery` carries the recipient, the token or code, its expiry, and `linkBase`
+— the base this request resolved (§5.1), which the receiver should build the
+link on. §21.2 lists the invitation's body field by field. On the mail kinds,
+`lang` is the request's `emailLang` when the caller sent one. Otherwise it is
+left out and the receiver picks the language: `email.mailer.defaultLang` belongs
+to the mailer and is not applied to webhook deliveries. Any 2xx is a delivery;
+anything else, a transport failure or the timeout is an error, which each route
+handles under its existing contract (`/forgot-password` still answers 200
+whatever happens; an invitation answers `502` and is undone, §21.2).
 
 **`email.deliveryWebhook.secret` is required when the url is set.** The body of
 every request is a credential, so a receiver that cannot verify
@@ -1522,6 +1529,7 @@ validates the vocabulary; `cmd/auth/ratelimit.go` holds the table below, and
 | `reset-password` | `POST <prefix>/reset-password` | the client address |
 | `verify-email` | `GET <prefix>/verify-email` | the client address |
 | `resend-verification` | `POST <prefix>/send-verification-email` | the client address |
+| `accept-invitation` | `POST <prefix>/invitations/accept`, mounted only with `invitations.enabled` (§21) | the client address |
 
 The subject column is what each route's handler acts on, and §14.2 says how it is
 read. On every row, a body that names none of it falls back to the client
@@ -1529,10 +1537,14 @@ address.
 
 The default scope is the five flows `docs/spec/data-model.md` §1.5 row #61 names
 — the ones where a guess costs an attacker nothing and where there is no session
-to lose. The other five are nameable and deliberately off: `refresh` and
+to lose. The other six are nameable and deliberately off: `refresh` and
 `verify-email` are spent by a client holding a token it was given, and limiting
 them by default would throttle ordinary use of a working deployment to defend
-against guessing a 256-bit value.
+against guessing a 256-bit value. `accept-invitation` is the same kind of
+256-bit token, on a route that stays public under `registration.closed`. Before
+any token is known to be bad, each call costs a decode, a SHA-256 and a
+consistent read of the table, so a realm that turns invitations on names it to
+bound a flood from one address. Distributed floods belong at the edge (§14.2).
 
 **Nothing here mounts a route.** The limiter is a middleware over the whole mux
 that matches on the resolved `http.apiPrefix` plus a path suffix, so moving the
@@ -3807,3 +3819,201 @@ skipping disabled or unconfirmed pool users there is a separate change.
 
 A front door that blocks `POST <prefix>/register` at the edge is still worth
 keeping as a second layer, and before this switch it was the only one.
+
+## 21. `invitations.*` and `admin.revealInvitationToken` — staff invitations
+
+awesome-go-auth v0.15.0 adds the invitation flow (core deviation
+`invitations-are-an-addition`); this block switches it on. Off by default, and
+off mounts nothing.
+
+| Key | Env | SAM parameter | Default | Effect |
+|---|---|---|---|---|
+| `invitations.enabled` | `AWESOME_AUTH_INVITATIONS_ENABLED` | `InvitationsEnabled` | `false` | hands the core the driver's `InvitationStore`: `POST`/`GET <admin>/api/users/invitations`, `DELETE <admin>/api/users/invitations/{id}`, and the public `POST <prefix>/invitations/accept` |
+| `invitations.ttl` | `AWESOME_AUTH_INVITATIONS_TTL` | `InvitationsTtl` | `72h` | how long a token is honoured (`WithInvitationTTL`); at most `30d` |
+| `invitations.reinvite` | `AWESOME_AUTH_INVITATIONS_REINVITE` | `InvitationsReinvite` | `false` | a still-pending address may be invited again: `200`, a fresh token, the earlier ones retired (`WithInvitationReinvite`) |
+| `admin.revealInvitationToken` | `AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN` | `AdminRevealInvitationToken` | `false` | the invite answer carries `token` and `acceptUrl` (`AdminOptions.RevealInvitationToken`) |
+
+### 21.1 Refusals
+
+The loader refuses, at cold start:
+
+- `invitations.enabled` without `admin.enabled` — the invite route is on the console;
+- `invitations.enabled` behind `admin.accessPolicy: open`. That console admits
+  every request with no credential, so anyone could invite a mailbox of their
+  own with the role they name, accept the invitation and sign in. That is
+  self-registration with a chosen role, which `registration.closed` would not
+  close. The template does not offer `open`, so this refusal concerns
+  `ConfigFile`;
+- `invitations.enabled` with `resourceServer.enabled` — no credential route is mounted there;
+- `invitations.enabled` with no `email.mailer`, no `email.deliveryWebhook` and no `admin.revealInvitationToken` — the invite route would answer `501` to every call;
+- `admin.revealInvitationToken` beside `email.mailer` or `email.deliveryWebhook` — the core mails the token and ignores the flag, and a deployment that mails tokens must never hand them to an HTTP caller;
+- `admin.revealInvitationToken` or `invitations.reinvite` while `invitations.enabled` is off;
+- `invitations.ttl` above `30d`, or one that is not a positive span (RS-9).
+
+The first-user console policy is already refused on every driver (RS-17), which is
+the one policy the core's invite route also refuses.
+
+It warns, without refusing, about `invitations.enabled` under
+`twoFactor.required` without `twoFactor.enrolOnLogin`. No invitee can reach a
+session alone there (§21.4), but an operator can still enrol each one out of
+band after it has accepted.
+
+The SAM template refuses the same configurations earlier, at changeset time,
+wherever its parameters decide them alone. A refusal at cold start takes every
+route of the realm down, login included, until a rollback.
+
+- `InvitationsTtl`'s pattern admits a whole number of minutes, hours or days
+  from `1m` to `30d`, written without a leading zero, or empty.
+- The Rules `InvitationsRefuseResourceServer` and `RevealRefusesASender` refuse
+  their pairs whatever `ConfigFile` says, because the variables they read beat
+  the document.
+- With no `ConfigFile`, the Rules `InvitationsNeedTheConsole`,
+  `InvitationsNeedADelivery`, `RevealNeedsInvitations` and
+  `ReinviteNeedsInvitations` refuse the rest. With one, they step aside: the
+  document may supply what the parameters leave out, and the loader decides.
+
+The open console has no Rule, since the template does not offer `open`. The
+`twoFactor.required` warning has none either, since it refuses nothing.
+
+### 21.2 Delivery
+
+The invitation travels by the transport the other credential mails take:
+the delivery webhook (`kind: "invitation"`, the `InvitationDelivery` body) when
+`email.deliveryWebhook.url` is set, otherwise the mailer, rendering the
+reference's `invitation` template (a template store's override wins) with the
+link `<base>/invitations/accept?token=…`. **No page ships for that path**: the
+front end that owns the accept form serves `GET` on it and posts
+`{token, password}` to the route, as it does for `/reset-password`. Neither
+transport is withheld under `twoFactor.required`.
+
+**What the delivery webhook receives.** Each invitation is one `POST` with the
+§5.4 envelope: `X-Webhook-Event: delivery.invitation`, a fresh
+`X-Webhook-Delivery` UUID, `X-Webhook-Timestamp`, and `X-Webhook-Signature:
+sha256=<hex HMAC-SHA256 of the exact body>` keyed by
+`email.deliveryWebhook.secret`. The body below is shown indented. On the wire it
+is compact, and the signature covers those exact bytes.
+
+```json
+{
+  "kind": "invitation",
+  "delivery": {
+    "invitationId": "inv_a0f396d7daee2d62e9a4ab864007656a",
+    "userId": "usr_10e90e943ef4fe8559d3074dcbb957be",
+    "tenantId": "",
+    "email": "new.staff@example.test",
+    "role": "staff",
+    "metadata": {"team": "ops"},
+    "token": "mKNd-8u6Y7hpOy67Z6lEbY5QGX5d7AULMDyQDir2_AY",
+    "expiresAt": "2026-11-23T14:55:22.902722Z",
+    "linkBase": "https://auth.example.test/auth",
+    "lang": "it"
+  }
+}
+```
+
+| Field | What it carries |
+|---|---|
+| `invitationId`, `userId` | the invitation and the pending account it reserves, as the invite answer names them; `invitationId` is what `DELETE <admin>/api/users/invitations/{id}` revokes |
+| `tenantId` | the account's tenant, `""` when there is none; always present |
+| `email` | **the recipient**: the invited address as the core stores it, trimmed and lower-cased |
+| `role`, `metadata` | what the invitation was created with, for a message that mentions them; each is left out when empty |
+| `token` | the single-use credential `POST <prefix>/invitations/accept` takes, in plaintext, 43 base64url characters. The store keeps only its SHA-256, so this request is the only place the token exists. A receiver must not log it |
+| `expiresAt` | when the token stops being honoured: `invitations.ttl` after the invitation was created, and the same instant as the invite answer's `expiresAt`. RFC 3339 with fractional seconds, in the function's zone, which is UTC on Lambda. The token is honoured strictly before it |
+| `linkBase` | the base the link is built on, resolved as every emailed link is (§5.1). A machine caller sends no `Origin`, so for one it is the first `email.siteUrls` entry, or `deployment.publicUrl` without one, followed by `http.apiPrefix` (and `/ui` under `ui.enabled`). It is left out when no site URL is known |
+| `lang` | the invite body's `emailLang` exactly as sent, left out when the call sent none. `email.mailer.defaultLang` belongs to the mailer and is not applied here, so the receiver picks the default language |
+
+**There is no link field.** The link the mailer would send is
+`<linkBase>/invitations/accept?token=<token>` (`auth.InvitationURL`). That path
+is the accept route itself, which takes only `POST`. A receiver that writes its
+own mail therefore points the link at the page of its front end that owns the
+accept form, carrying the token. That page then posts `{token, password}` to
+`POST <prefix>/invitations/accept`.
+
+**The answer is the delivery.** Any 2xx answer means the invitation was
+delivered. Anything else fails it: another status, a transport failure, or no
+answer within `email.deliveryWebhook.timeoutMs`. The invite route then answers
+`502 "Invitation could not be delivered"`, revokes the invitation and removes the
+account the call created, so the call can simply be repeated. A failed
+re-invitation keeps its account and leaves the earlier tokens working. If the
+invitee accepted in between, the account is kept. Nothing is retried. A
+receiver should therefore answer 2xx only once it owns the message, for example
+when it has queued it or handed it to its relay, and it should answer within
+the timeout. Each request is a distinct invitation with its own token. A
+re-invitation (`invitations.reinvite`) is a new request, and it retires the
+earlier tokens once it is delivered.
+
+`TestInvitationTravelsByTheDeliveryWebhook` and
+`TestInvitationWebhookFailureUndoesTheInvitation` (`cmd/auth/invitations_test.go`)
+pin this payload and this contract. The first fails if a later core adds a key
+to the body before this table describes it.
+
+### 21.3 `admin.revealInvitationToken` — the risk
+
+Accepting an invitation marks the address verified on the strength of the token
+having reached that mailbox. With the flag on, the token reaches whoever called
+the admin API instead — a machine principal, its logs, the channel it forwards the
+link through — and that caller can activate the account. Use it only for a back
+office that delivers the token to the invited mailbox itself and keeps it out of
+logs; the loader warns whenever it is on.
+
+### 21.4 The staff realm
+
+`registration.closed` + `twoFactor.required` + `twoFactor.enrolOnLogin` +
+`invitations.enabled` + `admin.machineAccess.iam.principals`: the back office
+invites on an IAM-signed request, the invitee accepts and receives
+`403 2FA_SETUP_REQUIRED` with an enrolment token, enrols TOTP through
+`/2fa/setup` and `/2fa/verify-setup`, and only then holds a session.
+`cmd/auth/invitations_test.go` drives exactly this on both drivers. With the
+delivery webhook as the sender, `TestInvitationTravelsByTheDeliveryWebhook`
+drives it on the memory driver.
+
+**`twoFactor.enrolOnLogin` is the part that cannot be dropped.** Without it the
+acceptance still spends the token, sets the password and answers
+`403 2FA_SETUP_REQUIRED`, but no route accepts that `tempToken`, and every later
+login answers the same. Each invitee then waits for an operator to enrol a
+factor out of band. Enrolling one *before* acceptance does not help: the core
+activates only an account with no password and no factor, so the acceptance
+spends the token and answers `401 INVALID_INVITATION`. The loader warns about
+this combination (§21.1). With `enrolOnLogin` the first enrolment is trust on
+first use, as §7.2 describes. Here, holding that trust means holding the
+single-use token that was sent to the invited mailbox.
+
+### 21.5 Storage (DynamoDB)
+
+`internal/store/dynamodb/invitations.go`: `INV#<id>`/`INV` (the record; the
+token's SHA-256, never the token), `INVTOKEN#<hash>`/`INVTOKEN` (pointer),
+`INVUSER#<userId>`/`INV#<id>` (one item per pending invitation, read with
+`ConsistentRead`), and the sparse GSI1 partition `INVITATION` for the listing.
+No new IAM action is needed.
+
+**A pending invitation carries no `ttl`**, expired or not: DynamoDB TTL never
+reaps one. It stays listed (as expired), revocable and reserving its account —
+passwordless, unverified, out of `/forgot-password`'s reach — until it is
+revoked, which is the core's contract. Reaping it would leave that account with
+nothing that lists, revokes or re-invites it. The transaction that ends an
+invitation — the acceptance or the revocation — deletes the pointer and the
+membership item and gives the record a `ttl` 30 days
+(`Options.InvitationRetention`) past its expiry or its end, whichever is later;
+after that sweep a second revocation answers `404` instead of `409`, as the
+core's memory store does a day after an invitation ends.
+
+Abandoned invitations are therefore bounded by revoking them, never by waiting:
+a back office that wants offers to lapse sweeps the listing and calls
+`DELETE <admin>/api/users/invitations/{id}` for the expired ones, which removes
+each untouched account with its invitation.
+
+
+### 21.6 Rate limiting the accept route
+
+`POST <prefix>/invitations/accept` is public, and it stays mounted under
+`registration.closed`. It is outside the default `rateLimit.scope`, like its
+sibling `/reset-password`. Name `accept-invitation` there (§14.1) to key it by
+client address. Its token has 256 bits, so the budget bounds a flood from one
+address, not a guess. A call with a bad token still costs a decode, a SHA-256
+and a consistent read of the table. The SAM template has no parameter for the scope,
+so a stack sets it in its `ConfigFile` and keeps the default names it wants
+beside the new one, for example
+`"rateLimit": {"scope": ["login", "forgot-password", "magic-link", "sms-code", "2fa-verify", "accept-invitation"]}`.
+`TestAcceptInvitationIsLimitedByClientAddress` covers this. Once an address has
+spent its budget it is answered `429`, and an invitee at another address still
+accepts.
