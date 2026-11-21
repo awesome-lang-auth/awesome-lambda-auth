@@ -535,9 +535,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //   - The console's login limiter, matching one route (POST <admin>/login) and
 //     nothing else; identity when the console or the block is off.
 //   - The second-factor gate (secondfactor.go): under twoFactor.required it
-//     refuses the passwordless logins, /link-verify's loginAfterLinking and
-//     POST <admin>/login before any of them reaches the core; identity when
-//     the policy is off. Outside the login limiter, so a console login the
+//     refuses the four passwordless routes in every mode, /link-verify's
+//     loginAfterLinking and POST <admin>/login before any of them reaches the
+//     core; identity when the policy is off. Outside the login limiter, so a console login the
 //     policy refuses spends nothing from the shared counter, and inside
 //     everything else, so a refusal carries the CORS headers a browser needs
 //     to read it and is in the access log like any answer. It classifies a

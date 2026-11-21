@@ -61,11 +61,13 @@ import (
 //
 // twoFactor.required is the core's Config.Require2FA (WithRequire2FA). Since
 // v0.14.0 the core enforces it at login: an account with a factor it can
-// present gets the challenge — an enrolled TOTP, or the emailed link or texted
-// code where a mail or SMS transport is wired — and one with none gets the
-// reference's 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
-// and no session. It is also a term of POST <prefix>/2fa/disable's refusal, with
-// or without a settings store. Before this knob the product could not ask for
+// present gets the challenge, and one with none gets the reference's
+// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
+// and no session. The core counts the emailed link and the texted code as
+// factors wherever a sender for them is wired; under the policy the product
+// wires neither (delivery.go), so the only factor an account can present is
+// an enrolled TOTP. It is also a term of POST <prefix>/2fa/disable's refusal,
+// with or without a settings store. Before this knob the product could not ask for
 // either: runtimeSettings.require2fa seeds the settings store, which the core
 // reads on /2fa/disable and nowhere else, so "require2fa" in a document
 // switched off the off-switch and left the login asking for nothing. The two
@@ -83,16 +85,20 @@ import (
 // the password binds the factor. The loader warns whenever it is on.
 //
 // What the core's policy does not reach, and what the product does about it
-// so that twoFactor.required means what an operator reads into it: the OAuth
-// callback issues a session with no second factor
-// (oauth-callback-skips-the-second-factor), and nothing in front of it can
-// make it ask, so RS-20 refuses oauth.providers beside the policy, and the
-// console's root user and bootstrap secret with it; the console's own
-// POST <admin>/login, the passwordless logins in login mode and /link-verify's
-// loginAfterLinking each open a session on one factor, and secondfactor.go
-// refuses each before the core acts (two-factor-required-refuses-one-factor-sign-ins).
-// secondfactor_test.go pins every door against a credential that opened a
-// session through it before the gate.
+// so that twoFactor.required means what an operator reads into it — every
+// session proved a TOTP code: the OAuth callback issues a session with no
+// second factor (oauth-callback-skips-the-second-factor), and nothing in front
+// of it can make it ask, so RS-20 refuses oauth.providers beside the policy,
+// and the console's root user, bootstrap secret and open policy with it; the
+// emailed link and the texted code would stand in for the factor as the
+// second step — and the mailbox also receives the reset link — so their
+// senders are withheld from the core (delivery.go) and the four passwordless
+// routes refused in every mode; and the console's own POST <admin>/login and
+// /link-verify's loginAfterLinking each open a session on one factor.
+// secondfactor.go refuses each of these before the core acts
+// (two-factor-required-refuses-one-factor-sign-ins), and secondfactor_test.go
+// pins every door against a credential that opened a session through it
+// before the gate.
 
 // twoFactorOptions hands the core the TOTP issuer and the second-factor
 // policy.

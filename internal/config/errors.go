@@ -128,13 +128,15 @@ const (
 	// RuleTwoFactorRequiredSignIn refuses twoFactor.required beside a sign-in
 	// that cannot be held to the second factor: an OAuth provider, whose
 	// callback the imported core completes with a session and no second-factor
-	// branch, and the two console credentials whose only door is
+	// branch; the two console credentials whose only door is
 	// POST <admin>/login — admin.rootUser and admin.bootstrapSecret — which
-	// the product does not serve under the policy. The passwordless logins,
-	// /link-verify's loginAfterLinking and POST <admin>/login itself are held
-	// to the policy at request time instead (cmd/auth secondFactorGate), so
-	// they are not refused here. A product rule: the reference has no
-	// deployment-level 2FA policy (core config-require2fa-is-a-system-policy-term).
+	// the product does not serve under the policy; and an open console
+	// (admin.accessPolicy: open), which asks for no credential at all. The
+	// passwordless routes, /link-verify's loginAfterLinking and
+	// POST <admin>/login itself are held to the policy at request time instead
+	// (cmd/auth secondFactorGate), so they are not refused here. A product
+	// rule: the reference has no deployment-level 2FA policy (core
+	// config-require2fa-is-a-system-policy-term).
 	RuleTwoFactorRequiredSignIn = "RS-20"
 
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:

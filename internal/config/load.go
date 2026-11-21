@@ -570,9 +570,12 @@ func collectWarnings(cfg *Config) {
 // deployment tooling reads before an upload, and again in the cold-start log.
 //
 // What twoFactor.required cannot be allowed to miss is not here: the OAuth
-// callback and the two console credentials are refused (RS-20), and the
-// passwordless logins, loginAfterLinking and POST <admin>/login are held to
-// the policy at request time (cmd/auth secondFactorGate).
+// callback, the two console credentials and an open console are refused
+// (RS-20), and the passwordless routes, loginAfterLinking and
+// POST <admin>/login are held to the policy at request time (cmd/auth
+// secondFactorGate). What is here is what the policy changes about a
+// transport the operator wired, because that is a change in what a
+// configured block does, and it is said rather than discovered.
 func collectRealmWarnings(cfg *Config) {
 	// A closed realm whose OAuth callback still creates accounts, narrowed to
 	// named domains and to addresses the provider verified. RS-19 refuses
@@ -588,15 +591,63 @@ func collectRealmWarnings(cfg *Config) {
 			"keep it if that is the realm you mean, with a provider that verifies the addresses it asserts at those domains; otherwise set oauth.provisioning.autoCreate: false so the callback signs in only accounts that already exist")
 	}
 
+	// The password-reset mail travels by the mailer or by the delivery
+	// webhook, and it hands a new password to whoever reads it.
+	resetMail := cfg.MailerConfigured() || cfg.DeliveryWebhookConfigured()
+
 	if cfg.TwoFactor.EnrolOnLogin {
 		scope := "an account under twoFactor.required"
 		if !cfg.TwoFactor.Required {
 			scope = "an account whose own require2FA flag is set (twoFactor.required is off)"
 		}
+		enough := "a leaked invitation or initial password, or the password of an account whose factor an administrator just reset, is enough"
+		if resetMail {
+			enough = "a leaked invitation or initial password, the password of an account whose factor an administrator just reset, " +
+				"or -- with the password-reset mail wired -- the account's mailbox alone, through POST <prefix>/forgot-password and /reset-password, is enough"
+		}
 		cfg.warn("twoFactor.enrolOnLogin",
 			"forced enrolment is trust on first use: when "+scope+" has no factor yet, whoever presents its password binds a factor of their choosing and gets a full session, "+
-				"and the owner's next login is a challenge they cannot answer -- a leaked invitation or initial password, or the password of an account whose factor an administrator just reset, is enough",
+				"and the owner's next login is a challenge they cannot answer -- "+enough,
 			"keep it only where the first sign-in with the password is the owner's by construction, and reset the password together with the factor; enrol out of band and leave it off otherwise")
+	}
+
+	// twoFactor.required beside a credential transport. Under the policy a
+	// TOTP code is the only second factor: the core would otherwise offer the
+	// emailed link as the second step to every challenged account, and the
+	// texted code to every one with a number on file, and the same mailbox
+	// receives the password-reset link — so a mailbox alone, or a phone
+	// number, would answer both steps. cmd/auth therefore does not hand the
+	// core the magic-link and SMS-code senders (the challenge lists "totp"
+	// alone, and an account without TOTP is told to enrol), and its gate
+	// refuses the four passwordless routes in every mode. That changes what
+	// the operator's transport does, so it is said here; nothing is refused,
+	// because what the transport still carries is wanted.
+	if cfg.TwoFactor.Required && (resetMail || cfg.SMSConfigured()) {
+		var wired []string
+		if cfg.MailerConfigured() {
+			wired = append(wired, "a mailer (email.mailer)")
+		}
+		if cfg.DeliveryWebhookConfigured() {
+			wired = append(wired, "the delivery webhook (email.deliveryWebhook)")
+		}
+		if cfg.SMSConfigured() {
+			wired = append(wired, "an SMS transport (sms)")
+		}
+		carries := "the SMS transport carries no credential at all: its one credential seam is the texted code, so a phone number alone never opens a session"
+		if resetMail {
+			carries = "the transport still carries the password-reset, email-verification and email-change mails, " +
+				"and a reset changes the password and opens no session -- the next login is the TOTP challenge -- so a mailbox or a phone number alone never opens one"
+		}
+		if resetMail && cfg.TwoFactor.EnrolOnLogin {
+			carries += ", except for an account that has not enrolled yet, which twoFactor.enrolOnLogin lets whoever resets its password claim (see that warning)"
+		}
+		cfg.warn("twoFactor.required",
+			fmt.Sprintf("twoFactor.required is on beside %s, and under the policy a TOTP code is the only second factor: "+
+				"POST <prefix>/magic-link/send, /magic-link/verify, /sms/send and /sms/verify answer 403 2FA_REQUIRED in every mode, the second step (mode \"2fa\") included, "+
+				"the magic-link and SMS-code senders are not handed to the core, so the login challenge offers totp alone and an account without TOTP is answered 2FA_SETUP_REQUIRED; %s",
+				strings.Join(wired, " and "), carries),
+			"nothing to change if that is the realm you mean; the emailed link or the texted code as a second step lets a mailbox -- which also receives the reset link -- or a phone number stand in for both factors, "+
+				"and is available only with twoFactor.required off")
 	}
 
 	// The built-in identity provider's POST <prefix>/authorize signs a user in

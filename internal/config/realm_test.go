@@ -355,24 +355,105 @@ func TestTwoFactorPolicyWarnings(t *testing.T) {
 			}
 		}
 	})
-	// The surfaces the request-time gate holds to the policy load without a
-	// word: the console (with its machine principal, the org realm's shape),
-	// a mail transport and an SMS one. Their cold-start line says what the
-	// gate refuses; a configuration warning would say something is wrong.
-	t.Run("required beside the console and both transports warns about nothing", func(t *testing.T) {
+	// The console the request-time gate holds to the policy loads without a
+	// word: with its machine principal it is the org realm's shape, and its
+	// cold-start line says what the gate refuses.
+	t.Run("required beside the console warns about nothing", func(t *testing.T) {
 		ws := warningsFor(t, func(doc Document) {
 			set(doc, "twoFactor.required", true)
 			set(doc, "admin.enabled", true)
 			set(doc, "admin.accessPolicy", "is-admin-flag")
 			set(doc, "admin.machineAccess.iam.principals", []any{"arn:aws:iam::123456789012:role/plat-identity"})
-			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
-			set(doc, "email.mailer.from", "no-reply@example.com")
-			set(doc, "sms.endpoint", "https://sms.example.com/send")
 		}, baseEnv())
 		for _, w := range ws {
 			if strings.HasPrefix(w.Path, "twoFactor.") {
-				t.Errorf("a surface the gate holds to the policy warned: %s", w.Error())
+				t.Errorf("the console under the policy warned: %s", w.Error())
 			}
+		}
+	})
+
+	// A transport is different: under the policy it stops carrying the
+	// emailed link and the texted code, which is a change in what a block the
+	// operator configured does — and the review that found a mailbox
+	// answering both steps found it because nothing said so. Each transport
+	// warns, naming what is refused and what the transport still carries.
+	mailer := func(doc Document) {
+		set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+		set(doc, "email.mailer.from", "no-reply@example.com")
+	}
+	webhook := func(doc Document) { set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook") }
+	sms := func(doc Document) { set(doc, "sms.endpoint", "https://sms.example.com/send") }
+	webhookEnv := func() map[string]string {
+		env := baseEnv()
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+		return env
+	}
+	for _, tc := range []struct {
+		name      string
+		transport func(Document)
+		env       func() map[string]string
+		names     string
+		carries   []string
+	}{
+		{"a mailer", mailer, baseEnv, "a mailer (email.mailer)", []string{"password-reset", "opens no session", "a mailbox or a phone number alone never opens one"}},
+		{"the delivery webhook", webhook, webhookEnv, "the delivery webhook (email.deliveryWebhook)", []string{"password-reset", "opens no session"}},
+		{"an SMS transport", sms, baseEnv, "an SMS transport (sms)", []string{"carries no credential", "a phone number alone never opens a session"}},
+	} {
+		t.Run("required beside "+tc.name+" says what is refused", func(t *testing.T) {
+			ws := warningsFor(t, func(doc Document) {
+				set(doc, "twoFactor.required", true)
+				tc.transport(doc)
+			}, tc.env())
+			w := find(ws, "twoFactor.required", "the only second factor")
+			if w == nil {
+				t.Fatalf("no warning that the policy changes what %s carries: %v", tc.name, ws)
+			}
+			for _, want := range append([]string{
+				tc.names, "TOTP code", "/magic-link/send, /magic-link/verify, /sms/send and /sms/verify", "403 2FA_REQUIRED",
+				"every mode", `mode "2fa"`, "totp alone", "2FA_SETUP_REQUIRED",
+			}, tc.carries...) {
+				if !strings.Contains(w.Problem, want) {
+					t.Errorf("the warning does not say %q:\n%s", want, w.Error())
+				}
+			}
+			if strings.Contains(w.Problem, "enrolOnLogin") {
+				t.Errorf("with forced enrolment off the warning names it:\n%s", w.Error())
+			}
+		})
+		t.Run(tc.name+" without the policy warns about nothing of this", func(t *testing.T) {
+			ws := warningsFor(t, tc.transport, tc.env())
+			for _, w := range ws {
+				if strings.HasPrefix(w.Path, "twoFactor.") {
+					t.Errorf("%s without twoFactor.required warned: %s", tc.name, w.Error())
+				}
+			}
+		})
+	}
+
+	// Forced enrolment beside the reset mail: the mailbox alone can set an
+	// unenrolled account's password, and forced enrolment then lets it bind
+	// the factor. Trust on first use, made reachable from the mailbox; both
+	// warnings say so.
+	t.Run("enrolOnLogin beside the reset mail names the mailbox", func(t *testing.T) {
+		ws := warningsFor(t, func(doc Document) {
+			set(doc, "twoFactor.required", true)
+			set(doc, "twoFactor.enrolOnLogin", true)
+			mailer(doc)
+		}, baseEnv())
+		if w := find(ws, "twoFactor.enrolOnLogin", "trust on first use"); w == nil || !strings.Contains(w.Problem, "mailbox alone") {
+			t.Errorf("the trust-on-first-use warning does not name the reset mail: %v", w)
+		}
+		if w := find(ws, "twoFactor.required", "the only second factor"); w == nil || !strings.Contains(w.Problem, "has not enrolled yet") {
+			t.Errorf("the transport warning does not name the unenrolled account forced enrolment exposes: %v", w)
+		}
+	})
+	t.Run("enrolOnLogin without a mail transport does not name the mailbox", func(t *testing.T) {
+		ws := warningsFor(t, func(doc Document) {
+			set(doc, "twoFactor.required", true)
+			set(doc, "twoFactor.enrolOnLogin", true)
+		}, baseEnv())
+		if w := find(ws, "twoFactor.enrolOnLogin", "trust on first use"); w == nil || strings.Contains(w.Problem, "mailbox") {
+			t.Errorf("with no reset mail the warning names a mailbox: %v", w)
 		}
 	})
 	t.Run("required alone warns about nothing", func(t *testing.T) {
@@ -452,6 +533,17 @@ func TestTwoFactorRequiredRefusesOneFactorSignIns(t *testing.T) {
 			},
 			path: "admin.bootstrapSecret",
 		},
+		{
+			// The reviewer's probe: GET /admin/api/users answered 200 with no
+			// credential under the policy.
+			name: "an open console",
+			mutate: func(doc Document) {
+				set(doc, "admin.enabled", true)
+				set(doc, "admin.accessPolicy", "open")
+			},
+			path:    "admin.accessPolicy",
+			mention: []string{"open", "no credential at all", "is-admin-flag"},
+		},
 	}
 	for _, env := range []string{"development", "production"} {
 		for _, tc := range cases {
@@ -486,9 +578,10 @@ func TestTwoFactorRequiredRefusesOneFactorSignIns(t *testing.T) {
 
 	// What stays: the org realm's shape — the policy, a console under a
 	// session policy with no root user, and a machine principal — and the
-	// passwordless transports, which the request-time gate holds to the
-	// policy. A root user and a provider with no console or policy around
-	// them are not this rule's business either.
+	// transports, whose passwordless seams cmd/auth withholds and the
+	// request-time gate refuses under the policy (warned, not refused). A
+	// root user and a provider with no console or policy around them are not
+	// this rule's business either.
 	t.Run("the console without its two credentials, a machine principal and both transports load", func(t *testing.T) {
 		doc := baseDoc()
 		console(doc)

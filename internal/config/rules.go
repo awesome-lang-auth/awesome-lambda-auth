@@ -118,12 +118,15 @@ func checkRS19ClosedRegistrationOAuth(c *Config, d *diagnostics) {
 // mintAdminToken) and each got one of two answers:
 //
 //   - Held to the policy at request time, by cmd/auth's secondFactorGate: the
-//     login mode of the two passwordless routes, /link-verify's
-//     loginAfterLinking, and POST <admin>/login. Each is one request the gate
-//     can recognise and refuse before the core acts on it, and refusing it
-//     takes nothing else away — the step-up mode of the same routes is the
-//     factor itself, and the console accepts a session that came through
-//     POST <prefix>/login. Not refused here.
+//     magic-link and SMS routes in every mode (under the policy a TOTP code
+//     is the only second factor, so the emailed link and the texted code are
+//     refused as a second step too, and their senders are not handed to the
+//     core), /link-verify's loginAfterLinking, and POST <admin>/login. Each is
+//     one request the gate can recognise and refuse before the core acts on
+//     it, and refusing it takes nothing else away — the password reset and
+//     the other mails keep their transport, and the console accepts a session
+//     that came through POST <prefix>/login and its TOTP code. Not refused
+//     here.
 //   - Refused here, because nothing can stand in front of it: the OAuth
 //     callback. The core's OAuthComplete issues the session for every
 //     account it resolves and the adapter sets the cookies on the 302; the
@@ -141,6 +144,14 @@ func checkRS19ClosedRegistrationOAuth(c *Config, d *diagnostics) {
 // with one factor by another name. Both are refused while the console is
 // mounted, which is checkAdminRootUser's rule ("a root user that can never
 // log in is refused") applied to the policy.
+//
+// And the console that asks for nothing: admin.accessPolicy: open admits every
+// request with no credential at all, which is the bootstrap secret's reasoning
+// taken one step further — not a sign-in with one factor but with none, to the
+// most privileged surface in the deployment. It is a warned posture without the
+// policy (collectWarnings), and refused beside it. A console with no policy and
+// no secret is RS-6's refusal already, so the literal is the only open shape
+// left to refuse here.
 //
 // Every environment: the policy is a security posture, and a development
 // stack that quietly ran without it would be the one place it was never
@@ -175,6 +186,13 @@ func checkRS20TwoFactorRequiredSignIn(c *Config, d *diagnostics) {
 				"without one it is the console's whole guard, a credential a person presents with no second factor",
 			"remove admin.bootstrapSecret, set admin.accessPolicy, and enter the console with a session from POST <prefix>/login, which asks for the factor -- "+
 				"flag the first administrator through a machine principal's promote (admin.machineAccess), in the store, or on a deploy before the policy is on")
+	}
+	if c.Admin.AccessPolicy == AdminAccessPolicyOpen {
+		d.errf(RuleTwoFactorRequiredSignIn, "admin.accessPolicy",
+			"twoFactor.required is on, and admin.accessPolicy is open: the console admits every request with no credential at all -- "+
+				"the user listing, promote, API keys and webhook secrets included -- so its whole power is reached with no factor, not even one",
+			"set admin.accessPolicy to is-admin-flag, rbac:<role> or permission:<perm> and enter the console with a session from POST <prefix>/login, which asks for the factor, "+
+				"or through admin.machineAccess")
 	}
 }
 

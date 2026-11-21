@@ -410,19 +410,23 @@ type TwoFactor struct {
 	// the literal "awesome-node-auth" (src/router/auth.router.ts:830).
 	AppName string `json:"appName"`
 
-	// Required demands a second factor of every account at login: the core's
-	// Config.Require2FA (auth.WithRequire2FA). An account with a factor it can
-	// present gets the reference's challenge — an enrolled TOTP, or, with a
-	// mail or SMS transport wired, the emailed link or the texted code, which
-	// the core counts as factors — and one with none gets
+	// Required demands a TOTP code of every account at login: the core's
+	// Config.Require2FA (auth.WithRequire2FA), with TOTP as the only second
+	// factor. An enrolled account gets the reference's challenge listing
+	// "totp" alone, and one with no TOTP gets
 	// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
-	// and no session; and POST <prefix>/2fa/disable answers 403 2FA_REQUIRED
-	// to everyone, with or without a settings store. The core asks at the
-	// password login alone, so the product holds the other sign-ins to it:
-	// RS-20 refuses it beside oauth.providers (the callback cannot be made to
-	// ask) and beside the console's root user and bootstrap secret, and
-	// cmd/auth's secondFactorGate refuses the passwordless logins' login mode,
+	// and no session, whatever transports are wired; and POST
+	// <prefix>/2fa/disable answers 403 2FA_REQUIRED to everyone, with or
+	// without a settings store. The core asks at the password login alone and
+	// counts an emailed link or a texted code as a second factor wherever it
+	// can deliver one, so the product holds the rest to the policy: RS-20
+	// refuses it beside oauth.providers (the callback cannot be made to ask),
+	// beside the console's root user and bootstrap secret, and beside an open
+	// console; cmd/auth withholds the magic-link and SMS-code senders from the
+	// core, so the challenge offers neither; and its secondFactorGate refuses
+	// the four passwordless routes in every mode — login and step-up alike —
 	// /link-verify's loginAfterLinking and POST <admin>/login at request time.
+	// A mailbox or a phone number alone therefore never opens a session.
 	//
 	// [new] — the reference has no deployment-level require2FA: the name lives
 	// on the settings store and on the user record only, and its login demands
@@ -1320,6 +1324,25 @@ func (c *Config) IDProviderActive() bool { return c.IDProvider.active() }
 // refresh token then falls back to the access secret, as before the secret
 // was wired; nothing there can redeem one.
 func (c *Config) VerifiesRefreshTokens() bool { return !c.ResourceServer.Enabled }
+
+// MailerConfigured, SMSConfigured and DeliveryWebhookConfigured report which
+// credential transports this deployment wires. They are the schema's own
+// signals rather than new knobs — validate.go refuses a mailer block with no
+// from address, an sms block with no endpoint, and a delivery webhook url
+// with no signing secret — and they are exported for the same reason
+// VerifiesRefreshTokens is: cmd/auth wires the senders from them and the
+// loader warns about twoFactor.required beside them, and the two must not
+// disagree about whether a deployment sends mail.
+func (c *Config) MailerConfigured() bool { return strings.TrimSpace(c.Email.Mailer.From) != "" }
+
+// SMSConfigured: see MailerConfigured.
+func (c *Config) SMSConfigured() bool { return strings.TrimSpace(c.SMS.Endpoint) != "" }
+
+// DeliveryWebhookConfigured: see MailerConfigured. When it is true the webhook
+// carries all five credential seams, mail and SMS alike.
+func (c *Config) DeliveryWebhookConfigured() bool {
+	return strings.TrimSpace(c.Email.DeliveryWebhook.URL) != ""
+}
 
 // CookieDeliveryActive reports whether the stack issues auth cookies at all.
 // Bearer versus cookie is a per-request client choice (X-Auth-Strategy), so the

@@ -15,24 +15,38 @@ import (
 
 // twoFactor.required, held at every door: the request-time half.
 //
-// The core enforces Config.Require2FA at POST <prefix>/login and nowhere else.
-// Every other way into a session was walked — each caller of the core's
-// issueSession, and the console's mintAdminToken — and sorted by what can be
-// done about it from outside the core, which this product does not fork:
+// The policy is that every session proved a TOTP code. The core enforces
+// Config.Require2FA at POST <prefix>/login and nowhere else, and there it
+// counts an emailed link or a texted code as a second factor wherever it can
+// deliver one. Every other way into a session was walked — each caller of the
+// core's issueSession, and the console's mintAdminToken — and sorted by what
+// can be done about it from outside the core, which this product does not
+// fork:
 //
 //   - The OAuth callback completes with a session and no second-factor step,
 //     and nothing in front of it can turn that into a challenge. A configured
 //     provider is refused at start (RS-20, internal/config).
 //   - admin.rootUser and admin.bootstrapSecret sign in at POST <admin>/login
-//     and nowhere else, so they die with it. Refused at start (RS-20).
+//     and nowhere else, so they die with it, and admin.accessPolicy: open asks
+//     for nothing at all. Refused at start (RS-20).
+//   - The emailed link and the texted code as the SECOND step: the core offers
+//     them in the login challenge (availableTwoFactorMethods) and completes
+//     the challenge with either — and the mailbox that receives the link also
+//     receives the password-reset link, so the mailbox alone answers both
+//     steps, and a phone number answers the second. Under the policy they are
+//     not factors: delivery.go does not hand the core the magic-link and
+//     SMS-code senders, so the challenge lists "totp" alone and an account
+//     with no TOTP is answered 2FA_SETUP_REQUIRED; and the gate below refuses
+//     the step-up mode of the four routes, which also covers a link or a code
+//     minted before the policy was switched on.
 //   - Four doors are one request each that the gate below can recognise and
 //     refuse before the core acts on it, without taking anything else away:
 //
-//     the login mode of POST <prefix>/magic-link/{send,verify} and
-//     POST <prefix>/sms/{send,verify} — the emailed link or the texted code
-//     alone opens a session there, as in the reference. The step-up mode of
-//     the same four routes (mode "2fa", with the login's tempToken) is the
-//     second factor itself, and passes;
+//     POST <prefix>/magic-link/{send,verify} and POST <prefix>/sms/{send,verify},
+//     in EVERY mode — the login mode, where the link or the code alone opens a
+//     session, as in the reference, and the step-up mode (mode "2fa", with the
+//     login's tempToken), where it stands in for the factor. The body is not
+//     read: no mode is admitted, so there is nothing in it to decide on;
 //
 //     POST <prefix>/link-verify with loginAfterLinking — the core opens a
 //     session for the linked account on the emailed link-token alone
@@ -42,17 +56,19 @@ import (
 //
 //     POST <admin>/login — a 24-hour console token on a password alone. The
 //     console still accepts the access token of a session that came through
-//     POST <prefix>/login and its factor (the core's admin guard reads it),
+//     POST <prefix>/login and its TOTP code (the core's admin guard reads it),
 //     and admin.loginPath sends a browser to the hosted login that asks for
 //     it; and machine access (admin.machineAccess) is IAM, not a sign-in.
 //
 //   - Everything else was already held: /register opens a session only when
-//     /login would (core registerIssuesSession), the forced enrolment of
-//     twoFactor.enrolOnLogin opens one only on a factor it has just bound,
-//     the identity provider's /authorize calls the core's Service.Login,
-//     which refuses every account under the policy, and /refresh continues a
-//     session that one of these doors opened — or one opened before the
-//     policy was switched on, which it does not end (config-reference §7.1).
+//     /login would (core registerIssuesSession), /reset-password changes a
+//     password and opens nothing — the next login is the TOTP challenge —
+//     the forced enrolment of twoFactor.enrolOnLogin opens a session only on
+//     the TOTP factor it has just bound, the identity provider's /authorize
+//     calls the core's Service.Login, which refuses every account under the
+//     policy, and /refresh continues a session that one of these doors opened
+//     — or one opened before the policy was switched on, which it does not end
+//     (config-reference §7.1).
 //
 // The gate answers the core's own envelope for the requirement it enforces,
 // 403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}
@@ -74,21 +90,23 @@ import (
 // field, as newAdminLoginLimiter does.
 //
 // And a gate that read the body its own way would be bypassed by every body
-// the handler reads differently. The core decodes these bodies with
+// the handler reads differently — which is why the passwordless routes are
+// refused without reading theirs. The one body it does read is
+// /link-verify's, for loginAfterLinking. The core decodes it with
 // json.NewDecoder into a struct (auth.DecodeOptionalJSON): one value, keys
 // matched case-insensitively, the last duplicate winning, an empty body read
 // as {}. The gate decodes the same bytes the same way into a struct carrying
-// the core's own tag for the one field it reads, so {"mode":"2fa","MODE":""}
-// is login mode to both. It passes only on exactly what the core treats as
-// step-up — auth.TwoFactorMode, the core's predicate — and refuses whatever it
-// cannot read, an oversized body included; the core would answer a malformed
-// body 400 INVALID_BODY, so failing closed costs a client nothing it could
-// have used. The bytes are put back for the handler unchanged.
+// the core's own tag for the one field it reads, so
+// {"loginAfterLinking":false,"LOGINAFTERLINKING":true} is a login to both. It
+// refuses whatever it cannot read, an oversized body included; the core would
+// answer a malformed body 400 INVALID_BODY, so failing closed costs a client
+// nothing it could have used. The bytes are put back for the handler
+// unchanged.
 
-// maxSecondFactorGateBody bounds what the gate reads of a body. The bodies of
-// these routes are a token, a mode and a tempToken — a few hundred bytes — so
-// 64 KiB is room for any client and a ceiling for the rest; a larger body is
-// refused rather than half-read.
+// maxSecondFactorGateBody bounds what the gate reads of a body. The body of
+// /link-verify is a token and a flag — a few hundred bytes — so 64 KiB is room
+// for any client and a ceiling for the rest; a larger body is refused rather
+// than half-read.
 const maxSecondFactorGateBody = 64 << 10
 
 // secondFactorGate returns the middleware that holds the one-factor sign-ins
@@ -103,7 +121,7 @@ func secondFactorGate(cfg *config.Config, mux *http.ServeMux) func(http.Handler)
 	prefix := hc.Prefix()
 	// The patterns exactly as the core registers them (adapter/nethttp
 	// mountCredentialRoutes and Mount): a method, a space, the prefixed path.
-	stepUp := map[string]bool{
+	passwordless := map[string]bool{
 		http.MethodPost + " " + prefix + "/magic-link/send":   true,
 		http.MethodPost + " " + prefix + "/magic-link/verify": true,
 		http.MethodPost + " " + prefix + "/sms/send":          true,
@@ -122,16 +140,11 @@ func secondFactorGate(cfg *config.Config, mux *http.ServeMux) func(http.Handler)
 			}
 			_, pattern := mux.Handler(r)
 			switch {
-			case stepUp[pattern]:
-				// The core's own tag: magicLinkSendRequest, magicLinkVerifyRequest,
-				// smsSendRequest and smsVerifyRequest all read `json:"mode"`.
-				var body struct {
-					Mode string `json:"mode"`
-				}
-				if !decodeGatedBody(r, &body) || !auth.TwoFactorMode(body.Mode) {
-					auth.WriteHTTPError(w, auth.HTTPErrTwoFactorRequired)
-					return
-				}
+			case passwordless[pattern]:
+				// Every mode: the login mode is one factor, and the step-up
+				// mode would make the mailbox or the phone the second.
+				auth.WriteHTTPError(w, auth.HTTPErrTwoFactorRequired)
+				return
 			case pattern == linkVerify:
 				// linkVerifyBody's tag. Refused before the core reads the token,
 				// so the link survives for a request without the flag.
@@ -169,23 +182,40 @@ func decodeGatedBody(r *http.Request, dst any) bool {
 	return true
 }
 
-// logSecondFactorSurface says at cold start which sign-ins the policy holds
-// and how, once, beside the other surface lines. Nothing when the policy is
-// off: every door then answers as the core does.
+// logSecondFactorSurface says at cold start what the policy enforces and how,
+// once, beside the other surface lines: that a TOTP code is the only second
+// factor, which doors are refused, and what a password reset still does.
+// Nothing when the policy is off: every door then answers as the core does.
 func logSecondFactorSurface(cfg *config.Config, log *slog.Logger) {
 	if !cfg.TwoFactor.Required {
 		return
 	}
 	hc := httpConfig(cfg)
 	prefix := hc.Prefix()
+	enrol := "is answered 403 2FA_SETUP_REQUIRED and enrolled out of band (twoFactor.enrolOnLogin is off)"
+	if cfg.TwoFactor.EnrolOnLogin {
+		enrol = "is answered 403 2FA_SETUP_REQUIRED and enrols TOTP with that answer's tempToken at POST " + prefix +
+			"/2fa/setup and /2fa/verify-setup (twoFactor.enrolOnLogin: trust on first use)"
+	}
 	admin := "no console is mounted"
 	if hc.AdminMounted() {
 		admin = "POST " + hc.AdminPath() + auth.AdminLoginPath + " answers 404; the console admits a session from POST " + prefix +
-			"/login, which asks for the factor, and machine access"
+			"/login and its TOTP code, and machine access"
 	}
-	log.Info("twoFactor.required: one-factor sign-ins refused",
-		slog.String("passwordlessLogin", "POST "+prefix+"/magic-link/send, /magic-link/verify, /sms/send and /sms/verify answer 403 2FA_REQUIRED unless mode is \"2fa\" (the step-up, with the login's tempToken)"),
+	attrs := []any{
+		slog.String("secondFactor", "totp alone: the login challenge lists totp and completes at POST "+prefix+"/2fa/verify; an account without TOTP "+enrol),
+		slog.String("passwordless", "POST "+prefix+"/magic-link/send, /magic-link/verify, /sms/send and /sms/verify answer 403 2FA_REQUIRED in every mode, "+
+			"the step-up (mode \"2fa\") included; their senders are not handed to the core, so no link or code is minted and ui/config reports neither"),
 		slog.String("linkVerify", "POST "+prefix+"/link-verify with loginAfterLinking answers 403 2FA_REQUIRED; linking alone passes"),
 		slog.String("adminLogin", admin),
-		slog.String("deviation", "two-factor-required-refuses-one-factor-sign-ins"))
+	}
+	if cfg.MailerConfigured() || cfg.DeliveryWebhookConfigured() {
+		reset := "POST " + prefix + "/forgot-password delivers the reset link and /reset-password changes the password and opens no session: the next login is the TOTP challenge"
+		if cfg.TwoFactor.EnrolOnLogin {
+			reset += "; an account that has not enrolled TOTP yet is claimed by whoever resets its password, through forced enrolment"
+		}
+		attrs = append(attrs, slog.String("passwordReset", reset))
+	}
+	log.Info("twoFactor.required: every session proves a TOTP code", append(attrs,
+		slog.String("deviation", "two-factor-required-refuses-one-factor-sign-ins"))...)
 }
