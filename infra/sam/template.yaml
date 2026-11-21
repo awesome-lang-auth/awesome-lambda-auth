@@ -66,6 +66,8 @@ Metadata:
         Parameters: [MailerFromAddress, MailerFromName, MailerIdentity, MailerDefaultLang, EnableSmsDelivery]
       - Label: {default: Email flows}
         Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn]
+      - Label: {default: Realm policy (registration and second factor)}
+        Parameters: [ClosedRegistration, TwoFactorRequired, TwoFactorEnrolOnLogin]
       - Label: {default: Second factor and token claims}
         Parameters: [TotpIssuer, ClaimsWebhookUrl, ClaimsWebhookTimeoutMs, ClaimsWebhookSecretArn]
       - Label: {default: OAuth providers}
@@ -87,7 +89,7 @@ Metadata:
       - Label: {default: Origin verification (front door)}
         Parameters: [OriginVerifySecretArn, OriginVerifyHeader, OriginVerifyExemptHealthz]
       - Label: {default: Admin console}
-        Parameters: [EnableAdminConsole, AdminAccessPolicy, AdminRootEmail, AdminRootPasswordHashArn, EnableAdminUploads]
+        Parameters: [EnableAdminConsole, AdminAccessPolicy, AdminRootEmail, AdminRootPasswordHashArn, EnableAdminUploads, AdminMachinePrincipalArns]
       - Label: {default: Outgoing webhook queue (D9b)}
         Parameters: [EnableWebhookQueue, WebhookQueueMaxReceiveCount, WebhookWorkerMaxConcurrency]
       - Label: {default: Observability and alarms}
@@ -360,6 +362,60 @@ Parameters:
       configured with the same key, which only you can do. Append #<jsonKey> to
       select one key of a JSON secret document. The function reads it at cold
       start; the value never enters the template.
+
+  # -----------------------------------------------------------------------
+  # Realm policy (config-reference.md §7 and §20): who may sign up, and what a
+  # login has to prove. Three switches, all off by default, and each sets its
+  # variable ONLY when it is "true": the environment layer beats the
+  # configuration document, so a "false" written into the environment would
+  # silently reopen a realm whose ConfigFile closed it.
+  #
+  # An invite-only staff realm sets ClosedRegistration and TwoFactorRequired.
+  # TwoFactorEnrolOnLogin is the one to think twice about: it lets the first
+  # sign-in with an unenrolled account's password bind the second factor —
+  # trust on first use — so it is for a realm whose initial passwords reach
+  # their owners and nobody else.
+  # -----------------------------------------------------------------------
+
+  ClosedRegistration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_REGISTRATION_CLOSED. "true" unmounts POST <ApiPrefix>/register
+      (it answers 404, the hosted UI hides its sign-up link and the OpenAPI
+      document drops the path); accounts are then created only by the admin
+      console, cmd/migrate or a flow of your own. It does not close the OAuth
+      callback, which creates accounts for new identities by default: with an
+      OAuth client id set and no ConfigFile the Rule
+      ClosedRegistrationRefusesOAuthSignUp refuses the stack, and with a
+      ConfigFile the function refuses to start (RS-19) unless
+      oauth.provisioning.autoCreate is false or allowedEmailDomains narrows it.
+
+  TwoFactorRequired:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_2FA_REQUIRED. "true" demands a second factor at every
+      password login: an enrolled account gets the TOTP challenge, an account
+      with none answers 403 2FA_SETUP_REQUIRED and gets no session, and POST
+      /2fa/disable is refused. Not the same as runtimeSettings.require2fa,
+      which only blocks /2fa/disable. The OAuth callback and the admin
+      console's own POST /admin/login still issue sessions without a factor
+      (the function warns at start).
+
+  TwoFactorEnrolOnLogin:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_2FA_ENROL_ON_LOGIN. "true" lets an account that must
+      present a second factor and has none enrol one at login, with the
+      tempToken of its 2FA_SETUP_REQUIRED answer, and opens its session when
+      it does. TRUST ON FIRST USE: whoever holds the password binds the
+      factor. "false" — the default — means such accounts are enrolled out of
+      band before their first login.
 
   # -----------------------------------------------------------------------
   # Second factor and token claims (config-schema.md §1.1, §1.8). The TOTP
@@ -1389,6 +1445,34 @@ Parameters:
       invocation event, and past that API Gateway answers its own 413 body
       before the function runs (config-reference.md §16.5).
 
+  # Machine access to the admin API (config-reference.md §16.9). A back-office
+  # service — an identity service that invites operators and deletes users —
+  # calls the console's JSON API with a SigV4-signed request instead of a
+  # person's password and second factor kept in a vault. Naming a principal
+  # here creates a SECOND, INTERNAL HTTP API (AdminMachineApi) whose single
+  # route, ANY /admin/{proxy+}, requires AWS_IAM authorization and invokes the
+  # same function; the function admits a caller API Gateway verified there
+  # when its role or user is listed. The internal API is an origin of nothing:
+  # CloudFront never routes to it, and the public API carries no IAM route.
+  # Empty — the default — creates nothing and grants nothing.
+  #
+  # The caller also needs execute-api:Invoke on the AdminMachineApiInvokeArn
+  # output, granted by ITS OWN IAM policy (an HTTP API has no resource
+  # policy), and with OriginVerifySecretArn set it sends the origin header too.
+  AdminMachinePrincipalArns:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[^,\s]+(,arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[^,\s]+)*$'
+    ConstraintDescription: >-
+      AdminMachinePrincipalArns must be a comma-separated list of IAM role or
+      user ARNs (arn:<partition>:iam::<account>:role/<name>), with no spaces.
+    Description: >-
+      AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS — IAM role or user
+      ARNs, comma separated, admitted to the admin API through the internal
+      AdminMachineApi. A role admits every session of it (matched by account
+      and name). Requires EnableAdminConsole "true". Placeholder is empty on
+      purpose; never commit an ARN.
+
   # -----------------------------------------------------------------------
   # Observability, alarms and budget
   # =======================================================================
@@ -1692,6 +1776,17 @@ Conditions:
     - !Condition HasAdminRootEmail
     - !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
   AdminUploadsEnabled: !Equals [!Ref EnableAdminUploads, 'true']
+  # Machine access: the principals are the switch, and the console is a term,
+  # so a stack that somehow bypassed the Rule below creates no API for a
+  # console that is not mounted (the function would refuse the variable).
+  HasAdminMachinePrincipals: !Not [!Equals [!Ref AdminMachinePrincipalArns, '']]
+  AdminMachineAccessEnabled: !And [!Condition AdminConsoleEnabled, !Condition HasAdminMachinePrincipals]
+
+  # The realm policy. Each is the switch for its one variable, which is set
+  # only when the parameter is "true" (see the parameters).
+  RegistrationClosed: !Equals [!Ref ClosedRegistration, 'true']
+  TwoFactorIsRequired: !Equals [!Ref TwoFactorRequired, 'true']
+  TwoFactorEnrolsOnLogin: !Equals [!Ref TwoFactorEnrolOnLogin, 'true']
 
   # Observability. HasAlarmTarget is the one every notifying resource is gated
   # on: with neither parameter set, no topic is created, no subscription exists,
@@ -1988,6 +2083,40 @@ Rules:
           EnableInboundWebhooks is "true", so set EnableTools to "true" as well.
           The inbound route is part of the tools router; without it the script
           runner would be a function nothing ever invokes.
+
+  # Machine access admits callers to the console; with the console off there
+  # is nothing to admit them to, and the function refuses the variable.
+  # Parameter-only: both are this template's.
+  AdminMachineAccessNeedsTheConsole:
+    RuleCondition: !Not [!Equals [!Ref AdminMachinePrincipalArns, '']]
+    Assertions:
+      - Assert: !Equals [!Ref EnableAdminConsole, 'true']
+        AssertDescription: >-
+          AdminMachinePrincipalArns names principals for the admin API, so set
+          EnableAdminConsole to "true": machine access admits callers to the
+          console, and with the console off nothing is mounted to admit them to.
+
+  # RS-19 at changeset time. Closing POST /register leaves the OAuth callback,
+  # which creates an account for any new identity while
+  # oauth.provisioning.autoCreate is on — its default, and nothing in this
+  # template can turn it off. Document-aware: a ConfigFile can turn it off or
+  # narrow it with allowedEmailDomains, and the function's own RS-19 then
+  # decides with both sources in view.
+  ClosedRegistrationRefusesOAuthSignUp:
+    RuleCondition: !And
+      - !Equals [!Ref ClosedRegistration, 'true']
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref OAuthGoogleClientId, '']
+          - !Equals [!Ref OAuthGithubClientId, '']
+        AssertDescription: >-
+          ClosedRegistration is "true" and an OAuth client id is set, so the
+          provider's callback would still create an account for anyone who signs
+          in with it (oauth.provisioning.autoCreate defaults to on) and the
+          function would refuse to start (RS-19). Remove the client id, or supply
+          a ConfigFile that sets oauth.provisioning.autoCreate to false or narrows
+          it with oauth.provisioning.allowedEmailDomains.
 
 Resources:
 
@@ -2427,6 +2556,12 @@ Resources:
           # a url that switches it on, a timeout, and a SECRETSMANAGER
           # reference whose value the function fetches at cold start.
           AWESOME_AUTH_2FA_APP_NAME: !Ref TotpIssuer
+          # The realm policy: each set only when its parameter is "true", so a
+          # ConfigFile's registration.closed or twoFactor.* is never overridden
+          # by a "false" the operator did not write.
+          AWESOME_AUTH_REGISTRATION_CLOSED: !If [RegistrationClosed, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_2FA_REQUIRED: !If [TwoFactorIsRequired, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_2FA_ENROL_ON_LOGIN: !If [TwoFactorEnrolsOnLogin, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL: !If [HasClaimsWebhook, !Ref ClaimsWebhookUrl, !Ref 'AWS::NoValue']
           # !Sub rather than !Ref: a Lambda environment variable is a string,
           # and the parameter is a Number so that CloudFormation enforces the
@@ -2590,6 +2725,12 @@ Resources:
           AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH_SECRETSMANAGER: !If
             - HasAdminRootPasswordHash
             - !Ref AdminRootPasswordHashArn
+            - !Ref 'AWS::NoValue'
+          # Machine access: who among the callers AdminMachineApi verified is
+          # admitted. Present exactly when that API exists.
+          AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS: !If
+            - AdminMachineAccessEnabled
+            - !Ref AdminMachinePrincipalArns
             - !Ref 'AWS::NoValue'
           # The upload location, as the S3 form ui.uploadDir takes on this
           # product: the bucket this stack owns, under one prefix, so the
@@ -3101,6 +3242,83 @@ Resources:
             Path: /{proxy+}
             Method: ANY
             PayloadFormatVersion: '2.0'
+
+  # ---------------------------------------------------------------------
+  # Machine access to the admin API: the internal API
+  # (config-reference.md §16.9)
+  #
+  # Created only when AdminMachinePrincipalArns names a principal and the
+  # console is on. A second HTTP API — not a route on HttpApi — for two
+  # reasons, both about who can reach it:
+  #
+  #   * AuthDistribution sends EVERY path to HttpApi, so a route there would
+  #     be routed by CloudFront whenever EnableCloudFront is on. This API is an
+  #     origin of nothing; infra/sam TestAdminMachineApiIsNotACloudFrontOrigin
+  #     fails the day a distribution names it.
+  #   * An AWS_IAM route on HttpApi under /admin would put the whole console
+  #     behind SigV4 for the people who use it in a browser.
+  #
+  # One route, ANY /admin/{proxy+} with AWS_IAM: API Gateway verifies the
+  # signature and the caller's execute-api:Invoke before the function runs,
+  # and writes the caller into requestContext.authorizer.iam, which is what the
+  # function matches against AdminMachinePrincipalArns. Nothing else of the
+  # function is reachable through it. The path is the template's admin mount;
+  # a ConfigFile that moves admin.basePath leaves every call here a 404.
+  #
+  # Raw AWS::ApiGatewayV2 resources rather than a SAM HttpApi event, because a
+  # SAM event cannot carry a Condition: as an event on AuthFunction the API
+  # would exist on every stack. The stage throttles to 10 requests a second
+  # (burst 20) — a back-office caller's volume, and a bound on what a
+  # misbehaving one costs.
+  # ---------------------------------------------------------------------
+
+  AdminMachineApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: AdminMachineAccessEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-admin-machine'
+      Description: !Sub 'awesome-lambda-auth admin API for IAM-signed machine callers of ${AWS::StackName}; never behind CloudFront'
+      ProtocolType: HTTP
+
+  AdminMachineIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: AdminMachineAccessEnabled
+    Properties:
+      ApiId: !Ref AdminMachineApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AdminMachineRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: AdminMachineAccessEnabled
+    Properties:
+      ApiId: !Ref AdminMachineApi
+      RouteKey: 'ANY /admin/{proxy+}'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${AdminMachineIntegration}'
+
+  AdminMachineStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: AdminMachineAccessEnabled
+    Properties:
+      ApiId: !Ref AdminMachineApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+
+  # API Gateway may invoke the function for this API's admin route and
+  # nothing else: the SourceArn is the API's own, under /admin.
+  AdminMachineInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: AdminMachineAccessEnabled
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AdminMachineApi}/*/*/admin/*'
 
   # ---------------------------------------------------------------------
   # D9b: outgoing webhooks from a queue
@@ -4659,6 +4877,22 @@ Outputs:
     Value: !Sub 'https://${AuthDistribution.DomainName}'
     Export:
       Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
+
+  # Machine access to the admin API. The endpoint a machine caller signs its
+  # requests for (service execute-api), and the resource its own IAM policy
+  # grants execute-api:Invoke on.
+  AdminMachineApiEndpoint:
+    Condition: AdminMachineAccessEnabled
+    Description: >-
+      Base URL of the internal admin API for IAM-signed machine callers; the
+      console's routes live under <endpoint>/admin. Never behind CloudFront.
+    Value: !Sub 'https://${AdminMachineApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  AdminMachineApiInvokeArn:
+    Condition: AdminMachineAccessEnabled
+    Description: >-
+      The execute-api:Invoke resource a machine caller's IAM policy must allow;
+      the caller must also be listed in AdminMachinePrincipalArns.
+    Value: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AdminMachineApi}/$default/*/admin/*'
 
   TableName:
     Description: DynamoDB single table backing every store.
