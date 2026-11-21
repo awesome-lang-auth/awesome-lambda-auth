@@ -468,6 +468,10 @@ func adminHTTPOptions(cfg *config.Config) auth.AdminOptions {
 			// mount, which is the reference's own `swaggerBasePath ?? '/admin'`.
 			BasePath: "",
 		},
+		// admin.machineAccess.iam.principals: a caller API Gateway verified on
+		// an AWS_IAM route, admitted ahead of the session policy. Nil without
+		// the block, which is the reference's guard. admin_machine.go.
+		MachineAccess: adminMachineAccess(cfg),
 	}
 	if prefix := cfg.Admin.CookiePrefix; prefix != "" {
 		out.CookiePrefix = &prefix
@@ -694,6 +698,8 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 		slog.String("note", "an unauthenticated GET that accepts text/html reaches only the login shell, never a guarded route (upstream deviation admin-unauthenticated-get-serves-only-the-login-form); "+
 			"the 2FA step-up token is not an admin credential (admin-guard-accepts-only-typed-session-tokens); "+
 			"sessions.checkOn does not reach this surface, and an admin token lives its 24h whatever happens to the account -- rotating security.jwt.accessTokenSecret is the one kill switch"))
+
+	logAdminMachineAccess(cfg, mount, log)
 
 	if hc.Admin.Docs.Enabled {
 		log.Warn("the admin console's documentation pair is mounted unguarded",

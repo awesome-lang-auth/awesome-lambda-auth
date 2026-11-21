@@ -576,6 +576,136 @@ func validateAdmin(c *Config, d *diagnostics) {
 			"use 5, the reference's own limit and the only value the core honours; the effective ceiling through this API is lower still, "+
 				"about 4.4 MiB, because a multipart body arrives base64-encoded inside a 6 MB invocation event (config-reference.md §16.5)")
 	}
+	validateAdminMachineAccess(c, d)
+}
+
+// iamPrincipalARN is an IAM role or user ARN: a partition, a twelve-digit
+// account, the resource type, an optional path and a name in IAM's own
+// character set. Nothing looser: the value decides who is let into the admin
+// API without a session, so a shape this cannot read is refused rather than
+// guessed at.
+var iamPrincipalARN = regexp.MustCompile(`^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/(?:[!-~]*/)?[A-Za-z0-9+=,.@_-]+$`)
+
+// iamRoleSessionARN is the caller ARN API Gateway reports for a session of a
+// role: no path, the role's name and a session name, both in IAM's character
+// set.
+var iamRoleSessionARN = regexp.MustCompile(`^arn:[a-z0-9-]+:sts::[0-9]{12}:assumed-role/[A-Za-z0-9+=,.@_-]+/[A-Za-z0-9+=,.@_-]+$`)
+
+// IAMPrincipalKey is the identity admin.machineAccess.iam.principals matches
+// on, for a configured ARN or for the caller API Gateway reports, and false
+// for anything that is neither.
+//
+// A role is its partition, account and name: a configured
+// arn:<p>:iam::<acct>:role/[<path>/]<name> and a caller
+// arn:<p>:sts::<acct>:assumed-role/<name>/<session> are the same key, because
+// API Gateway reports a role's caller as the session ARN, which drops the
+// role's path and carries a session name whoever assumed the role chose. Role
+// names are unique within an account whatever their path, so the three parts
+// name one role. A user is its whole ARN, path included, which is how both
+// sides spell it. Comparison is exact: IAM reports the name as it was created.
+//
+// Exported because cmd/auth matches callers with it, and a second reading of
+// the same ARN grammar there could drift from the one that validated the
+// document.
+func IAMPrincipalKey(arn string) (string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(arn), ":", 6)
+	if len(parts) != 6 || parts[0] != "arn" || parts[1] == "" || parts[3] != "" || !isAccountID(parts[4]) {
+		return "", false
+	}
+	partition, service, account, resource := parts[1], parts[2], parts[4], parts[5]
+	switch {
+	case service == "iam" && strings.HasPrefix(resource, "role/"):
+		if !iamPrincipalARN.MatchString(strings.TrimSpace(arn)) {
+			return "", false
+		}
+		name := resource[strings.LastIndex(resource, "/")+1:]
+		return "role:" + partition + ":" + account + ":" + name, true
+	case service == "iam" && strings.HasPrefix(resource, "user/"):
+		if !iamPrincipalARN.MatchString(strings.TrimSpace(arn)) {
+			return "", false
+		}
+		return "user:" + strings.TrimSpace(arn), true
+	case service == "sts" && strings.HasPrefix(resource, "assumed-role/"):
+		if !iamRoleSessionARN.MatchString(strings.TrimSpace(arn)) {
+			return "", false
+		}
+		name, _, _ := strings.Cut(strings.TrimPrefix(resource, "assumed-role/"), "/")
+		return "role:" + partition + ":" + account + ":" + name, true
+	}
+	return "", false
+}
+
+// isAccountID reports whether s is a twelve-digit AWS account id.
+func isAccountID(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validateAdminMachineAccess checks admin.machineAccess.*.
+//
+// Every entry has to be an IAM role or user ARN, and the refusals name the
+// three near-misses an operator actually writes: a session ARN copied from a
+// log line (its session name is the assumer's choice and identifies nothing),
+// the account's root user, and a wildcard. A duplicate is refused like a
+// duplicate KMS key: two entries for one principal mean one of them was meant
+// to be something else. And the block is refused while admin.enabled is off,
+// for the reason validateOriginVerify refuses a header without a secret: an
+// operator who listed a principal believes a machine can reach the console,
+// and with no console mounted nothing can.
+func validateAdminMachineAccess(c *Config, d *diagnostics) {
+	principals := c.Admin.MachineAccess.IAM.Principals
+	if len(principals) == 0 {
+		return
+	}
+	const path = "admin.machineAccess.iam.principals"
+	if !c.Admin.Enabled {
+		d.errf("", path,
+			"is set while admin.enabled is off, so no console is mounted and no machine can be admitted to one",
+			"set admin.enabled: true with an access policy, or remove this key")
+	}
+	seen := map[string]int{}
+	for i, raw := range principals {
+		entry := fmt.Sprintf("%s[%d]", path, i)
+		arn := strings.TrimSpace(raw)
+		switch {
+		case arn == "" || strings.Contains(arn, "*"):
+			d.errf("", entry,
+				fmt.Sprintf("%q is empty or a wildcard, and this list admits callers to the admin API with no session", raw),
+				"name each role or user, arn:<partition>:iam::<account>:role/<name>")
+			continue
+		case strings.Contains(arn, ":sts::") && strings.Contains(arn, ":assumed-role/"):
+			d.errf("", entry,
+				fmt.Sprintf("%q is a role session, whose session name is chosen by whoever assumes the role and identifies nothing", arn),
+				"name the role instead, arn:<partition>:iam::<account>:role/<name>, which admits every session of it")
+			continue
+		case strings.HasSuffix(arn, ":root"):
+			d.errf("", entry,
+				fmt.Sprintf("%q is an account's root user, which must never be an admin machine principal", arn),
+				"create a role for the service that calls the admin API and name it here")
+			continue
+		}
+		key, ok := IAMPrincipalKey(arn)
+		if !ok || !strings.Contains(arn, ":iam::") {
+			d.errf("", entry,
+				fmt.Sprintf("%q is not an IAM role or user ARN", arn),
+				"use arn:<partition>:iam::<account>:role/[<path>/]<name> or arn:<partition>:iam::<account>:user/[<path>/]<name>")
+			continue
+		}
+		if first, dup := seen[key]; dup {
+			d.errf("", entry,
+				fmt.Sprintf("%q names the principal %s[%d] already names", arn, path, first),
+				"list each role or user once; a role is matched by account and name, whatever its path")
+			continue
+		}
+		seen[key] = i
+	}
 }
 
 func validateTools(c *Config, d *diagnostics) {

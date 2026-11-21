@@ -275,6 +275,18 @@ func TestAdminHTTPOptionsCarryTheWholeBlock(t *testing.T) {
 	if plain.CookiePrefix != nil {
 		t.Errorf("CookiePrefix = %q for an unset knob, want nil", *plain.CookiePrefix)
 	}
+	// No principal is no machine access: nil is the reference's guard.
+	if plain.MachineAccess != nil {
+		t.Error("MachineAccess is set with no admin.machineAccess.iam.principals")
+	}
+	if got.MachineAccess != nil {
+		t.Error("MachineAccess is set for a document that configures no principal")
+	}
+	withMachine := adminHTTPOptions(loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", "arn:aws:iam::123456789012:role/plat-identity")))
+	if withMachine.MachineAccess == nil {
+		t.Error("MachineAccess is nil with a principal configured")
+	}
 }
 
 func TestAdminAccessPolicyMapsEverySpelling(t *testing.T) {

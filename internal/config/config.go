@@ -588,7 +588,43 @@ type Admin struct {
 	BasePath     string   `json:"basePath"`
 	SessionTTL   Duration `json:"sessionTtl"`
 	Upload       Upload   `json:"upload"`
+
+	// MachineAccess admits a back-office service to the guarded admin routes
+	// on a credential the platform verified, ahead of the session policy: the
+	// core's AdminOptions.MachineAccess (core deviation
+	// admin-machine-access-is-a-host-seam). [new] — the reference offers a
+	// service only the shared adminSecret or a user's session.
+	// cmd/auth/admin_machine.go.
+	MachineAccess AdminMachineAccess `json:"machineAccess"`
 }
+
+// AdminMachineAccess covers admin.machineAccess.*. One credential kind today,
+// IAM, in a block of its own so that a second (a mutual-TLS peer, say) is an
+// addition and not a rename.
+type AdminMachineAccess struct {
+	IAM AdminMachineAccessIAM `json:"iam"`
+}
+
+// AdminMachineAccessIAM covers admin.machineAccess.iam.*.
+type AdminMachineAccessIAM struct {
+	// Principals are the IAM roles and users admitted, as ARNs:
+	// arn:<partition>:iam::<account>:role/[<path>/]<name> admits every session
+	// of that role — API Gateway reports a role's caller as
+	// arn:<partition>:sts::<account>:assumed-role/<name>/<session>, with the
+	// path dropped and a session name the assumer chose, so the match is on
+	// partition, account and role name — and
+	// arn:<partition>:iam::<account>:user/[<path>/]<name> admits that user
+	// exactly. The caller is read from requestContext.authorizer.iam of an API
+	// Gateway HTTP API (payload 2.0) event, which API Gateway fills only on a
+	// route with AWS_IAM authorization, after verifying the SigV4 signature;
+	// the SAM template's internal admin API is that route. Empty — the
+	// default — admits no machine. Refused while admin.enabled is off,
+	// because there is then no console to admit anyone to.
+	Principals []string `json:"principals"`
+}
+
+// Enabled reports whether any principal is configured, which is the switch.
+func (m AdminMachineAccess) Enabled() bool { return len(m.IAM.Principals) > 0 }
 
 // AdminRootUser covers admin.rootUser.*.
 type AdminRootUser struct {
