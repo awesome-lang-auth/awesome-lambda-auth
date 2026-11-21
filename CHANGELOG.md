@@ -160,6 +160,7 @@ under [Unreleased].
 
 ### Security
 
+- **Counting windows have a one-year ceiling.** `twoFactor.lockout.windowSeconds` and `rateLimit.windowSeconds` above 31,536,000 seconds are refused at start: a window is multiplied by `time.Second`, and a value above ~292 years overflowed and turned the cap into a sub-second window.
 - **Rate-limit subject canonicalisation** (`rateLimit.keyBy: email`, the
   default). The limiter read a request's subject from the body by rules of its
   own rather than the way the route reads the same body, so a request could be

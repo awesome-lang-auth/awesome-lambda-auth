@@ -322,7 +322,7 @@ func validateTwoFactor(c *Config, d *diagnostics) {
 	// lockout.
 	atLeast(d, "twoFactor.lockout.maxFailures", c.TwoFactor.Lockout.MaxFailures, 0)
 	if c.TwoFactor.Lockout.MaxFailures > 0 {
-		positive(d, "twoFactor.lockout.windowSeconds", c.TwoFactor.Lockout.WindowSeconds)
+		windowSeconds(d, "twoFactor.lockout.windowSeconds", c.TwoFactor.Lockout.WindowSeconds)
 	}
 }
 
@@ -838,7 +838,7 @@ func validateRateLimit(c *Config, d *diagnostics) {
 	if !c.RateLimit.Enabled {
 		return
 	}
-	positive(d, "rateLimit.windowSeconds", c.RateLimit.WindowSeconds)
+	windowSeconds(d, "rateLimit.windowSeconds", c.RateLimit.WindowSeconds)
 	positive(d, "rateLimit.max", c.RateLimit.Max)
 	enum(d, "rateLimit.keyBy", c.RateLimit.KeyBy, RateLimitKeyByIP, RateLimitKeyByEmail)
 	for i, ep := range c.RateLimit.Scope {
@@ -1040,6 +1040,27 @@ func atLeast(d *diagnostics, path string, got, floor int) {
 		d.errf("", path,
 			fmt.Sprintf("%d is below the minimum of %d", got, floor),
 			fmt.Sprintf("set it to %d or more", floor))
+	}
+}
+
+// MaxWindowSeconds bounds every counting window (rateLimit.windowSeconds,
+// twoFactor.lockout.windowSeconds) at one year. A window is multiplied by
+// time.Second where it is used, and a value above ~292 years overflows int64:
+// the cap would silently turn into a sub-second window. A year is far beyond any
+// sensible lockout or rate window, so the ceiling refuses only typos.
+const MaxWindowSeconds = 365 * 24 * 60 * 60
+
+// windowSeconds reports a counting window that is not positive or exceeds
+// MaxWindowSeconds.
+func windowSeconds(d *diagnostics, path string, got int) {
+	if got <= 0 {
+		positive(d, path, got)
+		return
+	}
+	if got > MaxWindowSeconds {
+		d.errf("", path,
+			fmt.Sprintf("%d seconds exceeds the %d-second (one year) ceiling for a counting window", got, MaxWindowSeconds),
+			"set a window of at most one year; to keep an account locked, raise the window up to that ceiling or disable the account")
 	}
 }
 
