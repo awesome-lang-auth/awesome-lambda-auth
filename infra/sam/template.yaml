@@ -471,7 +471,10 @@ Parameters:
       password; under TwoFactorRequired the answer is 2FA_SETUP_REQUIRED and,
       with TwoFactorEnrolOnLogin, the invitee enrols TOTP before any session
       opens. Needs EnableAdminConsole and a sender or
-      AdminRevealInvitationToken. "false" — the default — mounts none of them.
+      AdminRevealInvitationToken. The accept route is outside the default
+      rate-limit scope: name accept-invitation in rateLimit.scope (ConfigFile)
+      to limit it per client address. "false" — the default — mounts none of
+      them.
 
   InvitationsTtl:
     Type: String

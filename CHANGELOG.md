@@ -45,6 +45,13 @@ under [Unreleased].
   `AuthTableItems` and `AuthTableIndexQuery` grants cover every call. The user
   store reads the acceptance depends on (`GetUserByID`, `GetUserByEmail`) were
   already `ConsistentRead`.
+- **`rateLimit.scope` accepts `accept-invitation`**: `POST
+  <prefix>/invitations/accept`, keyed by client address like `reset-password`.
+  It is not in the default scope, so a realm that turns invitations on names
+  it (`docs/config-reference.md` §21.6). The SAM template has no scope
+  parameter, so that is done in `ConfigFile`. The token cannot be guessed. The
+  budget bounds a flood from one address, each call of which costs a
+  consistent read before the token is known to be bad.
 
 - **Closed registration** (`registration.closed`, off by default;
   `AWESOME_AUTH_REGISTRATION_CLOSED`; SAM `ClosedRegistration`).

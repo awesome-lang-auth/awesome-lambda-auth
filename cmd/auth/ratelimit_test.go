@@ -193,8 +193,18 @@ func TestRateLimitedRoutesAreMountedByTheAdapter(t *testing.T) {
 	// deployment's own scope is irrelevant here — the limiter mounts nothing,
 	// so which routes it watches has no bearing on which routes exist — and the
 	// sweep sends one request per path, which no budget refuses.
+	//
+	// The deployment has invitations on, because accept-invitation's route is
+	// mounted only then. Registration stays open, because a closed realm
+	// answers 404 on /register.
 	scopes := config.RateLimitEndpoints()
-	app := newTestApp(t, baseEnv())
+	app := newTestApp(t, with(baseEnv(),
+		"AWESOME_AUTH_ADMIN_ENABLED", "true",
+		"AWESOME_AUTH_ADMIN_ACCESS_POLICY", config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", testMachineRole,
+		"AWESOME_AUTH_INVITATIONS_ENABLED", "true",
+		"AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN", "true",
+	))
 
 	prefix := config.Defaults().HTTP.APIPrefix
 	for _, name := range scopes {
@@ -315,6 +325,46 @@ func TestRateLimiterIgnoresForwardedHeaders(t *testing.T) {
 	if last != http.StatusTooManyRequests {
 		t.Errorf("four requests claiming four different forwarded addresses answered %d on the last; "+
 			"a client that can choose its own subject has no limit at all", last)
+	}
+}
+
+// TestAcceptInvitationIsLimitedByClientAddress: POST <prefix>/invitations/accept
+// is public, and it stays mounted under registration.closed. Each call costs a
+// decode, a SHA-256 and a consistent read of the table before any token is
+// known to be bad. Its 256-bit token cannot be guessed, so the threat is a
+// flood, not a guess. The scope name accept-invitation keys it by client
+// address, as reset-password is keyed. A flood from one address then spends
+// that address's budget and no one else's: an invitee elsewhere still accepts.
+func TestAcceptInvitationIsLimitedByClientAddress(t *testing.T) {
+	t.Parallel()
+	const budget = 3
+	app := newTestApp(t, staffRealmEnv(
+		"AWESOME_AUTH_RATE_LIMIT_ENABLED", "true",
+		"AWESOME_AUTH_RATE_LIMIT_SCOPE", "accept-invitation",
+		"AWESOME_AUTH_RATE_LIMIT_MAX", strconv.Itoa(budget),
+	))
+	t.Cleanup(app.Close)
+
+	bogus := `{"token":"` + strings.Repeat("A", 43) + `","password":"` + testPassword + `"}`
+	for i := 1; i <= budget; i++ {
+		if resp := invokeFrom(t, app, "203.0.113.66", http.MethodPost, "/auth/invitations/accept", bogus); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bogus acceptance %d of a budget of %d answered %d %s, want 401", i, budget, resp.StatusCode, resp.Body)
+		}
+	}
+	if resp := invokeFrom(t, app, "203.0.113.66", http.MethodPost, "/auth/invitations/accept", bogus); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("acceptance %d of a budget of %d answered %d %s, want 429", budget+1, budget, resp.StatusCode, resp.Body)
+	}
+
+	// Another address is a budget of its own: a real invitee accepts.
+	invite := invokeIAM(t, app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, `{"email":"limited@example.test"}`)
+	token, _ := decodeBody(t, invite)["token"].(string)
+	if invite.StatusCode != http.StatusCreated || token == "" {
+		t.Fatalf("invite answered %d %s", invite.StatusCode, invite.Body)
+	}
+	accept := invokeFrom(t, app, "198.51.100.23", http.MethodPost, "/auth/invitations/accept",
+		`{"token":"`+token+`","password":"`+testPassword+`"}`)
+	if accept.StatusCode != http.StatusForbidden || decodeBody(t, accept)["code"] != "2FA_SETUP_REQUIRED" {
+		t.Fatalf("an invitee at another address answered %d %s, want the realm's 403 2FA_SETUP_REQUIRED", accept.StatusCode, accept.Body)
 	}
 }
 

@@ -854,10 +854,13 @@ func validateRateLimit(c *Config, d *diagnostics) {
 
 // rateLimitEndpoints is the set of endpoints the built-in limiter can be pointed
 // at. They are the unauthenticated, credential-guessable ones — a limiter on
-// anything else would be theatre.
+// anything else would be theatre. accept-invitation names a route that exists
+// only with invitations.enabled; naming it without them watches a path nothing
+// serves, which costs nothing.
 var rateLimitEndpoints = []string{
 	"login", "register", "refresh", "forgot-password", "reset-password",
 	"magic-link", "sms-code", "2fa-verify", "verify-email", "resend-verification",
+	"accept-invitation",
 }
 
 // RateLimitEndpoints returns the vocabulary rateLimit.scope accepts.

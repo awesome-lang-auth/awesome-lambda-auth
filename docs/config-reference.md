@@ -1529,6 +1529,7 @@ validates the vocabulary; `cmd/auth/ratelimit.go` holds the table below, and
 | `reset-password` | `POST <prefix>/reset-password` | the client address |
 | `verify-email` | `GET <prefix>/verify-email` | the client address |
 | `resend-verification` | `POST <prefix>/send-verification-email` | the client address |
+| `accept-invitation` | `POST <prefix>/invitations/accept`, mounted only with `invitations.enabled` (§21) | the client address |
 
 The subject column is what each route's handler acts on, and §14.2 says how it is
 read. On every row, a body that names none of it falls back to the client
@@ -1536,10 +1537,14 @@ address.
 
 The default scope is the five flows `docs/spec/data-model.md` §1.5 row #61 names
 — the ones where a guess costs an attacker nothing and where there is no session
-to lose. The other five are nameable and deliberately off: `refresh` and
+to lose. The other six are nameable and deliberately off: `refresh` and
 `verify-email` are spent by a client holding a token it was given, and limiting
 them by default would throttle ordinary use of a working deployment to defend
-against guessing a 256-bit value.
+against guessing a 256-bit value. `accept-invitation` is the same kind of
+256-bit token, on a route that stays public under `registration.closed`. Before
+any token is known to be bad, each call costs a decode, a SHA-256 and a
+consistent read of the table, so a realm that turns invitations on names it to
+bound a flood from one address. Distributed floods belong at the edge (§14.2).
 
 **Nothing here mounts a route.** The limiter is a middleware over the whole mux
 that matches on the resolved `http.apiPrefix` plus a path suffix, so moving the
@@ -3956,3 +3961,18 @@ a back office that wants offers to lapse sweeps the listing and calls
 `DELETE <admin>/api/users/invitations/{id}` for the expired ones, which removes
 each untouched account with its invitation.
 
+
+### 21.6 Rate limiting the accept route
+
+`POST <prefix>/invitations/accept` is public, and it stays mounted under
+`registration.closed`. It is outside the default `rateLimit.scope`, like its
+sibling `/reset-password`. Name `accept-invitation` there (§14.1) to key it by
+client address. Its token has 256 bits, so the budget bounds a flood from one
+address, not a guess. A call with a bad token still costs a decode, a SHA-256
+and a consistent read of the table. The SAM template has no parameter for the scope,
+so a stack sets it in its `ConfigFile` and keeps the default names it wants
+beside the new one, for example
+`"rateLimit": {"scope": ["login", "forgot-password", "magic-link", "sms-code", "2fa-verify", "accept-invitation"]}`.
+`TestAcceptInvitationIsLimitedByClientAddress` covers this. Once an address has
+spent its budget it is answered `429`, and an invitee at another address still
+accepts.
