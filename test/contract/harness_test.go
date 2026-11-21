@@ -269,10 +269,19 @@ func (p *probeRun) LoggedIn(t *testing.T) *Client {
 		return p.user
 	}
 	cli := p.Env.NewClient()
-	login := cli.POST(t, "/login", body{"email": p.account.Email, "password": p.account.Password})
+	// signIn completes a TOTP challenge with the declared secret, so the same
+	// line serves a fresh account on an open realm and the declared account
+	// on a closed or 2FA-required one.
+	login := p.Env.signIn(t, cli, p.account)
 	if login.Status != 200 {
-		t.Fatalf("probe: cannot log the freshly registered account in: POST %s/login -> %d %s",
-			p.Env.Prefix, login.Status, login.snippet())
+		answer := login.snippet()
+		if login.Status == 403 && strings.Contains(string(login.Body), "2FA_SETUP_REQUIRED") {
+			// The body carries a live enrolment token; the code says enough.
+			answer = fmt.Sprintf("2FA_SETUP_REQUIRED\nThe realm demands a second factor at login: declare it with %s=required and an enrolled account with %s, %s and %s.",
+				TwoFactorEnv, RealmEmailEnv, RealmPasswordEnv, RealmTOTPSecretEnv)
+		}
+		t.Fatalf("probe: cannot sign the provisioned account %s in: POST %s/login -> %d %s",
+			p.account.Email, p.Env.Prefix, login.Status, answer)
 	}
 	p.user = cli
 	return cli
@@ -310,6 +319,15 @@ type Env struct {
 	// than under it. See ToolsPathEnv.
 	ToolsPath string
 	Caps      map[Capability]capability
+
+	// Realm is what the operator declared about registration and the second
+	// factor (realm_test.go). Its zero value is an open realm with an optional
+	// factor, which is every deployment this suite ran against before it.
+	Realm realm
+
+	// realmSkip carries the reason NewAccount skipped a case on a restricted
+	// realm out to the runner, which lists every skip at the end of the run.
+	realmSkip string
 }
 
 // URL builds an absolute URL for a path relative to the router mount point.
@@ -417,6 +435,7 @@ Override the router mount point with %s (default %q). See test/contract/README.m
 		BaseURL:   strings.TrimSuffix(base, "/"),
 		Prefix:    strings.TrimSuffix(prefix, "/"),
 		ToolsPath: "/" + strings.Trim(toolsPath, "/"),
+		Realm:     readRealm(t),
 	}
 	req := readRequired(t)
 	probe(t, env, req)
@@ -427,6 +446,17 @@ Override the router mount point with %s (default %q). See test/contract/README.m
 	var skipped []string
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
+			// A case NewAccount stood down on a restricted realm is a skip like
+			// any other, and goes on the list below with its reason. Deferred,
+			// because t.Skipf ends the subtest's goroutine.
+			defer func() {
+				if env.realmSkip != "" {
+					if t.Skipped() {
+						skipped = append(skipped, fmt.Sprintf("%-58s %s", c.Name, env.realmSkip))
+					}
+					env.realmSkip = ""
+				}
+			}()
 			for _, need := range c.Needs {
 				st := env.Caps[need]
 				switch {

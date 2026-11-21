@@ -60,8 +60,9 @@ func init() {
 		Probe: func(t *testing.T, p *probeRun) {
 			// A bearer login of the provisioned account, because ?token= is
 			// the credential an EventSource can carry to either origin and a
-			// cookie reaches only the base one.
-			login := p.Env.NewClient().POST(t, "/login", body{"email": p.account.Email, "password": p.account.Password}, BearerStrategy())
+			// cookie reaches only the base one. signIn completes a declared
+			// realm account's TOTP challenge (realm_test.go).
+			login := p.Env.signIn(t, p.Env.NewClient(), p.account, BearerStrategy())
 			if login.Status != 200 {
 				p.Set(CapSSE, capability{state: capBroken, why: fmt.Sprintf("cannot log in with a bearer strategy to probe the stream: %d", login.Status)})
 				p.Set(CapSSEResume, capability{state: capBroken, why: "the stream was not probed"})

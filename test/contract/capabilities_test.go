@@ -154,6 +154,9 @@ const CapRegister Capability = "register"
 func init() {
 	registerCapability(capabilityDecl{
 		Name: CapRegister,
+		// The declared closure is read off the same request (realm_test.go):
+		// a realm that says it is closed is held to a 404 here.
+		Settles: []Capability{CapRegistrationClosed},
 		// The whole of stageProvision, and the reason the stage exists: p.Anon
 		// carries this registration's cookies from here on, and p.LoggedIn is
 		// built from the account it stores.
@@ -168,9 +171,34 @@ func init() {
 			// A 500 here used to skip the entire suite and exit 0, which meant a
 			// deployment answering 500 to every request produced the same green
 			// `ok` as a healthy one.
+			//
+			// A realm declared closed is the exception the declaration exists
+			// for: its 404 is the claim under test, and the suite provisions
+			// from the account the operator declared instead of standing down.
+			// A realm declared 2FA-required still registers here — that is the
+			// register capability — but the pass runs on the declared account,
+			// because a fresh one cannot sign in with a password alone.
 			e := p.Env
 			p.account = randomAccount()
 			reg := p.Anon.POST(t, "/register", body{"email": p.account.Email, "password": p.account.Password})
+			if e.Realm.restricted() {
+				p.account = e.Realm.account
+			}
+			if e.Realm.closed {
+				switch {
+				case reg.Status == 404:
+					p.Set(CapRegister, capability{state: capAbsent, why: fmt.Sprintf("POST %s/register answered 404 — registration is closed, as declared", e.Prefix)})
+					p.Set(CapRegistrationClosed, capability{state: capOn, why: fmt.Sprintf("%s=closed, and POST %s/register answered the router's 404", RegistrationEnv, e.Prefix)})
+				case reg.Status == 200 || reg.Status == 201:
+					p.Set(CapRegister, capability{state: capOn, why: fmt.Sprintf("POST %s/register answered %d", e.Prefix, reg.Status)})
+					p.Set(CapRegistrationClosed, capability{state: capBroken, why: fmt.Sprintf(
+						"%s=closed declares a closed realm, and POST %s/register answered %d: anyone can sign up", RegistrationEnv, e.Prefix, reg.Status)})
+				default:
+					t.Fatalf("probe: POST %s/register answered %d %s on a realm declared closed, which is neither the closure (404) nor an open route", e.Prefix, reg.Status, reg.snippet())
+				}
+				return
+			}
+			p.Set(CapRegistrationClosed, capability{state: capAbsent, why: fmt.Sprintf("not declared: set %s=closed for a realm whose registration is closed", RegistrationEnv)})
 			switch {
 			case reg.Status == 200 || reg.Status == 201:
 				p.Set(CapRegister, capability{state: capOn, why: fmt.Sprintf("POST %s/register answered %d", e.Prefix, reg.Status)})
