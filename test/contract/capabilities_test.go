@@ -185,11 +185,11 @@ func init() {
 				p.account = e.Realm.account
 			}
 			if e.Realm.closed {
-				switch {
-				case reg.Status == 404:
+				switch reg.Status {
+				case 404:
 					p.Set(CapRegister, capability{state: capAbsent, why: fmt.Sprintf("POST %s/register answered 404 — registration is closed, as declared", e.Prefix)})
 					p.Set(CapRegistrationClosed, capability{state: capOn, why: fmt.Sprintf("%s=closed, and POST %s/register answered the router's 404", RegistrationEnv, e.Prefix)})
-				case reg.Status == 200 || reg.Status == 201:
+				case 200, 201:
 					p.Set(CapRegister, capability{state: capOn, why: fmt.Sprintf("POST %s/register answered %d", e.Prefix, reg.Status)})
 					p.Set(CapRegistrationClosed, capability{state: capBroken, why: fmt.Sprintf(
 						"%s=closed declares a closed realm, and POST %s/register answered %d: anyone can sign up", RegistrationEnv, e.Prefix, reg.Status)})

@@ -871,6 +871,20 @@ func TestGuardedPosturesArePricedAtColdStart(t *testing.T) {
 		}
 	})
 
+	// A closed realm: the session still reads every row, and nobody signs up.
+	t.Run("session on a closed realm", func(t *testing.T) {
+		t.Parallel()
+		out := logOf(t, toolsEnv("AWESOME_AUTH_REGISTRATION_CLOSED", "true"))
+		if strings.Contains(out, "anyone can sign up") || strings.Contains(out, "/register is mounted") {
+			t.Errorf("the closed realm's cold start says anyone can sign up:\n%s", out)
+		}
+		for _, want := range []string{"the tools routes answer any signed-in user", "registration is closed", "read every user's rows"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the closed realm's session cold start does not say %q:\n%s", want, out)
+			}
+		}
+	})
+
 	t.Run("apiKey", func(t *testing.T) {
 		t.Parallel()
 		out := logOf(t, toolsEnv("AWESOME_AUTH_TOOLS_AUTH", "apiKey", "AWESOME_AUTH_STORES_ENABLE_API_KEYS", "true"))
