@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	auth "github.com/nik2208/awesome-go-auth"
+
+	"github.com/nik2208/awesome-lambda-auth/internal/config"
 )
 
 // security.jwt.refreshTokenSecret reaches the core (auth.WithRefreshSecret).
@@ -154,4 +156,59 @@ func TestAResourceServerWithNoRefreshSecretStarts(t *testing.T) {
 		t.Fatalf("a resource server with no refresh secret refused to start: %v", err)
 	}
 	app.Close()
+}
+
+// TestAResourceServerWithAShortRefreshSecretStarts: RS-1 does not check a
+// resource server's refresh secret, because no route there verifies a refresh
+// token (config.VerifiesRefreshTokens), so coreOptions does not hand it to the
+// core either — auth.WithRefreshSecret refuses one under 32 characters, and a
+// resource server configured with one started before the secret was wired and
+// must go on starting. The cold start reports the knob as unread instead. The
+// same short secret off resource-server mode is RS-1's refusal, the control.
+func TestAResourceServerWithAShortRefreshSecretStarts(t *testing.T) {
+	t.Parallel()
+	key := newIDPKey(t)
+	server := jwksServer(t, []idpKey{key}, 0)
+	for name, refresh := range map[string]string{
+		"short":                      "too-short",
+		"equal to the access secret": testAccessSecret,
+		"one RS-1 would accept":      testRefreshSecret,
+	} {
+		env := map[string]string{
+			"AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT": "development",
+			"AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL":  "https://auth.example.test",
+			"AWESOME_AUTH_JWT_ACCESS_SECRET":      testAccessSecret,
+			"AWESOME_AUTH_JWT_REFRESH_SECRET":     refresh,
+			"AWESOME_AUTH_RS_ENABLED":             "true",
+			"AWESOME_AUTH_RS_JWKS_URL":            server.URL,
+		}
+		app, err := New(context.Background(), Options{
+			Getenv:     envFunc(env),
+			Logger:     discardLogger(),
+			Stores:     memoryStores,
+			HTTPClient: server.Client(),
+		})
+		if err != nil {
+			t.Errorf("a resource server with a %s refresh secret refused to start: %v", name, err)
+			continue
+		}
+		app.Close()
+		var reported bool
+		for _, gap := range unwiredKnobs(loadTestConfig(t, env)) {
+			reported = reported || gap.Path == "security.jwt.refreshTokenSecret"
+		}
+		if !reported {
+			t.Errorf("a resource server's %s refresh secret is not reported as unread at cold start", name)
+		}
+	}
+
+	_, err := config.Load(context.Background(), config.Options{Getenv: envFunc(with(baseEnv(), "AWESOME_AUTH_JWT_REFRESH_SECRET", "too-short"))})
+	if err == nil || !strings.Contains(err.Error(), config.RuleSecrets) {
+		t.Errorf("a short refresh secret off resource-server mode loaded (%v); RS-1 must refuse it", err)
+	}
+	for _, gap := range unwiredKnobs(loadTestConfig(t, baseEnv())) {
+		if gap.Path == "security.jwt.refreshTokenSecret" {
+			t.Errorf("the refresh secret is reported unread on a deployment that verifies refresh tokens: %s", gap.Problem)
+		}
+	}
 }

@@ -114,20 +114,23 @@ func TestRealmKnobsLoadFromEitherSource(t *testing.T) {
 // POST <prefix>/register closes one of two self-registration doors; the OAuth
 // callback is the other, open by default (oauth.provisioning.autoCreate), and a
 // closed realm that leaves it open to every account at the provider is
-// refused. Each other row takes one of the rule's conditions away.
+// refused — and so is one narrowed by domain on an address the provider has
+// not verified. Each other row takes one of the rule's conditions away.
 func TestClosedRegistrationBesideOAuth(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(Document)
 		env    map[string]string
-		// refused is RS-19 on oauth.provisioning.autoCreate; warned is the
-		// narrowed-realm warning on oauth.provisioning.allowedEmailDomains.
-		refused, warned bool
+		// refusedOn is the path RS-19 reports, empty when the document loads;
+		// warned is the narrowed-realm warning on
+		// oauth.provisioning.allowedEmailDomains.
+		refusedOn string
+		warned    bool
 	}{
 		{
-			name:    "closed, a provider, autoCreate by default and no domain list",
-			mutate:  func(doc Document) { set(doc, "registration.closed", true); googleProvider(doc) },
-			refused: true,
+			name:      "closed, a provider, autoCreate by default and no domain list",
+			mutate:    func(doc Document) { set(doc, "registration.closed", true); googleProvider(doc) },
+			refusedOn: "oauth.provisioning.autoCreate",
 		},
 		{
 			name: "the same with autoCreate written true",
@@ -136,7 +139,7 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 				googleProvider(doc)
 				set(doc, "oauth.provisioning.autoCreate", true)
 			},
-			refused: true,
+			refusedOn: "oauth.provisioning.autoCreate",
 		},
 		{
 			name:   "the same, closed through the variable",
@@ -146,7 +149,28 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 				env["AWESOME_AUTH_REGISTRATION_CLOSED"] = "true"
 				return env
 			}(),
-			refused: true,
+			refusedOn: "oauth.provisioning.autoCreate",
+		},
+		{
+			// requireVerifiedEmail defaults to off, so the domain is matched on
+			// whatever address the provider asserts, verified or not.
+			name: "closed and narrowed to the company's domain, verification not required",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+				set(doc, "oauth.provisioning.allowedEmailDomains", []any{"example.com"})
+			},
+			refusedOn: "oauth.provisioning.requireVerifiedEmail",
+		},
+		{
+			name: "the same with requireVerifiedEmail written false",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+				set(doc, "oauth.provisioning.allowedEmailDomains", []any{"example.com"})
+				set(doc, "oauth.provisioning.requireVerifiedEmail", false)
+			},
+			refusedOn: "oauth.provisioning.requireVerifiedEmail",
 		},
 		{
 			name: "closed with autoCreate off: the callback creates nobody",
@@ -166,13 +190,39 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 			}(),
 		},
 		{
-			name: "closed and narrowed to the company's domain: loads, and says so",
+			name: "closed, narrowed to the company's domain and to verified addresses: loads, and says so",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+				set(doc, "oauth.provisioning.allowedEmailDomains", []any{"example.com"})
+				set(doc, "oauth.provisioning.requireVerifiedEmail", true)
+			},
+			warned: true,
+		},
+		{
+			name: "the same with verification required through its variable",
 			mutate: func(doc Document) {
 				set(doc, "registration.closed", true)
 				googleProvider(doc)
 				set(doc, "oauth.provisioning.allowedEmailDomains", []any{"example.com"})
 			},
+			env: func() map[string]string {
+				env := googleEnv()
+				env["AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL"] = "true"
+				return env
+			}(),
 			warned: true,
+		},
+		{
+			// Verification alone narrows nothing: every verified address at
+			// the provider still signs up.
+			name: "closed with verification required and no domain list",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+				set(doc, "oauth.provisioning.requireVerifiedEmail", true)
+			},
+			refusedOn: "oauth.provisioning.autoCreate",
 		},
 		{
 			// autoCreate defaults to true with no provider at all, so a rule on
@@ -194,12 +244,21 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 				env = googleEnv()
 			}
 			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
-			if tc.refused {
-				d := requireRule(t, err, RuleClosedRegistrationOAuth, "oauth.provisioning.autoCreate")
-				for _, want := range []string{"google", "registration.closed", "autoCreate: false", "allowedEmailDomains"} {
+			if tc.refusedOn != "" {
+				d := requireRule(t, err, RuleClosedRegistrationOAuth, tc.refusedOn)
+				wants := []string{"google", "registration.closed", "autoCreate: false", "allowedEmailDomains"}
+				if tc.refusedOn == "oauth.provisioning.requireVerifiedEmail" {
+					// The narrowed shape: name the domain it lets in, and the
+					// knob that is missing.
+					wants = []string{"google", "registration.closed", "example.com", "requireVerifiedEmail: true", "unverified"}
+				}
+				for _, want := range wants {
 					if !strings.Contains(d.Error(), want) {
 						t.Errorf("the RS-19 diagnostic does not mention %q:\n%s", want, d.Error())
 					}
+				}
+				if n := len(validationError(t, err).Diagnostics); n != 1 {
+					t.Errorf("RS-19 reported %d diagnostics, want exactly one shape: %v", n, err)
 				}
 				return
 			}
@@ -224,9 +283,13 @@ func TestClosedRegistrationBesideOAuth(t *testing.T) {
 
 // TestTwoFactorPolicyWarnings: the loader says, where the deployment tooling
 // reads it, what each 2FA knob does where it meets a surface that does not
-// follow it — forced enrolment is trust on first use, and the OAuth callback
-// and the console's own login do not ask for the factor twoFactor.required
-// demands at POST <prefix>/login. None of them is refused.
+// follow it — forced enrolment is trust on first use, and the identity
+// provider's password-only /authorize refuses everyone under the policy.
+// Neither is refused. The surfaces the policy must not miss are no longer
+// warnings: the OAuth callback and the console credentials are refused
+// (RS-20, TestTwoFactorRequiredRefusesOneFactorSignIns) and the passwordless
+// logins and the console's login are held to the policy at request time
+// (cmd/auth secondFactorGate), so they warn about nothing.
 func TestTwoFactorPolicyWarnings(t *testing.T) {
 	warningsFor := func(t *testing.T, mutate func(Document), env map[string]string) []Diagnostic {
 		t.Helper()
@@ -267,41 +330,49 @@ func TestTwoFactorPolicyWarnings(t *testing.T) {
 			t.Fatalf("enrolOnLogin alone must load and say it applies to flagged accounts: %v", ws)
 		}
 	})
-	t.Run("required beside an OAuth provider", func(t *testing.T) {
+	t.Run("required beside the identity provider", func(t *testing.T) {
 		ws := warningsFor(t, func(doc Document) {
+			set(doc, "deployment.environment", "development")
 			set(doc, "twoFactor.required", true)
-			googleProvider(doc)
-		}, googleEnv())
-		if find(ws, "twoFactor.required", "oauth-callback-skips-the-second-factor") == nil {
-			t.Fatalf("no warning that the OAuth callback skips the factor: %v", ws)
+			set(doc, "idProvider.enabled", true)
+		}, baseEnv())
+		w := find(ws, "twoFactor.required", "POST <prefix>/authorize")
+		if w == nil {
+			t.Fatalf("no warning that the identity provider's /authorize refuses everyone under the policy: %v", ws)
+		}
+		if !strings.Contains(w.Problem, "invalid credentials") || !strings.Contains(w.Remedy, "idProvider") {
+			t.Errorf("the warning does not say what a user sees or what to change: %s", w.Error())
 		}
 	})
-	t.Run("required beside the admin console", func(t *testing.T) {
+	t.Run("the identity provider without the policy warns about nothing", func(t *testing.T) {
+		ws := warningsFor(t, func(doc Document) {
+			set(doc, "deployment.environment", "development")
+			set(doc, "idProvider.enabled", true)
+		}, baseEnv())
+		for _, w := range ws {
+			if strings.HasPrefix(w.Path, "twoFactor.") {
+				t.Errorf("an identity provider without twoFactor.required warned: %s", w.Error())
+			}
+		}
+	})
+	// The surfaces the request-time gate holds to the policy load without a
+	// word: the console (with its machine principal, the org realm's shape),
+	// a mail transport and an SMS one. Their cold-start line says what the
+	// gate refuses; a configuration warning would say something is wrong.
+	t.Run("required beside the console and both transports warns about nothing", func(t *testing.T) {
 		ws := warningsFor(t, func(doc Document) {
 			set(doc, "twoFactor.required", true)
 			set(doc, "admin.enabled", true)
 			set(doc, "admin.accessPolicy", "is-admin-flag")
-		}, baseEnv())
-		w := find(ws, "twoFactor.required", "admin-login-skips-the-second-factor")
-		if w == nil {
-			t.Fatalf("no warning that the console's login skips the factor: %v", ws)
-		}
-		if !strings.Contains(w.Remedy, "admin.loginPath") {
-			t.Errorf("the remedy does not name admin.loginPath: %s", w.Error())
-		}
-	})
-	t.Run("required beside a mail or SMS transport", func(t *testing.T) {
-		ws := warningsFor(t, func(doc Document) {
-			set(doc, "twoFactor.required", true)
+			set(doc, "admin.machineAccess.iam.principals", []any{"arn:aws:iam::123456789012:role/plat-identity"})
 			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
 			set(doc, "email.mailer.from", "no-reply@example.com")
+			set(doc, "sms.endpoint", "https://sms.example.com/send")
 		}, baseEnv())
-		w := find(ws, "twoFactor.required", "magic-link/verify")
-		if w == nil {
-			t.Fatalf("no warning that the magic-link login skips the factor: %v", ws)
-		}
-		if strings.Contains(w.Problem, "sms/verify") {
-			t.Errorf("the warning names the SMS login with no SMS transport: %s", w.Error())
+		for _, w := range ws {
+			if strings.HasPrefix(w.Path, "twoFactor.") {
+				t.Errorf("a surface the gate holds to the policy warned: %s", w.Error())
+			}
 		}
 	})
 	t.Run("required alone warns about nothing", func(t *testing.T) {
@@ -311,5 +382,134 @@ func TestTwoFactorPolicyWarnings(t *testing.T) {
 				t.Errorf("twoFactor.required alone warned: %s", w.Error())
 			}
 		}
+	})
+}
+
+// TestTwoFactorRequiredRefusesOneFactorSignIns is RS-20. Under
+// twoFactor.required a configuration is refused when it keeps a sign-in the
+// policy cannot reach: an OAuth provider (the core's callback opens a session
+// with no second-factor step), and the console's root user and bootstrap
+// secret, whose one door — POST <admin>/login — the product does not serve
+// under the policy. Every shape is refused in development too, and every one
+// loads with the policy off, which is the control that the rule is the
+// policy's and not the knob's.
+func TestTwoFactorRequiredRefusesOneFactorSignIns(t *testing.T) {
+	console := func(doc Document) {
+		set(doc, "admin.enabled", true)
+		set(doc, "admin.accessPolicy", "is-admin-flag")
+	}
+	const rootHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5BWX4Z6aZ5S0Ls0cK1R3G7rU/0Tsy"
+	cases := []struct {
+		name    string
+		mutate  func(Document)
+		env     func(map[string]string)
+		path    string
+		mention []string
+	}{
+		{
+			name:    "an OAuth provider",
+			mutate:  googleProvider,
+			env:     func(env map[string]string) { env["AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET"] = "google-client-secret" },
+			path:    "oauth.providers",
+			mention: []string{"google", "no second factor", "remove oauth.providers"},
+		},
+		{
+			name: "an OAuth provider with autoCreate off still signs existing accounts in",
+			mutate: func(doc Document) {
+				googleProvider(doc)
+				set(doc, "oauth.provisioning.autoCreate", false)
+			},
+			env:     func(env map[string]string) { env["AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET"] = "google-client-secret" },
+			path:    "oauth.providers",
+			mention: []string{"google"},
+		},
+		{
+			name:    "the console's root user",
+			mutate:  func(doc Document) { console(doc); set(doc, "admin.rootUser.email", "root@example.com") },
+			env:     func(env map[string]string) { env["AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH"] = rootHash },
+			path:    "admin.rootUser.email",
+			mention: []string{"POST <admin>/login", "could never sign in"},
+		},
+		{
+			name:    "the bootstrap secret beside a policy",
+			mutate:  console,
+			env:     func(env map[string]string) { env["AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET"] = strings.Repeat("s", 40) },
+			path:    "admin.bootstrapSecret",
+			mention: []string{"shared password", "POST <admin>/login"},
+		},
+		{
+			name:    "the bootstrap secret as the console's whole guard",
+			mutate:  func(doc Document) { set(doc, "admin.enabled", true) },
+			env:     func(env map[string]string) { env["AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET"] = strings.Repeat("s", 40) },
+			path:    "admin.bootstrapSecret",
+			mention: []string{"whole guard"},
+		},
+		{
+			name: "the bootstrap secret by store reference",
+			mutate: func(doc Document) {
+				console(doc)
+				set(doc, "admin.bootstrapSecret", map[string]any{"secretsManager": "awesome-auth/admin-bootstrap"})
+			},
+			path: "admin.bootstrapSecret",
+		},
+	}
+	for _, env := range []string{"development", "production"} {
+		for _, tc := range cases {
+			t.Run(env+"/"+tc.name, func(t *testing.T) {
+				for _, required := range []bool{true, false} {
+					doc := baseDoc()
+					set(doc, "deployment.environment", env)
+					tc.mutate(doc)
+					set(doc, "twoFactor.required", required)
+					vars := baseEnv()
+					if tc.env != nil {
+						tc.env(vars)
+					}
+					_, err := Load(t.Context(), Options{
+						Document: doc, Getenv: getenvFrom(vars), AllowUnimplemented: true,
+						Secrets: Resolvers{SecretsManager: fakeResolver{ResolverSecretsManager, map[string]string{"awesome-auth/admin-bootstrap": strings.Repeat("s", 40)}}},
+					})
+					if !required {
+						requireNoRule(t, err, RuleTwoFactorRequiredSignIn)
+						continue
+					}
+					d := requireRule(t, err, RuleTwoFactorRequiredSignIn, tc.path)
+					for _, want := range append([]string{"twoFactor.required"}, tc.mention...) {
+						if !strings.Contains(d.Error(), want) {
+							t.Errorf("the RS-20 diagnostic does not mention %q:\n%s", want, d.Error())
+						}
+					}
+				}
+			})
+		}
+	}
+
+	// What stays: the org realm's shape — the policy, a console under a
+	// session policy with no root user, and a machine principal — and the
+	// passwordless transports, which the request-time gate holds to the
+	// policy. A root user and a provider with no console or policy around
+	// them are not this rule's business either.
+	t.Run("the console without its two credentials, a machine principal and both transports load", func(t *testing.T) {
+		doc := baseDoc()
+		console(doc)
+		set(doc, "twoFactor.required", true)
+		set(doc, "admin.machineAccess.iam.principals", []any{"arn:aws:iam::123456789012:role/plat-identity"})
+		set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+		set(doc, "email.mailer.from", "no-reply@example.com")
+		set(doc, "sms.endpoint", "https://sms.example.com/send")
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv()), AllowUnimplemented: true})
+		requireNoRule(t, err, RuleTwoFactorRequiredSignIn)
+		if err != nil {
+			t.Fatalf("the org realm's shape must load:\n%v", err)
+		}
+	})
+	t.Run("a root user with the console off is not this rule's", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "twoFactor.required", true)
+		set(doc, "admin.rootUser.email", "root@example.com")
+		vars := baseEnv()
+		vars["AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH"] = rootHash
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(vars), AllowUnimplemented: true})
+		requireNoRule(t, err, RuleTwoFactorRequiredSignIn)
 	})
 }

@@ -92,6 +92,20 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage: "second sign-up form",
 		},
 		{
+			// RS-20: twoFactor.required beside a sign-in the core completes
+			// with no second factor. internal/config/realm_test.go walks the
+			// three shapes.
+			name: "RS-20 twoFactor.required beside an OAuth provider",
+			mutate: func(doc Document) {
+				set(doc, "twoFactor.required", true)
+				googleProvider(doc)
+			},
+			env:         googleEnv(),
+			wantRule:    RuleTwoFactorRequiredSignIn,
+			wantPath:    "oauth.providers",
+			wantMessage: "no second factor",
+		},
+		{
 			name: "RS-3 CSRF disabled in cookie mode",
 			mutate: func(doc Document) {
 				set(doc, "security.csrf.enabled", false)

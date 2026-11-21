@@ -445,6 +445,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logDocsSurface(cfg, log)
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
+	logSecondFactorSurface(cfg, log)
 	logToolsSurface(cfg, tools, log)
 	logScriptRunnerSurface(cfg, tools, log) // D9d
 	logStreamSurface(cfg, tools, stream, log)
@@ -533,6 +534,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //
 //   - The console's login limiter, matching one route (POST <admin>/login) and
 //     nothing else; identity when the console or the block is off.
+//   - The second-factor gate (secondfactor.go): under twoFactor.required it
+//     refuses the passwordless logins, /link-verify's loginAfterLinking and
+//     POST <admin>/login before any of them reaches the core; identity when
+//     the policy is off. Outside the login limiter, so a console login the
+//     policy refuses spends nothing from the shared counter, and inside
+//     everything else, so a refusal carries the CORS headers a browser needs
+//     to read it and is in the access log like any answer. It classifies a
+//     request by asking mux which pattern would serve it, which is why this
+//     function takes the mux itself.
 //   - The two header middlewares. Neither registers a pattern, so the adapter
 //     still owns every path under the api prefix — that is the only thing this
 //     binary can do about the reference's Swagger page loading an unpinned
@@ -568,11 +578,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //     ones the adapter does not own — GET /healthz today, whatever a later block
 //     mounts outside the api prefix tomorrow. See the correlation section of
 //     logging.go for why this binary never reads the header itself.
-func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adminLoginRL func(http.Handler) http.Handler) http.Handler {
-	handler := mux
+func assembleHandler(cfg *config.Config, log *slog.Logger, mux *http.ServeMux, adminLoginRL func(http.Handler) http.Handler) http.Handler {
+	var handler http.Handler = mux
 	if adminLoginRL != nil {
 		handler = adminLoginRL(handler)
 	}
+	handler = secondFactorGate(cfg, mux)(handler)
 	handler = docsSecurityHeaders(cfg)(handler)
 	handler = uploadAssetHeaders(cfg)(handler)
 	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
@@ -782,13 +793,17 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 	// token outstanding then was signed with the access secret and stops
 	// verifying (CHANGELOG, docs/config-reference.md §3.1).
 	//
-	// Passed whenever it resolved to a value, which is every deployment that
-	// mints refresh tokens: RS-1 requires it — at least 32 characters, and not
-	// the access secret — unless resourceServer.enabled, where no route mints
-	// or verifies one. It is passed only when set because WithRefreshSecret
-	// refuses an empty value rather than reading it as "fall back", and a
-	// resource server may legitimately configure none.
-	if refresh := cfg.RefreshTokenSecret(); refresh != "" {
+	// Passed exactly when RS-1 has checked it — at least 32 characters, and not
+	// the access secret — which is whenever a route verifies a refresh token:
+	// config.VerifiesRefreshTokens, the one predicate both sides read. A
+	// resource server mounts no /refresh, so RS-1 does not check its refresh
+	// secret and it is not passed either: WithRefreshSecret refuses a short
+	// one, and a resource server configured with one would otherwise have
+	// stopped starting on the release that wired the secret. unwiredKnobs
+	// reports it there instead. The value check stays for a test that builds
+	// the core without the loader: the option refuses an empty value rather
+	// than reading it as "fall back".
+	if refresh := cfg.RefreshTokenSecret(); cfg.VerifiesRefreshTokens() && refresh != "" {
 		opts = append(opts, auth.WithRefreshSecret(refresh))
 	}
 	return opts
@@ -1398,6 +1413,17 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 			Problem: fmt.Sprintf("the auth core exposes no functional option for this lifetime, so the deployed value stays %d minutes and not the configured %d",
 				row.coreValue, row.configured),
 			Remedy: "remove the override until the core exports an option for it",
+		})
+	}
+
+	// A resource server's refresh secret: neither checked by RS-1 nor handed to
+	// the core (coreOptions), because no route there verifies a refresh token.
+	if !cfg.VerifiesRefreshTokens() && cfg.RefreshTokenSecret() != "" {
+		gaps = append(gaps, knobGap{
+			Path: "security.jwt.refreshTokenSecret",
+			Problem: "resource-server mode mounts no route that verifies a refresh token (POST <prefix>/refresh is not mounted), " +
+				"so this secret is neither checked by RS-1 nor handed to the auth core",
+			Remedy: "leave it unset on a resource server; it takes effect, and RS-1 checks it, when resourceServer.enabled is off",
 		})
 	}
 

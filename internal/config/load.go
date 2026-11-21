@@ -564,21 +564,28 @@ func collectWarnings(cfg *Config) {
 }
 
 // collectRealmWarnings says what the realm knobs do where they meet a surface
-// that does not follow them. None of the three is refused: each is a posture
-// an operator can choose deliberately, and each is the kind a document can
+// that does not follow them. None of these is refused: each is a posture an
+// operator can choose deliberately, and each is the kind a document can
 // express without the operator noticing — so it is said here, where the
 // deployment tooling reads before an upload, and again in the cold-start log.
+//
+// What twoFactor.required cannot be allowed to miss is not here: the OAuth
+// callback and the two console credentials are refused (RS-20), and the
+// passwordless logins, loginAfterLinking and POST <admin>/login are held to
+// the policy at request time (cmd/auth secondFactorGate).
 func collectRealmWarnings(cfg *Config) {
 	// A closed realm whose OAuth callback still creates accounts, narrowed to
-	// named domains. RS-19 refuses the unnarrowed shape; this one is the
-	// "sign in with your company account" realm, and it is a sign-up path all
-	// the same.
+	// named domains and to addresses the provider verified. RS-19 refuses
+	// every looser shape; this one is the "sign in with your company account"
+	// realm, and it is a sign-up path all the same, exactly as strong as the
+	// provider's verification of an address at those domains.
 	p := cfg.OAuth.Provisioning
-	if cfg.Registration.Closed && len(cfg.OAuth.Providers) > 0 && p.AutoCreate && len(p.AllowedEmailDomains) > 0 {
+	if cfg.Registration.Closed && len(cfg.OAuth.Providers) > 0 && p.AutoCreate && len(p.AllowedEmailDomains) > 0 && p.RequireVerifiedEmail {
 		cfg.warn("oauth.provisioning.allowedEmailDomains",
-			fmt.Sprintf("registration.closed is on and the OAuth callback still creates an account for any identity at %s that no account holds yet, so anyone holding an address there signs up through the provider",
+			fmt.Sprintf("registration.closed is on and the OAuth callback still creates an account for any identity at %s that no account holds yet and the provider reports as verified, "+
+				"so anyone the provider will vouch for at those domains signs up through it -- the list is only as strong as the provider's own verification of an address",
 				strings.Join(p.AllowedEmailDomains, ", ")),
-			"keep it if that is the realm you mean; otherwise set oauth.provisioning.autoCreate: false so the callback signs in only accounts that already exist")
+			"keep it if that is the realm you mean, with a provider that verifies the addresses it asserts at those domains; otherwise set oauth.provisioning.autoCreate: false so the callback signs in only accounts that already exist")
 	}
 
 	if cfg.TwoFactor.EnrolOnLogin {
@@ -592,37 +599,18 @@ func collectRealmWarnings(cfg *Config) {
 			"keep it only where the first sign-in with the password is the owner's by construction, and reset the password together with the factor; enrol out of band and leave it off otherwise")
 	}
 
-	if cfg.TwoFactor.Required && len(cfg.OAuth.Providers) > 0 {
+	// The built-in identity provider's POST <prefix>/authorize signs a user in
+	// with the core's Service.Login, which has no second-factor step to offer:
+	// under the policy it answers ErrTwoFactorRequired for every account, and
+	// the endpoint reports that as invalid credentials. It fails closed — no
+	// authorization code, so no /token pair — and that is why it is a warning
+	// and not a refusal; but no relying party can sign anyone in, and the
+	// error a user sees says their password is wrong.
+	if cfg.TwoFactor.Required && cfg.IDProviderActive() {
 		cfg.warn("twoFactor.required",
-			fmt.Sprintf("a second factor is required at POST <prefix>/login, and the OAuth callback of %s issues a session without asking for one, whatever the account (product deviation oauth-callback-skips-the-second-factor)",
-				strings.Join(sortedKeys(cfg.OAuth.Providers), ", ")),
-			"rely on the provider's own second factor for those sign-ins, or remove oauth.providers from a realm whose policy is that every session proved two factors here")
-	}
-	// The two passwordless logins. In their login mode POST
-	// <prefix>/magic-link/verify and POST <prefix>/sms/verify open a session on
-	// the one factor they delivered, as the reference's do — the policy is a
-	// term of the password login and of /2fa/disable, not of these — and
-	// either is reachable whenever its transport is wired: a mailer or the
-	// delivery webhook for the link, an SMS endpoint or the webhook for the
-	// code.
-	mail := strings.TrimSpace(cfg.Email.Mailer.From) != "" || strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
-	sms := strings.TrimSpace(cfg.SMS.Endpoint) != "" || strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
-	if cfg.TwoFactor.Required && (mail || sms) {
-		var routes []string
-		if mail {
-			routes = append(routes, "POST <prefix>/magic-link/verify")
-		}
-		if sms {
-			routes = append(routes, "POST <prefix>/sms/verify")
-		}
-		cfg.warn("twoFactor.required",
-			"a second factor is required at POST <prefix>/login, and "+strings.Join(routes, " and ")+" in login mode open a session on the one factor delivered, as the reference's do",
-			"keep the transport only if an emailed link or a texted code is meant to sign in on its own; otherwise leave it unconfigured, or refuse the login mode at the front door")
-	}
-	if cfg.TwoFactor.Required && cfg.Admin.Enabled {
-		cfg.warn("twoFactor.required",
-			"a second factor is required at POST <prefix>/login, and the admin console's own POST <admin>/login mints a 24-hour admin token on the password alone (product deviation admin-login-skips-the-second-factor)",
-			"set admin.loginPath to the hosted login so browsers go through the factor, keep <admin>/login off the internet at the front door, and enter the console with a session from <prefix>/login")
+			"the identity provider's POST <prefix>/authorize signs users in with a password and has no second-factor step, so under twoFactor.required it refuses every account "+
+				"(answered as invalid credentials) and no relying party can complete an OIDC sign-in",
+			"run the identity provider on a realm without twoFactor.required, or turn idProvider off on this one")
 	}
 }
 

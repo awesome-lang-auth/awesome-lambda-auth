@@ -407,96 +407,49 @@ func TestTwoFactorOptionsCarryThePolicy(t *testing.T) {
 	}
 }
 
-// ── what twoFactor.required does not reach ───────────────────────────────────
-
-// TestOAuthCallbackSkipsTheFactorTheRealmRequires pins
-// oauth-callback-skips-the-second-factor under the policy: with
-// twoFactor.required on, the callback still signs in an identity with no factor
-// at all — the account it provisions could not log in with a password — and the
-// loader's warning is the only notice an operator gets. It fails the day the
-// core's callback grows the reference's 2FA branch.
-func TestOAuthCallbackSkipsTheFactorTheRealmRequires(t *testing.T) {
+// TestClosedRealmRefusesAnUnverifiedAddressAtAnAllowedDomain is RS-19's
+// narrowed shape, end to end. On b20ef56 a closed realm narrowed to
+// example.test signed up a stranger whose provider asserted
+// stranger@example.test with email_verified false: the core matches the domain
+// on the asserted address, and oauth.provisioning.requireVerifiedEmail is off
+// by default. That configuration no longer starts. With verification required
+// it does, the same assertion is refused and creates nobody, and a verified
+// address at the domain still signs up — the realm the two knobs are for.
+func TestClosedRealmRefusesAnUnverifiedAddressAtAnAllowedDomain(t *testing.T) {
 	t.Parallel()
 	p := newFakeOAuthProvider(t)
-	app := newOAuthApp(t, oauthDoc(p), newOAuthStores(), "AWESOME_AUTH_2FA_REQUIRED", "true")
+	p.setProfile(`{"sub":"stranger-1","email":"stranger@example.test","email_verified":false,"name":"Stranger"}`)
+	doc := oauthDoc(p)
+	provisioningDoc(doc)["allowedEmailDomains"] = []any{"example.test"}
 
-	resp := signIn(t, app, p, nil)
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("callback status = %d, want 302 (body %s)", resp.StatusCode, resp.Body)
+	_, err := New(context.Background(), Options{
+		Getenv: envFunc(oauthEnv(t, doc, "AWESOME_AUTH_REGISTRATION_CLOSED", "true")),
+		Logger: discardLogger(),
+		Stores: newOAuthStores().factory(),
+	})
+	if err == nil {
+		t.Fatal("a closed realm narrowed by domain, with requireVerifiedEmail off, started: its callback signs up any address the provider asserts there")
 	}
-	if loc := location(t, resp); strings.Contains(loc, "tempToken") {
-		t.Fatalf("the callback now diverts to the 2FA page (%q): retire oauth-callback-skips-the-second-factor and the loader's warning", loc)
+	for _, want := range []string{config.RuleClosedRegistrationOAuth, "oauth.provisioning.requireVerifiedEmail", "example.test"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
 	}
-	access := cookieValue(t, resp, auth.AccessTokenCookieName)
-	if access == "" {
-		t.Fatalf("the callback issued no session cookie: %v", resp.Cookies)
-	}
-	me := invoke(t, app, http.MethodGet, "/auth/me", bearer(access), nil, "")
-	if me.StatusCode != http.StatusOK || decodeBody(t, me)["isTotpEnabled"] == true {
-		t.Fatalf("GET /auth/me with the callback's session answered %d %s, want 200 for an account with no factor", me.StatusCode, me.Body)
-	}
-	// The same account's password route refuses it a session: the policy is
-	// on, and the callback walked around it.
-	login := invoke(t, app, http.MethodPost, "/auth/login", jsonHeaders(), nil, loginBody(testOAuthEmail, "whatever-it-was-never-set"))
-	if login.StatusCode == http.StatusOK {
-		t.Errorf("a password login of the OAuth account answered 200: %s", login.Body)
-	}
-}
 
-// TestAdminLoginSkipsTheFactorTheRealmRequires pins
-// admin-login-skips-the-second-factor under the policy: an account that
-// POST <prefix>/login refuses a session until it enrols is signed into the
-// console by POST <admin>/login on its password alone.
-func TestAdminLoginSkipsTheFactorTheRealmRequires(t *testing.T) {
-	t.Parallel()
-	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin, "AWESOME_AUTH_2FA_REQUIRED", "true")), Options{}, nil)
-	const email = "policy@example.test"
-	if reg := s.call(t, http.MethodPost, "/auth/register", map[string]string{"email": email, "password": testPassword}); reg.Code != http.StatusCreated {
-		t.Fatalf("register answered %d %s", reg.Code, reg.Body.String())
+	stores := newOAuthStores()
+	app := newOAuthApp(t, doc, stores, "AWESOME_AUTH_REGISTRATION_CLOSED", "true", "AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL", "true")
+	t.Cleanup(app.Close)
+	refused := signIn(t, app, p, nil)
+	if refused.StatusCode != http.StatusForbidden || len(sessionCookies(refused)) > 0 {
+		t.Errorf("the unverified assertion answered %d %v, want 403 and no session", refused.StatusCode, refused.Cookies)
 	}
-	login := s.call(t, http.MethodPost, "/auth/login", map[string]string{"email": email, "password": testPassword})
-	if login.Code != http.StatusForbidden || decodeJSON(t, login)["code"] != "2FA_SETUP_REQUIRED" {
-		t.Fatalf("POST /auth/login answered %d %s, want 403 2FA_SETUP_REQUIRED; the policy is not on and this test proves nothing", login.Code, login.Body.String())
+	if u, err := stores.users.GetUserByEmail(context.Background(), "stranger@example.test", ""); err == nil {
+		t.Errorf("a closed realm created %s for an address the provider did not verify", u.ID)
 	}
-	rec := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": email, "password": testPassword})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("POST /admin/login answered %d %s under twoFactor.required.\n"+
-			"If upstream's admin login now honours the policy, retire admin-login-skips-the-second-factor and the loader's warning", rec.Code, rec.Body.String())
-	}
-}
 
-// TestMagicLinkLoginSkipsTheFactorTheRealmRequires: POST
-// <prefix>/magic-link/verify in login mode opens a session on the emailed link
-// alone, under twoFactor.required too — the reference's passwordless login,
-// which the policy does not reach. With a mail transport wired the emailed link
-// is also a second factor the password login can be challenged for
-// (available2faMethods carries magic-link), so that login is the challenge
-// rather than 2FA_SETUP_REQUIRED and opens nothing; the direct link login is
-// one factor all the same. The loader warns whenever a mail transport is wired;
-// this pins that the warning describes the wire.
-func TestMagicLinkLoginSkipsTheFactorTheRealmRequires(t *testing.T) {
-	t.Parallel()
-	d := newDeliveryApp(t, mailerEnv(with(baseEnv(), "AWESOME_AUTH_2FA_REQUIRED", "true")))
-	const owner = "passwordless@example.test"
-	if reg := invoke(t, d.app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(owner)); reg.StatusCode != http.StatusCreated {
-		t.Fatalf("register answered %d %s", reg.StatusCode, reg.Body)
-	}
-	login := invoke(t, d.app, http.MethodPost, "/auth/login", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, loginBody(owner, testPassword))
-	if login.StatusCode != http.StatusOK || decodeBody(t, login)["requiresTwoFactor"] != true || decodeBody(t, login)["accessToken"] != nil {
-		t.Fatalf("the password login answered %d %s, want the challenge and no session; the policy is not on and this test proves nothing", login.StatusCode, login.Body)
-	}
-	methods, _ := decodeBody(t, login)["available2faMethods"].([]any)
-	if len(methods) != 1 || methods[0] != "magic-link" {
-		t.Errorf("available2faMethods = %v, want [magic-link]: with a mailer the emailed link is the account's second factor", methods)
-	}
-	if send := invoke(t, d.app, http.MethodPost, "/auth/magic-link/send", jsonHeaders(), nil, fmt.Sprintf(`{"email":%q}`, owner)); send.StatusCode != http.StatusOK {
-		t.Fatalf("magic-link/send answered %d %s", send.StatusCode, send.Body)
-	}
-	verify := invoke(t, d.app, http.MethodPost, "/auth/magic-link/verify",
-		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil,
-		fmt.Sprintf(`{"token":%q}`, tokenIn(t, linkIn(t, d.mail.only(t).Body))))
-	if verify.StatusCode != http.StatusOK || decodeBody(t, verify)["accessToken"] == nil {
-		t.Fatalf("magic-link/verify answered %d %s under twoFactor.required.\n"+
-			"If the core now applies the policy to the passwordless logins, retire the loader's warning", verify.StatusCode, verify.Body)
+	p.setProfile(`{"sub":"colleague-1","email":"colleague@example.test","email_verified":true,"name":"Colleague"}`)
+	admitted := signIn(t, app, p, nil)
+	if admitted.StatusCode != http.StatusFound || cookieValue(t, admitted, auth.AccessTokenCookieName) == "" {
+		t.Errorf("a verified address at the allowed domain answered %d %v, want the 302 with a session", admitted.StatusCode, admitted.Cookies)
 	}
 }

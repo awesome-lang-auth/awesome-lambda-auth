@@ -42,6 +42,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"tools-admin-login-redirect-points-into-the-admin-mount",
 		"tools-api-key-refusal-is-the-cores-bare-401",
 		"tools-stream-is-not-mounted-on-api-gateway",
+		"two-factor-required-refuses-one-factor-sign-ins",
 		"uploaded-assets-carry-a-content-security-policy",
 		// ui-uploaded-assets-are-not-served was retired by the admin surface:
 		// the upload store is the writer D7 said was missing, and the read

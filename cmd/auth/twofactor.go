@@ -82,14 +82,17 @@ import (
 // the safe default, because the option is trust on first use: whoever holds
 // the password binds the factor. The loader warns whenever it is on.
 //
-// What neither reaches, stated here because the operator who turns them on
-// will assume otherwise: the OAuth callback issues a session with no second
-// factor (oauth-callback-skips-the-second-factor), the console's own
-// POST <admin>/login is password-only (admin-login-skips-the-second-factor),
-// and the passwordless logins — magic-link and SMS in login mode — open a
-// session on the one factor they delivered, as the reference's do. The loader
-// warns on each combination; realm_test.go pins that all three still hold
-// with twoFactor.required on.
+// What the core's policy does not reach, and what the product does about it
+// so that twoFactor.required means what an operator reads into it: the OAuth
+// callback issues a session with no second factor
+// (oauth-callback-skips-the-second-factor), and nothing in front of it can
+// make it ask, so RS-20 refuses oauth.providers beside the policy, and the
+// console's root user and bootstrap secret with it; the console's own
+// POST <admin>/login, the passwordless logins in login mode and /link-verify's
+// loginAfterLinking each open a session on one factor, and secondfactor.go
+// refuses each before the core acts (two-factor-required-refuses-one-factor-sign-ins).
+// secondfactor_test.go pins every door against a credential that opened a
+// session through it before the gate.
 
 // twoFactorOptions hands the core the TOTP issuer and the second-factor
 // policy.

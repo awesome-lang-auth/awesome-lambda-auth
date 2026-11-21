@@ -261,8 +261,11 @@ func envBindings() []envBinding {
 		envInt("AWESOME_AUTH_ADMIN_UPLOAD_MAX_FILE_SIZE_MB", "admin.upload.maxFileSizeMb", func(c *Config, v int) { c.Admin.Upload.MaxFileSizeMb = v }),
 		// admin.machineAccess.* is product-only, so the name is invented to the
 		// AWESOME_AUTH_ + upper-snaked-path convention. Comma separated, like
-		// every list here; an ARN carries no comma. A stack template sets it
-		// from a parameter, beside the internal API it creates for the route.
+		// every list here — which means a role or user whose name or path holds
+		// a comma (IAM allows one) cannot be listed through this variable or the
+		// SAM parameter that sets it, only through the configuration document.
+		// A stack template sets it from a parameter, beside the internal API it
+		// creates for the route.
 		envList("AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", "admin.machineAccess.iam.principals", func(c *Config, v []string) { c.Admin.MachineAccess.IAM.Principals = v }),
 
 		// §1.14 tools, telemetry, SSE

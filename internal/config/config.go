@@ -1299,6 +1299,22 @@ func (c *Config) RedirectOrigins() []string {
 // could drift away from the rule that refuses a keyless production deployment.
 func (c *Config) IDProviderActive() bool { return c.IDProvider.active() }
 
+// VerifiesRefreshTokens reports whether this deployment serves a route that
+// verifies a refresh token: every mode but resource-server, which does not
+// mount POST <prefix>/refresh (core auth.ResourceServerGatedRoutes).
+//
+// It is the one predicate both halves of security.jwt.refreshTokenSecret
+// read, so that they cannot disagree. RS-1 holds the secret to its rules —
+// present, at least 32 characters, not the access secret — exactly when this
+// is true, and cmd/auth hands it to the core (auth.WithRefreshSecret, which
+// refuses a short one) exactly when this is true. In resource-server mode
+// neither happens: the secret is not checked, so it is not passed either,
+// and a resource server that configured a short one starts as it always did.
+// The OAuth callback a resource server still mounts mints session pairs whose
+// refresh token then falls back to the access secret, as before the secret
+// was wired; nothing there can redeem one.
+func (c *Config) VerifiesRefreshTokens() bool { return !c.ResourceServer.Enabled }
+
 // CookieDeliveryActive reports whether the stack issues auth cookies at all.
 // Bearer versus cookie is a per-request client choice (X-Auth-Strategy), so the
 // only configuration that switches the auth-flow cookies off entirely is
