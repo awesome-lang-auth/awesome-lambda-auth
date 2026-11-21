@@ -1,9 +1,14 @@
 package sam
 
 import (
+	"context"
+	"errors"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/nik2208/awesome-lambda-auth/internal/config"
 )
 
 // The realm policy parameters and the internal admin API (config-reference
@@ -187,5 +192,144 @@ func TestAdminMachineAccessNeedsTheConsoleIsARule(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("AdminMachineAccessNeedsTheConsole lacks %q:\n%s", want, text)
 		}
+	}
+}
+
+// TestTwoFactorRequiredRefusesWhatItCannotHoldIsARule is RS-20 at changeset
+// time: with TwoFactorRequired "true", an OAuth client id is refused (the
+// callback opens a session with no second factor), and so is a root user on a
+// mounted console (its one door, POST /admin/login, is not served under the
+// policy). Not ConfigFile-aware, unlike RS-19's Rule, because nothing a
+// ConfigFile says removes what the environment sets.
+func TestTwoFactorRequiredRefusesWhatItCannotHoldIsARule(t *testing.T) {
+	t.Parallel()
+	for name, wants := range map[string][]string{
+		"TwoFactorRequiredRefusesOAuthSignIn": {
+			"RuleCondition: !Equals [!Ref TwoFactorRequired, 'true']",
+			"- !Equals [!Ref OAuthGoogleClientId, '']",
+			"- !Equals [!Ref OAuthGithubClientId, '']",
+			"RS-20",
+		},
+		"TwoFactorRequiredRefusesTheRootUser": {
+			"- !Equals [!Ref TwoFactorRequired, 'true']",
+			"- !Equals [!Ref EnableAdminConsole, 'true']",
+			"- Assert: !Equals [!Ref AdminRootEmail, '']",
+			"RS-20",
+		},
+	} {
+		text := rule(t, name)
+		if strings.Contains(text, "ConfigFile, ''") {
+			t.Errorf("%s depends on ConfigFile; the environment it guards beats the document:\n%s", name, text)
+		}
+		for _, want := range wants {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s lacks %q:\n%s", name, want, text)
+			}
+		}
+	}
+}
+
+// TestAdminMachinePrincipalPatternIsTheLoaders runs sample values of
+// AdminMachinePrincipalArns through its AllowedPattern and through
+// config.Load, which is what the function does with the variable the
+// parameter sets. Whatever the pattern accepts the loader accepts, so a
+// changeset that passes cannot deploy a function that refuses to start —
+// taking every route down — over a typo; and every shape the loader refuses
+// that a regular expression can see is refused at changeset time. A
+// duplicate is the one the pattern cannot see, and stays the loader's.
+//
+// The pattern is compiled by Go's RE2 here and by Java's engine in
+// CloudFormation; it uses only syntax the two read alike — anchors,
+// alternation, groups, counted and starred repetition, and bracket ranges.
+func TestAdminMachinePrincipalPatternIsTheLoaders(t *testing.T) {
+	t.Parallel()
+	raw := load(t).parameters["AdminMachinePrincipalArns"].fields["AllowedPattern"]
+	if !strings.HasPrefix(raw, "'") || !strings.HasSuffix(raw, "'") || strings.Contains(raw[1:len(raw)-1], "'") {
+		t.Fatalf("AllowedPattern is not one single-quoted scalar: %s", raw)
+	}
+	pattern, err := regexp.Compile(raw[1 : len(raw)-1])
+	if err != nil {
+		t.Fatalf("AllowedPattern does not compile: %v", err)
+	}
+
+	loads := func(value string) error {
+		env := map[string]string{
+			"AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT":              "development",
+			"AWESOME_AUTH_JWT_ACCESS_SECRET":                   strings.Repeat("a", 40),
+			"AWESOME_AUTH_JWT_REFRESH_SECRET":                  strings.Repeat("b", 40),
+			"AWESOME_AUTH_ADMIN_ENABLED":                       "true",
+			"AWESOME_AUTH_ADMIN_ACCESS_POLICY":                 "is-admin-flag",
+			"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS": value,
+		}
+		_, err := config.Load(context.Background(), config.Options{
+			Getenv:             func(k string) (string, bool) { v, ok := env[k]; return v, ok },
+			AllowUnimplemented: true,
+		})
+		var ve *config.ValidationError
+		if err != nil && !errors.As(err, &ve) {
+			return err
+		}
+		if ve != nil {
+			for _, d := range ve.Diagnostics {
+				if strings.HasPrefix(d.Path, "admin.machineAccess.iam.principals") {
+					return d
+				}
+			}
+		}
+		return nil
+	}
+
+	accepted := []string{
+		"arn:aws:iam::123456789012:role/identity-service",
+		"arn:aws:iam::123456789012:role/service/identity-service",
+		"arn:aws:iam::123456789012:role/a/b/c/identity.service+1=2@x_y-z",
+		"arn:aws:iam::123456789012:user/ops/deployer",
+		"arn:aws-us-gov:iam::123456789012:role/identity-service",
+		"arn:aws:iam::123456789012:role/identity-service,arn:aws:iam::210987654321:user/deployer",
+		"arn:aws:iam::123456789012:role/odd!path$/identity-service",
+	}
+	for _, value := range accepted {
+		if !pattern.MatchString(value) {
+			t.Errorf("the pattern refuses %q, which the loader admits", value)
+		}
+		if err := loads(value); err != nil {
+			t.Errorf("the loader refuses %q, which the pattern admits: %v", value, err)
+		}
+	}
+
+	refused := []string{
+		"arn:aws:iam::123456789012:role/*",
+		"arn:aws:iam::123456789012:role/svc*/identity-service",
+		"arn:aws:iam::123456789012:role/svc/",
+		"arn:aws:iam::123456789012:role/",
+		"arn:aws:iam::123456789012:role/identity service",
+		"arn:aws:iam::123456789012:role/identity#service",
+		"arn:aws:sts::123456789012:assumed-role/identity-service/session-1",
+		"arn:aws:iam::123456789012:root",
+		"arn:aws:iam::12345678901:role/identity-service",
+		"arn:aws:iam::123456789012:group/admins",
+		"arn:aws:iam::123456789012:role/identity-service,",
+		"arn:aws:iam::123456789012:role/identity-service, arn:aws:iam::123456789012:user/deployer",
+	}
+	for _, value := range refused {
+		if pattern.MatchString(value) {
+			t.Errorf("the pattern admits %q", value)
+		}
+	}
+	// The values above that the loader can be handed as written refuse there
+	// too, so the pattern is not stricter than the function about any of them.
+	for _, value := range refused[:10] {
+		if loads(value) == nil {
+			t.Errorf("the loader admits %q; the pattern refusing it would block a deployable value", value)
+		}
+	}
+
+	// The one shape left to the loader.
+	dup := "arn:aws:iam::123456789012:role/identity-service,arn:aws:iam::123456789012:role/path/identity-service"
+	if !pattern.MatchString(dup) {
+		t.Errorf("the pattern refuses %q, a well-formed list", dup)
+	}
+	if loads(dup) == nil {
+		t.Errorf("the loader admits a principal named twice: %q", dup)
 	}
 }

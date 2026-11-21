@@ -451,6 +451,63 @@ func init() {
 		},
 
 		Case{
+			Name: "2fa-required/one-factor-sign-ins-are-refused",
+			Doc: "product deviation two-factor-required-refuses-one-factor-sign-ins (twoFactor.required here) — under the policy the " +
+				"login mode of POST /magic-link/send, /magic-link/verify, /sms/send and /sms/verify, and POST /link-verify with " +
+				"loginAfterLinking, answer 403 {\"error\":\"Two-factor authentication required\",\"code\":\"2FA_REQUIRED\"} before " +
+				"anything is minted, sent or consumed, whatever transports and stores the deployment has; the step-up mode " +
+				"(mode \"2fa\") reaches the route, which judges its tempToken. The reference has no such policy: there the link " +
+				"or the code alone opens a session",
+			Needs: []Capability{Cap2FARequired},
+			Run: func(t *testing.T, e *Env) {
+				stranger := randomAccount()
+				for _, probe := range []struct {
+					path string
+					b    body
+				}{
+					{"/magic-link/send", body{"email": stranger.Email}},
+					{"/magic-link/verify", body{"token": "0123456789abcdef0123456789abcdef"}},
+					{"/sms/send", body{"email": stranger.Email}},
+					{"/sms/verify", body{"userId": "usr_contract", "code": "000000"}},
+					{"/link-verify", body{"token": "0123456789abcdef0123456789abcdef", "loginAfterLinking": true}},
+				} {
+					for _, mode := range []struct {
+						name string
+						opts []reqOpt
+					}{{"cookie", []reqOpt{CSRF()}}, {"bearer", []reqOpt{BearerStrategy()}}} {
+						r := e.NewClient().POST(t, probe.path, probe.b, mode.opts...)
+						r.mustError(t, 403, "2FA_REQUIRED", "Two-factor authentication required")
+						for _, credential := range []string{cookieAccess, cookieRefresh} {
+							if c := r.cookie(credential); c != nil {
+								t.Errorf("%s mode: the refusal set %s\n  %s", mode.name, c.Name, r.where())
+							}
+						}
+					}
+				}
+				// The step-up mode is the second factor itself and reaches the
+				// route, which refuses a tempToken that is not one with its own
+				// 401 — not the policy's 403.
+				e.NewClient().POST(t, "/magic-link/verify",
+					body{"token": "0123456789abcdef0123456789abcdef", "mode": "2fa", "tempToken": "not.a.token"}, BearerStrategy()).
+					mustError(t, 401, "INVALID_TEMP_TOKEN", "")
+			},
+		},
+
+		Case{
+			Name: "2fa-required/console-login-is-not-served",
+			Doc: "product deviation two-factor-required-refuses-one-factor-sign-ins — under the policy POST <admin>/login, which " +
+				"mints a 24-hour console token on a password alone (admin.router.ts:543-616), is not served: the router's 404, " +
+				"and nothing set. The console admits a session from POST /login and its factor instead",
+			Needs: []Capability{Cap2FARequired, CapAdminSession},
+			Run: func(t *testing.T, e *Env) {
+				acct := randomAccount()
+				r := e.NewClient().POST(t, adminPath()+"/login", body{"email": acct.Email, "password": acct.Password})
+				r.mustStatus(t, 404)
+				r.mustNoCookies(t)
+			},
+		},
+
+		Case{
 			Name: "2fa-required/disable-is-refused",
 			Doc: "auth.router.ts:890-895, core config-require2fa-is-a-system-policy-term — under the policy POST /2fa/disable is " +
 				"403 {\"error\":\"Cannot disable 2FA: required by system policy\",\"code\":\"2FA_REQUIRED\"}. Driven on a fresh " +

@@ -393,20 +393,27 @@ Parameters:
       OAuth client id set and no ConfigFile the Rule
       ClosedRegistrationRefusesOAuthSignUp refuses the stack, and with a
       ConfigFile the function refuses to start (RS-19) unless
-      oauth.provisioning.autoCreate is false or allowedEmailDomains narrows it.
+      oauth.provisioning.autoCreate is false, or allowedEmailDomains narrows it
+      AND requireVerifiedEmail is true (the domain is matched on the address
+      the provider asserts, so without verification it narrows nothing).
 
   TwoFactorRequired:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      AWESOME_AUTH_2FA_REQUIRED. "true" demands a second factor at every
-      password login: an account with a factor gets the challenge, an account
-      with none answers 403 2FA_SETUP_REQUIRED and gets no session, and POST
-      /2fa/disable is refused. Not the same as runtimeSettings.require2fa,
-      which only blocks /2fa/disable. The OAuth callback, the admin console's
-      own POST /admin/login and the magic-link and SMS logins still issue
-      sessions without a second factor (the function warns at start).
+      AWESOME_AUTH_2FA_REQUIRED. "true" demands a second factor of every
+      session: a password login with a factor gets the challenge, one with
+      none answers 403 2FA_SETUP_REQUIRED and gets no session, and POST
+      /2fa/disable is refused. The magic-link and SMS logins answer 403
+      2FA_REQUIRED unless used as the second step (mode "2fa"), /link-verify
+      refuses loginAfterLinking, and POST /admin/login answers 404 — the
+      console admits a two-factor session from the auth login, and machine
+      access. An OAuth client id (Rule TwoFactorRequiredRefusesOAuthSignIn) or
+      AdminRootEmail (Rule TwoFactorRequiredRefusesTheRootUser) beside it is
+      refused, because neither sign-in can be made to ask for the factor
+      (RS-20). Not the same as runtimeSettings.require2fa, which only blocks
+      /2fa/disable.
 
   TwoFactorEnrolOnLogin:
     Type: String
@@ -798,8 +805,9 @@ Parameters:
       passes — no scope is required — and a refusal is the core's bare
       text/plain 401. "session" is the adapter's own session middleware, and
       its price has to be read before it is chosen: POST <ApiPrefix>/register
-      is always mounted, so any self-registered user holds a session, and a
-      session reads the STORE-WIDE telemetry (every identity.* event the
+      is mounted unless ClosedRegistration is "true", so on an open realm any
+      self-registered user holds a session, and a session reads the
+      STORE-WIDE telemetry (every identity.* event the
       bridge records, emails, IP addresses, user agents and session ids
       included), attributes tracked events to any userId in the body and so
       fires signed outgoing webhooks, and notifies any topic; with EnableSse it
@@ -1412,8 +1420,11 @@ Parameters:
       the user table, bypasses the access policy, and is how the first
       administrator gets in under is-admin-flag. Requires
       AdminRootPasswordHashArn; the function refuses to start with one and not
-      the other. Empty — the default — configures no root user. Placeholder
-      is deliberately empty; never commit an address.
+      the other. Refused beside TwoFactorRequired "true" (Rule
+      TwoFactorRequiredRefusesTheRootUser): the root user signs in at POST
+      /admin/login on a password alone, which that policy does not serve.
+      Empty — the default — configures no root user. Placeholder is
+      deliberately empty; never commit an address.
 
   AdminRootPasswordHashArn:
     Type: String
@@ -1462,13 +1473,33 @@ Parameters:
   # The caller also needs execute-api:Invoke on the AdminMachineApiInvokeArn
   # output, granted by ITS OWN IAM policy (an HTTP API has no resource
   # policy), and with OriginVerifySecretArn set it sends the origin header too.
+  #
+  # The trust boundary is lambda:InvokeFunction on AuthFunction, not only
+  # this API: whoever may invoke the function directly can hand it an event
+  # carrying any requestContext.authorizer.iam, a listed ARN included, and get
+  # the console's whole power. This template grants that permission to API
+  # Gateway alone, scoped by source ARN; keep it so in the account (an SCP or
+  # a permissions boundary that denies lambda:InvokeFunction on the function
+  # to everyone else), and list only roles whose trust policy names the one
+  # calling service (config-reference.md §16.9).
+  #
+  # AllowedPattern is the loader's grammar (internal/config iamPrincipalARN)
+  # less the two characters a comma-separated list cannot carry: a role or
+  # user ARN, an optional path of visible ASCII without "," or "*", and a name
+  # in IAM's own set without ",". So a wildcard, a trailing slash, a session
+  # ARN or a stray character is refused at changeset time and not at cold
+  # start, where it would take every route down. A duplicate is refused only
+  # by the function (a regular expression cannot see one), and a role or user
+  # whose name or path holds a comma can be listed only through ConfigFile.
   AdminMachinePrincipalArns:
     Type: String
     Default: ''
-    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[^,\s]+(,arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[^,\s]+)*$'
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/([!-)+.-~-]*/)?[A-Za-z0-9+=.@_-]+(,arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/([!-)+.-~-]*/)?[A-Za-z0-9+=.@_-]+)*$'
     ConstraintDescription: >-
       AdminMachinePrincipalArns must be a comma-separated list of IAM role or
-      user ARNs (arn:<partition>:iam::<account>:role/<name>), with no spaces.
+      user ARNs (arn:<partition>:iam::<account>:role/[<path>/]<name>), with no
+      spaces, no wildcard and no trailing slash; a name may use letters,
+      digits and + = . @ _ -.
     Description: >-
       AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS — IAM role or user
       ARNs, comma separated, admitted to the admin API through the internal
@@ -2118,8 +2149,44 @@ Rules:
           provider's callback would still create an account for anyone who signs
           in with it (oauth.provisioning.autoCreate defaults to on) and the
           function would refuse to start (RS-19). Remove the client id, or supply
-          a ConfigFile that sets oauth.provisioning.autoCreate to false or narrows
-          it with oauth.provisioning.allowedEmailDomains.
+          a ConfigFile that sets oauth.provisioning.autoCreate to false, or
+          narrows it with oauth.provisioning.allowedEmailDomains together with
+          oauth.provisioning.requireVerifiedEmail true.
+
+  # RS-20 at changeset time, its two halves the parameters can see. The OAuth
+  # callback completes with a session and no second-factor step, and nothing
+  # in front of it can make it ask; the root user signs in at POST
+  # /admin/login, which the function does not serve under the policy. Not
+  # document-aware, unlike the Rule above: the environment beats ConfigFile,
+  # so nothing a ConfigFile says removes a client id or a root email this
+  # template sets. A ConfigFile that asks for the policy while
+  # TwoFactorRequired is "false" is refused by the function instead.
+  TwoFactorRequiredRefusesOAuthSignIn:
+    RuleCondition: !Equals [!Ref TwoFactorRequired, 'true']
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref OAuthGoogleClientId, '']
+          - !Equals [!Ref OAuthGithubClientId, '']
+        AssertDescription: >-
+          TwoFactorRequired is "true" and an OAuth client id is set, but the
+          provider's callback opens a session with no second factor, whatever
+          the account, and nothing can make it ask for one, so the function
+          would refuse to start (RS-20). Remove the client id, or set
+          TwoFactorRequired to "false".
+
+  TwoFactorRequiredRefusesTheRootUser:
+    RuleCondition: !And
+      - !Equals [!Ref TwoFactorRequired, 'true']
+      - !Equals [!Ref EnableAdminConsole, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref AdminRootEmail, '']
+        AssertDescription: >-
+          TwoFactorRequired is "true" and AdminRootEmail is set, but the root
+          user signs in at POST /admin/login on a password alone, which the
+          function does not serve under the policy, so it could never sign in
+          and the function would refuse to start (RS-20). Remove AdminRootEmail
+          and AdminRootPasswordHashArn, and enter the console with a two-factor
+          session from the auth login as an account AdminAccessPolicy admits.
 
 Resources:
 

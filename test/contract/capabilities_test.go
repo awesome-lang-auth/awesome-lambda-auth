@@ -536,6 +536,16 @@ func init() {
 			case !declared:
 				p.Set(CapAdminCredential, capability{state: capAbsent, why: fmt.Sprintf(
 					"%s and %s are unset, so no administrator is declared; the suite cannot mint one", AdminEmailEnv, AdminPasswordEnv)})
+			case p.Env.Realm.twoFARequired:
+				// The credentialed cases sign in at POST <admin>/login, which a
+				// 2FA-required realm does not serve (product deviation
+				// two-factor-required-refuses-one-factor-sign-ins): there the
+				// console is entered with a session from POST /login and its
+				// factor. Absent, with the reason, so a run that requires the
+				// capability fails saying why rather than on a 404 per case.
+				p.Set(CapAdminCredential, capability{state: capAbsent, why: fmt.Sprintf(
+					"%s declares %s, but the realm is declared 2FA-required, where POST <admin>/login is not served and the credentialed console cases cannot sign in",
+					AdminEmailEnv, email)})
 			default:
 				p.Set(CapAdminCredential, capability{state: capOn, why: fmt.Sprintf("%s declares %s", AdminEmailEnv, email)})
 			}
