@@ -144,7 +144,7 @@ Four pointer-backed families share one shape, and SMS (#23-#25) is the same shap
 | 58 | Drop pending link | `Delete(state)` ← OAuth callback, `/link-verify` | DeleteItem, unconditional — idempotent no-op after #57 | main | 1 w |
 | 59 | Record telemetry | `TelemetryStore.Record` ← `POST /tools/track/:eventName` | PutItem `PK=TEL#<t>#<yyyy-mm-dd>`, `SK=<rfc3339Nano>#<eventId>`, `ttl` | main | 1 w |
 | 60 | Query telemetry | `TelemetryStore.Query` ← `GET /tools/telemetry` | Query per day in `[Since,Until]`, `SK BETWEEN`, `Limit` | main | pages |
-| 61 | Rate-limit consume | NET-NEW (gap analysis §1.4) — login, forgot-password, magic-link, sms, 2fa | UpdateItem `PK=RL#<scope>#<subject>#<window>` `ADD n :1` if `attribute_not_exists(n) OR n < :max`, `ttl` | main | 1 w |
+| 61 | Rate-limit consume | NET-NEW (gap analysis §1.4) — login, forgot-password, magic-link, sms, 2fa; and the per-account cap on failed second-factor checks (`twoFactor.lockout`, scope `2fa-account`, which also deletes the item on a successful check: `DeleteItem`, 1 w) | UpdateItem `PK=RL#<scope>#<subject>#<window>` `ADD n :1` if `attribute_not_exists(n) OR n < :max`, `ttl` | main | 1 w |
 | 72 | Find webhooks by event | `WebhookStore.FindByEvent` ← every emitted event | Query `PK=WEBHOOKS` `begins_with(SK,'WHK#')` → `WebhookConfig.Matches` in memory | main | W |
 | 73 | List webhooks | `WebhookAdminStore.ListWebhooks` ← `GET /admin/api/webhooks` | #72's Query, sliced by `limit`/`offset` | main | W |
 | 74 | Add / update / remove webhook | `AddWebhook`, `UpdateWebhook`, `RemoveWebhook` ← the admin Webhooks screens | Put if `attribute_not_exists(SK)`; read-modify-write conditional on `updatedAt`; unconditional Delete | main | 1–2 w |

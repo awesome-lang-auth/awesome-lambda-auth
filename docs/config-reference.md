@@ -77,7 +77,9 @@ Three kinds of line, all JSON, all on the deployment's log group:
   posture off: which transport each seam uses, the canonical site URL, how many
   origins are allowlisted, what the templates directory seeded, and which
   providers, provisioning policy and linking stores the OAuth block came up
-  with.
+  with. Under `twoFactor.required` the delivery line carries
+  `magicLinkAndSMSCode` — both seams withheld from the core (§7.1) — and its
+  `smsTransport` never reads as a carrier.
 
 ## 3. Secrets
 
@@ -110,6 +112,40 @@ to anyone who can describe the function.
 
 A plaintext secret written straight into the document refuses to start, with the
 knob's dotted path.
+
+### 3.1 The refresh token is signed with its own key
+
+`security.jwt.refreshTokenSecret` signs and verifies every refresh token, as the
+reference's `refreshTokenSecret` does (`token.service.ts:25-29`, `:154`), and
+`security.jwt.accessTokenSecret` signs everything else: the access token, the
+2FA step-up and enrolment tokens and the admin session. RS-1 requires both — at
+least 32 characters each, and never equal — on every deployment that verifies
+refresh tokens, which is every one but a resource server (§10): there no route
+verifies one, so the refresh secret is neither checked nor handed to the core,
+a short one does not stop the function starting, and the cold start reports it
+on the `configured knob is not wired to the auth core` line. One predicate,
+`config.VerifiesRefreshTokens`, decides both halves, so they cannot disagree.
+
+**Upgrading to the release that wired this signs every session out once.**
+Before it the imported core fell back to the access secret for refresh tokens
+(the core deviation `refresh-secret-falls-back-to-secret`) and the refresh
+secret signed nothing; the cold-start log said so on every start. Every refresh
+token outstanding when the new release starts serving was signed with the
+access secret, and is refused with `401`. Access tokens already handed out keep
+working until they expire — 15 minutes by default — and each client then signs
+in again. There is no switch to phase it in, because a core that also accepted
+the access secret for refresh tokens would keep accepting exactly the tokens
+the separation exists to refuse; and **rolling back is a second sign-out** the
+other way, since the old release cannot verify a refresh token signed with the
+refresh secret. Deploy it at a quiet hour, and say so to the people it signs
+out.
+
+What it buys afterwards: a component that holds the access secret to verify
+sessions — an authorizer in front of another API, say — can no longer mint a
+refresh token, and rotating the refresh secret alone ends every session at its
+next refresh while the access tokens in flight run to their expiry. On the SAM
+quickstart both keys are two members of one secret document;
+`infra/sam/README.md`, *Rotating*, says what rotating one of them takes.
 
 ## 4. Domains this build does not act on yet
 
@@ -168,7 +204,9 @@ they are read. What refuses an admin block now is the block's own rules, which
 the gate used to pre-empt: RS-6 for a console enabled with neither a policy nor
 a bootstrap secret, or with a bootstrap secret too short to be one; RS-17 for
 `first-user` on every driver, and RS-10 for it on a driver that cannot list
-users at all; RS-18 for a session console beside `cookies.sameSite: none`; and
+users at all; RS-18 for a session console beside `cookies.sameSite: none`;
+RS-20 for a root user, a bootstrap secret or the `open` policy beside
+`twoFactor.required`; and
 the `stores.enable.rbac` requirement behind `rbac:<role>` and
 `permission:<perm>`. Two of its knobs are reported rather than honoured (§16.8),
 which is the other mechanism and not this one.
@@ -289,6 +327,14 @@ at cold start as knobs this build cannot honour rather than quietly dropped.
 `email.mailer.defaultLang` is the default only: a request that carries an
 `emailLang` body field of `en` or `it` renders in that language instead.
 
+**Under `twoFactor.required` the mailer carries three seams, not four.** The
+magic link is not handed to the core, because the emailed link would stand in
+for the TOTP code as the second step, and the mailbox also receives the reset
+link (§7.1); `POST <prefix>/magic-link/*` answer `403 2FA_REQUIRED`. The reset,
+verification and email-change mails, and the email-changed notice, go out as
+ever. The same holds for SNS, whose one credential seam — the texted code — is
+withheld, and for the delivery webhook below. The loader says so in a warning.
+
 ### 5.3 `email.templatesDir` — shipped templates
 
 A directory of JSON files baked into the artifact, read once at cold start and
@@ -356,7 +402,8 @@ or SNS for those routes, even when the mailer and sms blocks are also
 configured. It is what a deployment whose transport is neither mail nor SMS — or
 is not reachable from a Lambda — wires, and it replaces the reference's
 in-process send-callback functions, which a configuration document cannot
-express.
+express. Under `twoFactor.required` it is handed three of the five: the magic
+link and the SMS code are not sender seams there (§7.1, §5.2).
 
 The request:
 
@@ -538,11 +585,19 @@ the reference's callback can — so point this only at a receiver you own.
   "secret": {"secretsManager": "awesome-auth/prod/claims-webhook"}}}}}
 ```
 
-## 7. `twoFactor.appName` — the TOTP issuer
+## 7. `twoFactor.*` — the TOTP issuer, and the second-factor policy
 
-| Path | Type | Default | Env var |
-|---|---|---|---|
-| `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` |
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` | `TotpIssuer` |
+| `twoFactor.required` | boolean | `false` | `AWESOME_AUTH_2FA_REQUIRED` | `TwoFactorRequired` |
+| `twoFactor.enrolOnLogin` | boolean | `false` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | `TwoFactorEnrolOnLogin` |
+| `twoFactor.lockout.maxFailures` | integer ≥ 0 (`0` is off) | `10` | `AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES` | — |
+| `twoFactor.lockout.windowSeconds` | integer > 0 | `86400` | `AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS` | — |
+
+The SAM template sets the two policy variables only when their parameter is
+`"true"`: the environment layer wins over the document, so a `"false"` written
+there would silently override a `ConfigFile` that asks for the policy.
 
 The name an authenticator app prints above the six digits. It is the issuer in
 the `otpauth://` URI `POST /2fa/setup` returns, in both places the URI carries
@@ -554,6 +609,242 @@ It is passed unconditionally, so the core's fallback to its own issuer never
 applies and a deployment that configures nothing gets the reference's own
 default. The `iss` claim is a different thing and is not this knob: it is not
 configurable in this build, and it becomes one with the identity-provider block.
+
+### 7.1 `twoFactor.required` — every session proves a TOTP code
+
+The core's `Config.Require2FA`, enforced at login since `awesome-go-auth`
+`v0.14.0`, with **TOTP as the only second factor**. With it on,
+`POST <prefix>/login` opens no session on a password alone:
+
+- An account with TOTP enrolled gets the reference's challenge,
+  `200 {"requiresTwoFactor":true,"tempToken":…,"available2faMethods":["totp"]}`,
+  and completes it at `POST <prefix>/2fa/verify` with a code. Nothing else is
+  offered and nothing else completes it — not the emailed link, not the texted
+  code, whatever transports are wired (see *A mailbox or a phone is not a second
+  factor*, below).
+- An account without TOTP gets the reference's
+  `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` and no
+  session — with a mail or SMS transport wired too, and with a phone number on
+  file. Its `tempToken` completes nothing unless `twoFactor.enrolOnLogin` is
+  on (§7.2); otherwise the account has to be enrolled out of band before it can
+  sign in — by whatever provisions it, writing the factor through the store —
+  because under the policy it can never get the session that `/2fa/setup` on
+  the voluntary path needs. Pick one before turning the policy on: forced
+  enrolment (trust on first use), or a provisioning tool that enrols.
+- `POST <prefix>/2fa/disable` answers
+  `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}`
+  to everyone, with or without a settings store.
+
+**It is not `runtimeSettings.require2fa`** (§11). That key is the reference's
+own: a seed for the settings store an administrator flips at run time, read by
+`POST <prefix>/2fa/disable` and by nothing else — it never makes a login ask for
+anything. `twoFactor.required` is the deployment's policy, has no reference
+counterpart (the core's `config-require2fa-is-a-system-policy-term`), and is the
+one to set for "every account signs in with two factors". Setting both is
+harmless: the disable is refused on either.
+
+**Every other way into a session is held to it too.** The core enforces the
+policy at `POST <prefix>/login` and nowhere else, so this product closes the
+rest, each door pinned by a test that presents a credential which opened a
+session there before (`cmd/auth/secondfactor_test.go`):
+
+| Door | Under `twoFactor.required` | Why this answer |
+|---|---|---|
+| `GET <prefix>/oauth/{provider}/callback` | **refused at start** (RS-20) while any `oauth.providers` entry is configured | the core completes the callback with a session and no second-factor step (`oauth-callback-skips-the-second-factor`), and nothing in front of it can make it ask |
+| `POST <prefix>/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`, in **every mode** | `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}`, before anything is minted, sent or consumed — the **login mode** and the **step-up mode** (`mode: "2fa"` with the login's `tempToken`) alike | in login mode the emailed link or texted code alone is one factor; as the step-up it would make the mailbox or the phone the second, and the mailbox also receives the reset link. The core is not handed the two senders either, so its challenge never offers them (below) |
+| `POST <prefix>/link-verify` with `loginAfterLinking` | the same `403`, before the link token is read; linking without it works as before | the core opens a session on the emailed link token alone, and `/link-request` mints one for any access token, mailed wherever its body says |
+| `POST <admin>/login` | the router's `404`, as wherever the route is not mounted | it mints a 24-hour console token on a password alone (`admin-login-skips-the-second-factor`). The console admits the access token of a session from `POST <prefix>/login` and its factor — point `admin.loginPath` at the hosted login so a browser goes there — and machine access (§16.9), which is IAM and not a sign-in |
+| `admin.rootUser`, `admin.bootstrapSecret` | **refused at start** (RS-20) while the console is mounted | their one door is `POST <admin>/login`; without an access policy the bootstrap secret is the console's whole guard, a shared password with no second factor. The first administrator is then flagged another way (§16.2) |
+| `admin.accessPolicy: open` | **refused at start** (RS-20) while the console is mounted | the open console admits every request with no credential at all — the user listing, promote, API keys and webhook secrets included — so its power needs no factor, not even one. Set `is-admin-flag`, `rbac:<role>` or `permission:<perm>` |
+| `POST <prefix>/authorize` (identity provider) | `401 invalid credentials` for every account; the loader warns | it signs in through the core's password login, which has no second-factor step there and refuses everyone under the policy: no authorization code is issued, so no OIDC sign-in can complete. Run the identity provider on a realm without the policy |
+
+The passwordless refusals, the withheld senders, the `loginAfterLinking`
+refusal and the console's `404` are the product deviation
+`two-factor-required-refuses-one-factor-sign-ins`, written at start on the
+`twoFactor.required: every session proves a TOTP code` line. Nothing else
+changes: `POST <prefix>/register` opens no session under the policy (the core
+opens one only when the login would), `POST <prefix>/reset-password` changes a
+password and opens none, and forced enrolment opens one only on the TOTP factor
+it has just bound (§7.2).
+
+**It is not retroactive.** Switching the policy on stops new one-factor
+sign-ins; it does not end the sessions already open, which go on refreshing
+until they expire or are revoked — `POST <prefix>/refresh` continues a session
+and asks nothing. Turn it on together with a sign-out of everyone: rotate the
+refresh-token secret (§3.1) in the same deploy, so every outstanding refresh
+token stops verifying and each client signs in again, through the factor, when
+its access token expires. A console token `POST <admin>/login` minted before
+the switch is signed with the access secret and the guard accepts it for its
+24 hours whatever the policy, so if anyone entered the console that way, rotate
+the access-token secret too — on the SAM quickstart both keys live in one
+secret document and rotate together (`infra/sam/README.md`, *Rotating*).
+
+**A mailbox or a phone is not a second factor.** Left to itself the core
+offers the emailed link as the second step to every challenged account
+wherever mail can be sent, and the texted code to every account with a number
+on file wherever SMS can be (`advertised-2fa-methods-require-store-support`,
+as the reference does) — and the mailbox that receives the link also receives
+the password-reset link. Whoever controlled the mailbox alone could therefore
+reset the password and answer the challenge with the emailed link: two steps,
+one factor, and a TOTP-enrolled account opened without its code. Under the
+policy neither counts:
+
+- the magic-link and SMS-code senders are **not handed to the core**, whatever
+  transport is wired — a mailer, SNS or the delivery webhook. The challenge
+  lists `totp` alone; an account without TOTP is answered `2FA_SETUP_REQUIRED`
+  (and enrols, under §7.2) instead of being challenged for a link or a code;
+  and `GET <prefix>/ui/config` reports `features.magicLink` and `features.sms`
+  false, so the hosted page offers neither;
+- the four routes **answer `403 2FA_REQUIRED` in every mode**, the step-up
+  included — which also refuses a link or a code minted before the policy was
+  switched on;
+- the transport **keeps everything else**: the password-reset,
+  email-verification and email-change mails, and the email-changed notice. A
+  reset changes the password and opens no session, so the next login still
+  asks whoever reset it for TOTP — the challenge for an enrolled account,
+  `2FA_SETUP_REQUIRED` for one without.
+
+The loader warns when the policy meets a mailer, the delivery webhook or an SMS
+transport, saying what is refused and what the transport still carries, and
+the cold start's `credential delivery wired` line carries
+`"magicLinkAndSMSCode":"withheld under twoFactor.required: …"`. A mailbox
+still reaches a session two ways. Forced enrolment (§7.2): an account that has
+not enrolled TOTP yet can have its password reset and its factor bound by
+whoever reads its mail — trust on first use, which is why that knob is off by
+default and warned about. And guessing: whoever resets the password of a
+TOTP-enrolled account gets the login's challenge and may guess at its six-digit
+code. The `rateLimit` budget of `/2fa/verify` is per challenge and every login
+mints a new one, so it is `twoFactor.lockout` (§7.3) that bounds the guesses,
+per account: by default 10 wrong codes a UTC day, about 310 a month, a chance
+of about 1 in 1 000 a month against a code the core accepts at three time
+steps. With `twoFactor.lockout.maxFailures: 0` nothing bounds them per account
+and a sweep of the code takes hours.
+
+### 7.2 `twoFactor.enrolOnLogin` — enrolling at the first login, and what that trusts
+
+The core's `Config.EnrolOnLogin` (the core deviation
+`forced-enrolment-opens-a-session`). An account that must present a second
+factor and has none — under `twoFactor.required`, or under its own `require2FA`
+flag — enrols one at login: the `tempToken` of its `2FA_SETUP_REQUIRED` answer is
+an **enrolment token**, which `POST <prefix>/2fa/setup` and
+`POST <prefix>/2fa/verify-setup` accept (in the body as `tempToken`, or as
+`Authorization: Bearer`, which is how a reference client sends it) and every
+other route refuses. `/2fa/setup` answers a secret the server derives from the
+token; `verify-setup` with that secret and a live code stores the factor and
+**opens the session** exactly as `POST <prefix>/2fa/verify` does — cookies, or
+`accessToken`/`refreshToken` under `X-Auth-Strategy: bearer`. The token is bound
+to the password that minted it, lives the temp-token TTL (five minutes), and
+dies the moment the account has a factor: a replay is
+`401 INVALID_TEMP_TOKEN` (body form) or the access refusal (bearer form).
+
+**It is trust on first use, which is why it is off by default.** Whoever holds an
+unenrolled account's password — a leaked invitation or initial password, or the
+password of an account whose factor an administrator has just reset — binds a
+factor of their choosing and gets a full session, and the owner's next login is
+a challenge they cannot answer. **With the reset mail wired** (a mailer or the
+delivery webhook) the mailbox alone is enough: `POST <prefix>/forgot-password`
+and `/reset-password` hand the password to whoever reads it, and forced
+enrolment then binds their factor — the one way a mailbox opens a session
+under `twoFactor.required` without guessing a TOTP code (§7.3), and only for
+an account that has not enrolled yet. Turn it on where the first sign-in with the password is the
+owner's by construction, and reset the password together with the factor; a
+realm that hands out initial passwords it does not control, that can reset a
+factor without resetting the password, or that cannot vouch for its users'
+mailboxes before they enrol, enrols out of band and leaves it off. The loader
+warns at every start while it is on, naming the mailbox when the reset mail is
+wired.
+
+It is not refused without `twoFactor.required`: an account whose own
+`require2FA` flag is set is held to a factor too, and enrols the same way.
+
+**The hosted UI does not walk this flow.** The core's own login page
+(`ui/auth.html` at `v0.14.0`) answers a `2FA_SETUP_REQUIRED` login with "This
+account must enrol a second factor before it can sign in" and stops, and the
+reference's pages served under `<prefix>/ui` call `/2fa/setup` with the
+browser's cookies and no enrolment token, which the route refuses. A realm that
+turns `enrolOnLogin` on needs a client of its own that sends the `tempToken`
+through `/2fa/setup` and `/2fa/verify-setup` — or enrols out of band and leaves
+it off.
+
+### 7.3 `twoFactor.lockout` — failed second-factor checks, counted per account
+
+`rateLimit` counts per subject, and the subject of `POST <prefix>/2fa/verify` is
+the challenge it carries (§14.2): it bounds the guesses at one `tempToken`.
+Every login mints a new one, so on its own it bounds nothing per account — a
+caller who can log in again and again (the password, or under
+`twoFactor.required` with the reset mail wired, the mailbox) gets a fresh budget
+each time, and a six-digit code falls in hours. This block counts the checks
+against the **account** instead, whichever challenge, login or source address
+they come through.
+
+What is counted — each request that checks a second factor for an account:
+
+- `POST <prefix>/2fa/verify` (the TOTP code);
+- `POST <prefix>/magic-link/verify` and `/sms/verify` in `mode: "2fa"`, the
+  second-step link and code (refused outright under `twoFactor.required`, §7.1);
+- `POST <prefix>/2fa/verify-setup` with an enrolment token, under
+  `twoFactor.enrolOnLogin` (§7.2). A guess there buys nothing — the token's
+  holder is handed the secret — but it is the same account checking a code.
+
+Not counted: the login branches of the magic-link and SMS routes, which check a
+first factor and are keyed by `rateLimit`; a voluntary enrolment, made with an
+access token by a signed-in user.
+
+**The account is read from a verified token.** The core's own verifiers —
+`StepUpSubject` for a step-up `tempToken`, `TOTPEnrolmentCaller` for an
+enrolment token — check the token's signature, type and lifetime before its
+subject is used, exactly as the handler does. A token that does not verify names
+no account: the handler refuses it and nothing is counted. So no one can spend
+an account's budget without a token the deployment minted for that account,
+which takes its first factor; a forged token, an unsigned one or a real one with
+another account written into it locks no one out.
+
+**The rule.** Each check is counted before it runs, with the shared counter's
+conditional increment, and a check that succeeds (`2xx`) clears the count. Once
+an account has made `maxFailures` checks in the current window without one
+succeeding, every further check for it answers the `429` of §14.3 — same body,
+`Retry-After` to the end of the window — until the window ends. Counting before
+the check is what keeps concurrent guesses from slipping under the cap: however
+many arrive at once, at most `maxFailures` are evaluated per account per window.
+A request that does not reach the code (a malformed body, a CSRF refusal) keeps
+its count too; only a holder of a valid token for the account can send one.
+
+**The default, and what it buys.** Ten failed checks per account per window of
+a day (86400 s, epoch-aligned like every window here, so it turns at 00:00 UTC):
+at most 20 in any 24 hours across the boundary and about 310 in a month. The
+core accepts a TOTP code at three time steps (`TOTPSkew` 1), so each guess wins
+with a chance of about 3 in 10⁶ and a month of guessing at the cap about 1 in
+1 000. What an exhausted budget costs the owner is a wait until the window
+ends — `Retry-After` says how long — and only a caller who is already past the
+first factor can exhaust it. A deployment that wants shorter lockouts shortens
+the window and pays for it in guesses: 10 an hour is about 7 200 a month, a
+chance of about 2%. A lock lifts by itself when the window ends, since the
+next window is a key nothing has written; to lift one early, delete the counter
+item `RL#2fa-account#<subject>#<window index>`, where the subject is the first
+16 bytes, in hex, of `sha256("awesome-lambda-auth/2fa-account/v1" NUL tenantId
+NUL userId)` and the index is the Unix time divided by `windowSeconds`. There is
+no console action for it.
+
+**Off.** `maxFailures: 0`. The cold start then warns that second-factor checks are
+bounded per challenge and per address only, and under `twoFactor.required` with
+the reset mail wired the loader's warning says the mailbox is then bounded by
+nothing per account.
+
+**Where it runs, and on which store.** In the auth router's limiter slot,
+inside `rateLimit`: a request the per-challenge or per-address budget refuses
+never reaches the cap and spends nothing there. It is its own switch, so it
+runs with `rateLimit.enabled: false` or an empty `rateLimit.scope`, and with
+either `keyBy`. On DynamoDB the counter is the rate limiter's table (one
+conditional write per check, one delete per success), shared by every execution
+environment and not routed through the rate limiter's in-process pre-filter,
+which cannot follow a count that goes down. On the memory driver it counts in
+process, per execution environment, like every limiter there. When the shared
+counter cannot be reached the check is not refused for it — the check reads the
+same table and would have failed behind it, the argument of §14.5 — but it is
+not left unbounded either: it is counted in process instead, so while the
+outage lasts the bound is `maxFailures` per account per execution environment,
+the floor `rateLimit`'s local tier keeps for it. The cold start's log says so
+once, at `WARN`.
 
 ## 8. `oauth.*`, knob by knob
 
@@ -676,7 +967,7 @@ way the family's demos do.
 |---|---|
 | `autoCreate` | May the callback create an account for a provider identity nothing here knows yet? With `false`, the answer is `403 OAUTH_USER_NOT_PROVISIONED` and accounts come from `/register`, an invitation or an admin. |
 | `onEmailMatch` | The provider account is unknown, but some account already holds the address it asserts. `link` signs that account in and records the binding; `conflict` raises the reference's `OAUTH_ACCOUNT_CONFLICT` — a 302 to `/account-conflict` where the front end drives `/link-request` and `/link-verify`, so the link is made only after an emailed token proves the address; `reject` refuses outright. **`conflict` needs `stores.enable.pendingLinks`** — see below. |
-| `requireVerifiedEmail` | Refuse a profile whose `emailVerified` is not positively true (`403 OAUTH_EMAIL_NOT_VERIFIED`). Most providers send no claim at all, so turning this on for one of them refuses every login through it. |
+| `requireVerifiedEmail` | Refuse a profile whose `emailVerified` is not positively true (`403 OAUTH_EMAIL_NOT_VERIFIED`). Most providers send no claim at all, so turning this on for one of them refuses every login through it. **Required on a closed realm narrowed by `allowedEmailDomains`** (RS-19, §20): the domain is matched on the address the provider asserts, so without this an unverified address at your domain signs up. |
 | `allowedEmailDomains` | Bare domains, matched case-insensitively on the part after the last `@`, with no subdomain matching. Empty admits every address; non-empty refuses a profile with no address at all. |
 | `fieldMap` | Fills `firstName`, `lastName`, `phoneNumber` and `role` on an account the callback **creates**, with `profileMap` expressions over the same userinfo document. A key outside that list, or a value that does not compile, refuses the cold start. |
 
@@ -733,8 +1024,10 @@ redirected to `${redirectTo}/auth/2fa?tempToken=…&methods=…` instead of bein
 handed a session (`auth.router.ts:1298-1313`). The imported core has no such
 branch — it issues a session for every account it resolves — and this product
 does not fork the core, so **a federated login skips the second factor a
-password login demands**. A deployment that requires 2FA and also configures an
-OAuth provider should know that before it turns one on.
+password login demands** of an account that enrolled one. Under
+`twoFactor.required` that would be every account, so the two do not combine:
+RS-20 refuses `oauth.providers` beside the policy (§7.1), and the SAM template
+refuses a client id beside `TwoFactorRequired` at changeset time.
 
 It is not silent. It is registered as the product deviation
 `oauth-callback-skips-the-second-factor`, so every cold start announces it
@@ -767,6 +1060,13 @@ what it serves, what it deliberately does not do, and how a key is rotated — i
 true *or* key material is present, so a document that names a key and forgets the
 flag does not come up with the IdP silently off. `kmsKeyId` counts as key
 material for the same reason `privateKey` does.
+
+**Not on a realm with `twoFactor.required`.** `POST <prefix>/authorize` signs a
+user in with the core's password login, which has no second-factor step there:
+under the policy it refuses every account — `401 invalid credentials`, the same
+answer a wrong password gets — and issues no code, so no relying party can
+complete a sign-in. It fails closed, which is why it loads; the loader warns at
+every start (§7.1). Run the identity provider on a realm without the policy.
 
 ### 9.1 The signing key: `kmsKeyId` or `privateKey`, never both
 
@@ -882,6 +1182,14 @@ it here: the auth core needs one to build, and the verifier's cookie path reads
 it. The cold start refuses by name rather than letting the core complain about a
 knob you were told to leave out.
 
+**`security.jwt.refreshTokenSecret` is not read.** No route here verifies a
+refresh token (`/refresh` is one of the nineteen), so RS-1 does not check it and
+the core is not given it — whatever its length — and the cold start reports a
+configured one as unwired. The routes a resource server still mounts that open
+a session (the OAuth callback, `/link-verify`) sign the refresh token with the
+access secret, as every release did before the secret was wired; nothing here
+can redeem it.
+
 ## 11. `runtimeSettings.*`, knob by knob
 
 The one block of this document that an administrator changes without a
@@ -941,7 +1249,9 @@ One key, on one route. `require2fa` is consulted by
 `POST <prefix>/2fa/disable`, which answers `403` `2FA_REQUIRED` when it is true —
 the reference's behaviour at `auth.router.ts:890-896`. It is a *system policy*
 term, so it refuses the disable regardless of whether that account has a second
-factor enabled.
+factor enabled. **It does not make a login ask for a second factor** — in the
+reference or here. That is `twoFactor.required` (§7.1), which also refuses the
+disable, with or without this store.
 
 The other two are stored and handed back, and nothing in this build acts on
 them. Both are named, with their paths, in the cold-start log:
@@ -1274,9 +1584,14 @@ which is the single route a limiter is most obviously for.
 Where the handler acts on a challenge — always on `/2fa/verify`, and in
 `mode: "2fa"` on the passwordless routes — the subject is the `tempToken` that
 names it: whoever is guessing the six digits holds one token and presents it
-with every guess, so the counter is exactly per challenge, and one who rotates
-tokens has to log in again for each, which `login` limits. It is hashed because
-it is a bearer credential and must not become a partition key in the clear.
+with every guess, so the counter is exactly per challenge. It is not a bound
+per account: one who rotates tokens logs in again for each, and `login` allows
+`max` logins a window, each minting a challenge good for five minutes
+(`TempTokenTTL`), so this budget alone lets an account be asked about
+`login.max × 5 min / window × max` codes a window — about 500 a minute at the
+defaults. The bound per account is `twoFactor.lockout` (§7.3), which counts the
+checks against the account a verified token names. It is hashed because it is a
+bearer credential and must not become a partition key in the clear.
 Nothing here verifies anything or reads a store — a hash is not a check — so a
 refusal still costs nothing downstream.
 
@@ -1656,7 +1971,9 @@ by the very next request, exactly as in the reference.
   principal is established. It is the reference's own default and its own
   advice for it — "use only behind a VPN or IP allow-list" (`admin.router.ts:29`).
   The contract suite reports a console that answers a bare `GET <admin>/api/ping`
-  with 200 as a fault, in as many words.
+  with 200 as a fault, in as many words. **Refused at start beside
+  `twoFactor.required`** (RS-20): a console that asks for no credential cannot
+  be one that asks for a second factor.
 - **`first-user`** is **refused at start on every driver** (RS-17), and the
   schema keeps the spelling only so a document written for another port parses
   here and meets the refusal rather than a schema error. The reference grants
@@ -1732,6 +2049,25 @@ cost per guess. And **`admin.loginPath`, pointed at the hosted login**
 (`<prefix>/ui/login`), sends a browser through the flow that does enforce the
 second factor: the ordinary access token it ends with is the first credential
 above, and the guard judges it. A deployment that requires 2FA sets it.
+
+**Under `twoFactor.required` the console's login is not served.**
+`POST <admin>/login` answers the router's `404`, the second credential above
+stops existing, and the console admits the first alone — a session from
+`POST <prefix>/login` that proved the factor — plus machine access (§16.9). The
+root user and the bootstrap secret, which sign in nowhere else, are refused at
+start beside the policy (RS-20), and so are a bootstrap secret standing as the
+console's whole guard without an access policy and the `open` policy, which
+asks for no credential at all. §7.1 has the whole table.
+
+That leaves the first administrator of an `is-admin-flag` console to be flagged
+without the root user, and there are three ways: a machine principal (§16.9)
+calls `POST <admin>/users/{id}/promote` with `{"method":"flag"}` — the org
+realm's own path; a provisioning tool writes the flag through the store, as it
+writes the account and its factor; or the realm is bootstrapped before the
+policy — deployed once with the root user and without `twoFactor.required`,
+the first administrator flagged and enrolled, then redeployed with the policy
+and without the root user, rotating the access-token secret so the root user's
+console token dies with it.
 
 **Neither credential is revocable through the session store.** The guard
 verifies signature, `typ`, issuer and expiry and never consults the store, so
@@ -1883,13 +2219,21 @@ user `migrate cognito --tenant` imported under another, which is what it did
 before. The product register's `admin-user-detail-is-single-tenant` is retired
 (`docs/deviations.md` §1.1).
 
-What the core still does with the empty tenant is the core's, recorded upstream
-as `admin-user-detail-spans-tenants-only-through-a-lookup-store`, and no store
-closes it: `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
-with `{"method":"flag"}` both pass `""` whatever the store implements, so on a
-table with users under a tenant neither reaches them: on this store both find
-no row under `""` and answer `500 {"error":"Internal server error"}`. `GET
-<admin>/api/users/{id}/roles` reads the empty tenant too, on purpose: there the
+Since the `v0.14.0` pin the two console writes that address a user by id
+resolve the tenant the same way, which is the core's
+`admin-user-detail-spans-tenants-only-through-a-lookup-store`: `DELETE
+<admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` with
+`{"method":"flag"}` look the id up through `auth.UserLookupStore` first and
+write the row in whichever tenant holds it. Through the `v0.13.0` pin both
+passed `""`, found no row for a user stored under a tenant and answered `500
+{"error":"Internal server error"}`. **This widens what an administrator can
+write**: a policy that admits per-tenant administrators — `is-admin-flag` set on
+a tenant's own row, or an `rbac:<role>` held in one tenant — now lets them
+delete and promote users in every tenant, as it already let them read every
+tenant's users. Check that this is what your policy means before upgrading. An
+id no tenant holds is written under `""` as before, so an unknown id answers
+what it always answered. The other user-scoped writes still pass `""`, and `GET
+<admin>/api/users/{id}/roles` reads the empty tenant on purpose: there the
 tenant is the scope of a role *assignment*, and the console assigns in the empty
 scope. And an id the store holds under two tenants — possible only on a table
 written before the pin — is a `404` rather than either account once `migrate
@@ -2108,6 +2452,117 @@ with no option beside it. Both knobs are `[new]` in the schema — inventions ov
 values the reference hard-codes — and their defaults are those values, so a
 document that leaves them alone reports nothing. `ui.uploadDir` in its
 filesystem spelling is the third report (§15.4).
+
+### 16.9 Machine access: `admin.machineAccess.iam.principals`
+
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `admin.machineAccess.iam.principals` | IAM role or user ARNs | none | `AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS` (comma separated) | `AdminMachinePrincipalArns` |
+
+A back-office service — an identity service that invites operators, deletes
+users, revokes sessions — reaches the console's JSON API on an IAM-signed
+request, instead of on a person's password and second factor kept in a vault.
+The reference offers a service nothing better than the shared `adminSecret`;
+the core's `AdminOptions.MachineAccess` (`admin-machine-access-is-a-host-seam`)
+is the seam, and this block fills it with IAM.
+
+**Who verifies the caller: API Gateway.** On a route with `AWS_IAM`
+authorization it checks the SigV4 signature and the caller's
+`execute-api:Invoke` permission before the function runs, and writes the
+caller into `requestContext.authorizer.iam` of the payload 2.0 event — a place
+no request header can reach. The function reads `userArn` from there and admits
+the caller when its role or user is listed:
+
+- `arn:<partition>:iam::<account>:role/[<path>/]<name>` admits **every session of
+  that role**. API Gateway reports a role's caller as
+  `arn:<partition>:sts::<account>:assumed-role/<name>/<session>` — the role's path
+  dropped, and a session name chosen by whoever assumed the role — so the match is
+  partition, account and role name, which name one role whatever its path.
+- `arn:<partition>:iam::<account>:user/[<path>/]<name>` admits that user, path
+  included.
+
+Refused at start: a role-session ARN (its session name identifies nothing), the
+root user, a wildcard, anything that is not a role or user ARN, a principal
+named twice — a role with and without its path is one principal — and the whole
+block while `admin.enabled` is off. The SAM parameter's `AllowedPattern` is the
+same grammar, so all of these but the duplicate are refused at changeset time
+rather than by a function that then serves no route at all. The variable and
+the parameter are comma separated, so a role or user whose name or path holds a
+comma — IAM allows one — can be listed only in the configuration document.
+
+**The trust boundary is `lambda:InvokeFunction` on the auth function.** API
+Gateway writes `requestContext.authorizer.iam` only on the internal API's
+`AWS_IAM` route, but the function cannot tell an event API Gateway built from
+one a principal built by hand: whoever may invoke the function directly can hand
+it an event carrying a listed ARN and get everything a match gets — promote,
+API keys (and with them the `apiKey` tools posture), webhooks, mail and UI
+templates. Before this block a direct invocation gained nothing an HTTP request
+could not. The template grants the permission to `apigateway.amazonaws.com`
+alone, scoped by source ARN to the two APIs; keep it that way in the account —
+an SCP or a permissions boundary denying `lambda:InvokeFunction` on the
+function to every other principal — and treat any grant of it as a grant of the
+console. And list only roles whose trust policy names the one calling service:
+a role that a Cognito identity pool, a web identity or a broad trust policy can
+assume admits every session of it.
+
+**What a match gets.** Every route behind the guard — the users listing and
+detail, `DELETE <admin>/api/users/{id}`, the session routes, promote — with no
+token, cookie, CSRF pair, user-store read or policy evaluation; the core's
+contract for the seam. Each grant raises `identity.admin.machine.access` with
+the caller's own ARN (session name included), the method and the path: with
+`tools.enabled` it is fanned out like any event (a telemetry row, a matching
+webhook), and without an event bus it is a line of this log. A request a
+browser originated — an `Origin` header, or `Sec-Fetch-Site` other than
+`none` — is never offered to the match, and meets the session policy. An
+unlisted caller, and every request with no IAM block — every request on the
+public API — is left to the guard exactly as before.
+
+**Where the route is.** The SAM template creates an internal API for it,
+`AdminMachineApi` — a second HTTP API whose one route is
+`ANY /admin/{proxy+}` with `AWS_IAM`, invoking the same function — whenever
+`AdminMachinePrincipalArns` is set beside `EnableAdminConsole`. It is an origin
+of nothing: the stack's distribution sends every path to the public API, which
+carries no IAM route, so CloudFront never routes a request to the internal one.
+The caller signs for service `execute-api` against the `AdminMachineApiEndpoint`
+output, and its **own** IAM policy has to allow `execute-api:Invoke` on the
+`AdminMachineApiInvokeArn` output — an HTTP API has no resource policy, so the
+stack cannot grant it. The route is the template's mount, `/admin`; a
+`ConfigFile` that moves `admin.basePath` leaves every machine call a `404`.
+
+**The front door still applies — an open decision, with today's answer.**
+Machine access does not lift `http.originVerify` (§19): with the check on, the
+machine caller sends the front door's header too, read from the same secret, or
+is refused with the bare `403` before the guard. That is the combination as
+built and pinned (`TestAdminMachineAccessMeetsTheOriginCheck`), and it has a
+cost the owner of the check has to weigh against the alternative:
+
+- **As built:** the back-office service's role is granted
+  `secretsmanager:GetSecretValue` on the front door's secret. Whoever holds that
+  secret can call the public API's origin directly, past CloudFront and any WAF
+  rule in front of it — which is what the check exists to prevent — so the
+  secret now lives in two places and its blast radius is the service's.
+- **The alternative, not implemented:** exempt from the check a request that
+  arrived on the internal API — `requestContext.apiId` equal to
+  `AdminMachineApi`'s id, passed to the function as a variable (the API resource
+  does not depend on the function, so this makes no cycle) — and that carries an
+  `authorizer.iam` block. The service then needs no secret, and the check
+  changes contract: it stops being "only the front door may call the origin".
+
+Until that is decided the first holds, and the cold start's `admin machine
+access` line says whether the header is required.
+
+**`twoFactor.required` leaves it alone.** A machine caller signs in nowhere: it
+is admitted on a credential IAM verified, with no session, so the policy — which
+is about the sessions people open — neither refuses it nor asks it for anything
+(§7.1). That is what makes a console only machines call possible on a realm
+whose people all sign in with two factors.
+
+**A console for machines only.** `AdminMounted` still needs an access policy.
+Under `is-admin-flag` with no root user and nobody flagged, no person can enter
+the console and the machine principal is its only caller; it can flag a person
+later through promote. The cold start names the principals, what they are
+admitted to, and whether the front-door header is required (`admin machine
+access`).
 
 ## 17. `tools.*`, knob by knob
 
@@ -2827,8 +3282,9 @@ host's middleware; this product is that host (`cmd/auth/tools.go`,
 loader warns about that combination.
 
 **`session` is not the ordinary posture, and it is not the template's default,
-because of who holds a session.** `POST <prefix>/register` is always mounted
-(upstream `register-route-is-always-mounted`), so under `session`
+because of who holds a session.** `POST <prefix>/register` is mounted unless
+`registration.closed` says otherwise (§20; upstream
+`register-route-is-always-mounted`), so on an open realm under `session`
 "authenticated" means any self-registered user, and what such a user can do is
 the reference's own shape, reproduced rather than narrowed:
 
@@ -3236,3 +3692,118 @@ waiting on it; the next successful read resets the count.
 `previousAccepted: false` means the secret has never been rotated, or that its
 previous value is not usable — in which case a warning line says why. Neither
 the ARN nor any value is ever written.
+
+### 19.6 Machine callers on the internal admin API
+
+The check runs on every request the function receives, whichever API delivered
+it, so a machine caller on `AdminMachineApi` (§16.9) is held to it too: with
+`http.originVerify.secretArn` set, it sends the header holding the secret's
+current value — reading it with `secretsmanager:GetSecretValue`, granted by its
+own role — and is refused with the bare `403` otherwise, before the guard ever
+sees its IAM identity. The cold start's `admin machine access` line says when
+that is so.
+
+That puts the front door's secret in a second place, where whoever holds it can
+reach this origin past the front door; exempting a request that arrived on the
+internal API with an IAM caller is the alternative, and changes what this check
+promises. Which of the two to run is an open decision of the check's owner;
+§16.9 sets out both, and the first is what is built.
+
+## 20. `registration.closed` — an invite-only realm
+
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `registration.closed` | boolean | `false` | `AWESOME_AUTH_REGISTRATION_CLOSED` | `ClosedRegistration` |
+
+The reference mounts `POST <prefix>/register` only when its host passes an
+`onRegister` hook (`auth.router.ts:712-715`); this product ships registration,
+so the hookless deployment is this switch — the core's
+`HTTPConfig.ClosedRegistration` since `awesome-go-auth` `v0.14.0`. With it on:
+
+- `POST <prefix>/register` is not mounted and answers the router's `404`, in
+  both delivery modes, with no session and no account;
+- `GET <prefix>/ui/config` answers `features.register: false`, so the hosted
+  login page hides its sign-up link (the `<prefix>/ui/register` page itself is
+  still served, as the reference serves it without a hook, and its form posts to
+  the route that is gone);
+- the served OpenAPI document leaves the path out.
+
+Nothing else closes: every other route answers as it did.
+
+**No route creates an account on a closed realm.** The reference's admin router
+has no user-creating route and the core reproduces it, so neither the console
+nor a machine caller on it (§16.9) can create one — they list, flag, promote and
+delete. On a closed realm accounts come from outside the HTTP surface:
+`cmd/migrate cognito` imports them from a Cognito pool (with
+`stores.migration.mode` at `import-only`: dual-read is refused here, see below); an OAuth callback narrowed
+with `oauth.provisioning.allowedEmailDomains` and `requireVerifiedEmail` provisions
+whoever the provider vouches for at your own domains (see below — and not on a
+realm with `twoFactor.required`, where providers are refused); or a provisioning
+tool of your own writes them through the store
+(`internal/store/dynamodb`, the way `cmd/migrate` does) — enrolling their
+second factor there too when `twoFactor.required` is on and
+`twoFactor.enrolOnLogin` is off (§7.1). **Creating accounts over HTTP is not
+supported yet:** an invitation service calling the auth API needs an invitation
+route in the core's admin API, which would close the gap upstream.
+
+An earlier revision of this section suggested the opposite shape for such a
+service — leave this switch off and put an `AWS_IAM`-authorized route for
+`POST <prefix>/register` on the public API in front of the function. **That
+advice is withdrawn.** The function serves percent-encoded spellings of the
+path: `POST /auth/%72egister` and `/auth/re%67ister` register an account exactly
+as `/auth/register` does, because the router decodes the path before matching
+it. The patch therefore holds only if API Gateway routes every such spelling to
+the IAM route too, and that has not been verified on a deployed stack; if it
+matches the encoded path, they fall to the unauthenticated `/{proxy+}` route and
+register anyone. It would also be the one IAM route on the public API, which
+§16.9 and the template otherwise keep free of them. A deployment that already
+runs the patch should verify on its own stack that each percent-encoded
+spelling of the register path is refused before the function — or block them at
+the edge on the URL-decoded path — and otherwise close the realm with this
+switch and provision through the store.
+
+**The OAuth callback is the other sign-up door.** It creates an account for any
+provider identity no account holds whenever `oauth.provisioning.autoCreate` is
+on, which is its default (§8.2). So a closed realm with a provider configured is
+**refused at start (RS-19)** unless the callback is closed too —
+`oauth.provisioning.autoCreate: false`, which signs in only accounts that already
+exist or match — or narrowed to the "sign in with your company account" realm,
+which takes **both** `oauth.provisioning.allowedEmailDomains` and
+`oauth.provisioning.requireVerifiedEmail: true`. The domain list alone is not
+enough: the core matches it on the address the provider asserts, so with
+verification off — its default — a provider that reports
+`stranger@your-domain` as unverified signs a stranger up, and RS-19 refuses
+that shape too, naming `requireVerifiedEmail`. With both it loads, with a
+warning naming the domains it lets in, and the list is then exactly as strong
+as the provider's verification of an address there; a provider that sends no
+`email_verified` claim at all is refused outright, so this realm suits a
+provider that asserts it (Google does). With no provider configured
+`autoCreate` is a default nothing reads, and nothing is refused. The SAM
+template refuses the same combination at changeset time when no `ConfigFile` is
+supplied (Rule `ClosedRegistrationRefusesOAuthSignUp`), since nothing in it can
+turn `autoCreate` off or set a domain list.
+
+**Dual-read is a third sign-up door, and a closed realm refuses it (RS-21).**
+With `stores.migration.mode: dual-read` a lookup that misses the local store
+falls through to the migration source and creates the local account on the
+spot (`internal/store/migrating`), and the lookup is made by unauthenticated
+routes: a `POST <prefix>/login` or `/forgot-password` naming any address the
+pool holds provisions it, and the reset mail then goes out as for any account.
+The pool's own state is not read on the way — a user disabled or unconfirmed in
+the pool is provisioned like any other — and a pool that allows self sign-up
+would make its sign-up this realm's for as long as the mode stayed on. So
+`registration.closed` beside `dual-read` does not start, with the remedy named:
+run `cmd/migrate cognito` to completion and keep the mode at `import-only` (its
+default), or leave the realm open for the migration window if accounts are meant
+to arrive from the pool on first use. An inactive block (no
+`stores.migration.source`) is not refused, since its mode reads nothing. The SAM
+template refuses the same at changeset time (Rule
+`ClosedRegistrationRefusesDualRead`); it does not step aside for a
+`ConfigFile`, because both knobs reach the function as environment variables,
+which beat the document. `cmd/migrate` itself imports every record with an
+email, whatever its pool state, as it always has: it runs with the operator's
+credentials and not over HTTP, so what it imports is the operator's choice, and
+skipping disabled or unconfirmed pool users there is a separate change.
+
+A front door that blocks `POST <prefix>/register` at the edge is still worth
+keeping as a second layer, and before this switch it was the only one.

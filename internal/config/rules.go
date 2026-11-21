@@ -42,7 +42,192 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS15ToolsInboundWebhooks(c, d)
 	checkRS17FirstUserRandomIDs(c, d)
 	checkRS18AdminCrossSiteCookie(c, d)
+	checkRS19ClosedRegistrationOAuth(c, d)
+	checkRS20TwoFactorRequiredSignIn(c, d)
+	checkRS21ClosedRegistrationDualRead(c, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS21ClosedRegistrationDualRead: a closed realm that dual-reads a
+// migration source is refused.
+//
+// registration.closed promises that no route creates an account (config
+// reference §20). Dual-read breaks that promise on two unauthenticated routes:
+// a GetUserByEmail miss falls through to the source, and the row is created
+// locally for whatever the pool holds (internal/store/migrating
+// provisionFromSource). The account so created is then an ordinary local
+// account — POST /forgot-password mails its reset link, POST /login signs it
+// in — and the pool's state is not read on the way: a user disabled or
+// unconfirmed in the pool is provisioned like any other, and a pool that
+// allows self sign-up is a sign-up form for this realm for as long as the
+// mode stays on.
+//
+// Refused rather than warned, because the two settings contradict each other
+// rather than combine: a closed realm's accounts are the ones its operator
+// put there, and the import (cmd/migrate cognito, which runs with operator
+// credentials and is not reachable over HTTP) is the way to put them there.
+// The mode is only a safety net for an incomplete import; a realm that is
+// closed runs the import to completion and keeps the mode at import-only.
+// Inactive blocks are not refused: DualRead is false without a source.
+func checkRS21ClosedRegistrationDualRead(c *Config, d *diagnostics) {
+	if !c.Registration.Closed || !c.Stores.Migration.DualRead() {
+		return
+	}
+	d.errf(RuleClosedRegistrationDualRead, "stores.migration.mode",
+		fmt.Sprintf("registration.closed is on, and stores.migration.mode is dual-read: a POST <prefix>/login or /forgot-password naming any address the %s source holds creates the local account on the spot, "+
+			"without reading whether the source still has the user enabled or confirmed -- an unauthenticated lookup is a sign-up for every account in the source, and on a source that allows self sign-up for anyone",
+			c.Stores.Migration.Source),
+		"import the accounts with cmd/migrate cognito and set stores.migration.mode: import-only (AWESOME_AUTH_STORES_MIGRATION_MODE=import-only) on the closed realm, "+
+			"or set registration.closed: false for the migration window if accounts are meant to arrive from the source on first use")
+}
+
+// checkRS19ClosedRegistrationOAuth: a closed realm whose OAuth callback still
+// signs up anyone is refused.
+//
+// registration.closed unmounts POST <prefix>/register and nothing else. The
+// OAuth callback creates an account for a provider identity no row knows
+// whenever oauth.provisioning.autoCreate is on — the default, because it is
+// what keeps "configure a provider and nothing else" working (Defaults) — so a
+// realm that closed the form and configured Google is open to every Google
+// account, and nothing anywhere says so. The core names the gap on the flag
+// itself ("it is not the only self-registration path").
+//
+// Three conditions, each of which takes the rule off:
+//
+//   - no provider configured: autoCreate is then a default nothing reads, so a
+//     rule on it alone would refuse every closed realm;
+//   - autoCreate off: the callback signs in only identities already linked or
+//     matched, which is what invite-only means;
+//   - allowedEmailDomains non-empty AND requireVerifiedEmail on: the callback
+//     creates accounts, but only for addresses at domains the operator named
+//     that the provider says it verified — the "sign in with your company
+//     Google account" realm, which is a deliberate posture rather than a
+//     mistake. It loads, and collectWarnings says what it does.
+//
+// The domain list alone does not take the rule off. The core matches it
+// against the address the provider asserts, and with requireVerifiedEmail off
+// — its default — an assertion the provider itself marks unverified is
+// matched all the same: a generic provider that answers
+// {"email":"stranger@corp.example","email_verified":false} signs a stranger up
+// to a realm closed to everyone outside corp.example. So the narrowed shape
+// needs both knobs, and the second refusal names the second knob.
+//
+// Reported on oauth.provisioning.autoCreate when nothing narrows the callback,
+// because that is the knob whose default is doing the damage and the one the
+// remedy turns first; and on oauth.provisioning.requireVerifiedEmail when a
+// domain list narrows it, because that is then the one knob missing.
+func checkRS19ClosedRegistrationOAuth(c *Config, d *diagnostics) {
+	p := c.OAuth.Provisioning
+	if !c.Registration.Closed || len(c.OAuth.Providers) == 0 || !p.AutoCreate {
+		return
+	}
+	providers := strings.Join(sortedKeys(c.OAuth.Providers), ", ")
+	switch {
+	case len(p.AllowedEmailDomains) == 0:
+		d.errf(RuleClosedRegistrationOAuth, "oauth.provisioning.autoCreate",
+			fmt.Sprintf("registration.closed is on, and the OAuth provider(s) %s create an account for any identity they assert that no account holds yet, "+
+				"because oauth.provisioning.autoCreate is on (its default) with no allowedEmailDomains -- the callback is a second sign-up form open to anyone with an account at the provider",
+				providers),
+			"set oauth.provisioning.autoCreate: false (AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE=false) so the callback signs in only accounts that already exist, "+
+				"or narrow it to your own domains with oauth.provisioning.allowedEmailDomains and oauth.provisioning.requireVerifiedEmail: true, or remove oauth.providers -- "+
+				"or set registration.closed: false if sign-up is meant to be open")
+	case !p.RequireVerifiedEmail:
+		d.errf(RuleClosedRegistrationOAuth, "oauth.provisioning.requireVerifiedEmail",
+			fmt.Sprintf("registration.closed is on, and the OAuth provider(s) %s create an account for any identity at %s that no account holds yet, "+
+				"matching the domain on the address the provider asserts whether or not it verified it, because oauth.provisioning.requireVerifiedEmail is off (its default) -- "+
+				"a provider that reports an address at those domains as unverified signs a stranger up to the closed realm",
+				providers, strings.Join(p.AllowedEmailDomains, ", ")),
+			"set oauth.provisioning.requireVerifiedEmail: true (AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL=true) so only addresses the provider verified are admitted -- "+
+				"a provider that sends no email_verified claim is then refused outright -- or set oauth.provisioning.autoCreate: false so the callback signs in only accounts that already exist, "+
+				"or remove oauth.providers")
+	}
+}
+
+// checkRS20TwoFactorRequiredSignIn: twoFactor.required beside a sign-in that
+// cannot be held to the second factor is refused.
+//
+// twoFactor.required is the core's Config.Require2FA, which the core enforces
+// at POST <prefix>/login and nowhere else. Every other way into a session was
+// walked (every caller of the core's issueSession, and the console's
+// mintAdminToken) and each got one of two answers:
+//
+//   - Held to the policy at request time, by cmd/auth's secondFactorGate: the
+//     magic-link and SMS routes in every mode (under the policy a TOTP code
+//     is the only second factor, so the emailed link and the texted code are
+//     refused as a second step too, and their senders are not handed to the
+//     core), /link-verify's loginAfterLinking, and POST <admin>/login. Each is
+//     one request the gate can recognise and refuse before the core acts on
+//     it, and refusing it takes nothing else away — the password reset and
+//     the other mails keep their transport, and the console accepts a session
+//     that came through POST <prefix>/login and its TOTP code. Not refused
+//     here.
+//   - Refused here, because nothing can stand in front of it: the OAuth
+//     callback. The core's OAuthComplete issues the session for every
+//     account it resolves and the adapter sets the cookies on the 302; the
+//     reference's 2FA branch does not exist there (product deviation
+//     oauth-callback-skips-the-second-factor), and a gate on
+//     the callback could only refuse every federated sign-in, which is the
+//     same deployment with oauth.providers removed and a 403 where the
+//     operator expected a login. So a configured provider is refused.
+//
+// And two credentials die with the console's login: admin.rootUser and
+// admin.bootstrapSecret are accepted at POST <admin>/login and nowhere else
+// under a session policy, so with the route not served they can never be
+// used — and without a policy the bootstrap secret is the console's whole
+// guard, a shared password a person pastes into the SPA, which is a sign-in
+// with one factor by another name. Both are refused while the console is
+// mounted, which is checkAdminRootUser's rule ("a root user that can never
+// log in is refused") applied to the policy.
+//
+// And the console that asks for nothing: admin.accessPolicy: open admits every
+// request with no credential at all, which is the bootstrap secret's reasoning
+// taken one step further — not a sign-in with one factor but with none, to the
+// most privileged surface in the deployment. It is a warned posture without the
+// policy (collectWarnings), and refused beside it. A console with no policy and
+// no secret is RS-6's refusal already, so the literal is the only open shape
+// left to refuse here.
+//
+// Every environment: the policy is a security posture, and a development
+// stack that quietly ran without it would be the one place it was never
+// tested.
+func checkRS20TwoFactorRequiredSignIn(c *Config, d *diagnostics) {
+	if !c.TwoFactor.Required {
+		return
+	}
+	if len(c.OAuth.Providers) > 0 {
+		d.errf(RuleTwoFactorRequiredSignIn, "oauth.providers",
+			fmt.Sprintf("twoFactor.required is on, and the OAuth callback of %s completes a sign-in with a session and no second factor, whatever the account: "+
+				"the imported core has no second-factor step after the callback, so a federated login would walk around the policy POST <prefix>/login enforces",
+				strings.Join(sortedKeys(c.OAuth.Providers), ", ")),
+			"remove oauth.providers from a realm whose policy is that every session proved two factors, or set twoFactor.required: false and rely on the provider's own second factor")
+	}
+	if !c.Admin.Enabled {
+		return
+	}
+	if email := strings.TrimSpace(c.Admin.RootUser.Email); email != "" {
+		d.errf(RuleTwoFactorRequiredSignIn, "admin.rootUser.email",
+			"twoFactor.required is on, and the admin root user signs in at POST <admin>/login with a password alone -- a route this deployment does not serve under the policy, "+
+				"so the root user could never sign in",
+			"remove admin.rootUser and enter the console with a session from POST <prefix>/login, which asks for the factor, as an account admin.accessPolicy admits -- "+
+				"flag the first one through a machine principal's promote (admin.machineAccess), in the store, or with the root user on a deploy before the policy is on")
+	}
+	// Written by any source: a store reference in the document or its
+	// variable (configured), or a value through AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET,
+	// which resolves into the secret table without touching the struct.
+	if c.Admin.BootstrapSecret.configured() || c.SecretValue("admin.bootstrapSecret") != "" {
+		d.errf(RuleTwoFactorRequiredSignIn, "admin.bootstrapSecret",
+			"twoFactor.required is on, and the admin bootstrap secret is a shared password: beside an access policy POST <admin>/login accepts it, and this deployment does not serve that route under the policy; "+
+				"without one it is the console's whole guard, a credential a person presents with no second factor",
+			"remove admin.bootstrapSecret, set admin.accessPolicy, and enter the console with a session from POST <prefix>/login, which asks for the factor -- "+
+				"flag the first administrator through a machine principal's promote (admin.machineAccess), in the store, or on a deploy before the policy is on")
+	}
+	if c.Admin.AccessPolicy == AdminAccessPolicyOpen {
+		d.errf(RuleTwoFactorRequiredSignIn, "admin.accessPolicy",
+			"twoFactor.required is on, and admin.accessPolicy is open: the console admits every request with no credential at all -- "+
+				"the user listing, promote, API keys and webhook secrets included -- so its whole power is reached with no factor, not even one",
+			"set admin.accessPolicy to is-admin-flag, rbac:<role> or permission:<perm> and enter the console with a session from POST <prefix>/login, which asks for the factor, "+
+				"or through admin.machineAccess")
+	}
 }
 
 // checkRS14ToolsSSEDistributor: an SSE configuration that names a distributor
@@ -312,12 +497,13 @@ func checkRS13Migration(c *Config, capabilities func(string) StoreCapabilities, 
 // silent failure §2 records against the reference.
 func checkRS1Secrets(c *Config, d *diagnostics) {
 	paths := []string{"security.jwt.accessTokenSecret", "security.jwt.refreshTokenSecret"}
-	if c.ResourceServer.Enabled {
+	if !c.VerifiesRefreshTokens() {
 		if !c.adminGuardVerifiesTokens() {
 			return
 		}
-		// Only the access secret is needed: nothing in this deployment mints or
-		// verifies a refresh token, so demanding a second one would be noise.
+		// Only the access secret is needed: nothing in this deployment
+		// verifies a refresh token, so demanding a second one would be noise
+		// -- and cmd/auth does not hand the core one it did not check.
 		paths = paths[:1]
 	}
 

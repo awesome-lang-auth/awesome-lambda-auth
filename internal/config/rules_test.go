@@ -78,6 +78,50 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantPath: "deployment.publicUrl",
 		},
 		{
+			// RS-19: a closed realm whose OAuth callback signs up any account
+			// at the provider. internal/config/realm_test.go walks the shapes
+			// around it.
+			name: "RS-19 closed registration beside a provider that creates accounts",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+			},
+			env:         googleEnv(),
+			wantRule:    RuleClosedRegistrationOAuth,
+			wantPath:    "oauth.provisioning.autoCreate",
+			wantMessage: "second sign-up form",
+		},
+		{
+			// RS-20: twoFactor.required beside a sign-in the core completes
+			// with no second factor. internal/config/realm_test.go walks the
+			// three shapes.
+			name: "RS-20 twoFactor.required beside an OAuth provider",
+			mutate: func(doc Document) {
+				set(doc, "twoFactor.required", true)
+				googleProvider(doc)
+			},
+			env:         googleEnv(),
+			wantRule:    RuleTwoFactorRequiredSignIn,
+			wantPath:    "oauth.providers",
+			wantMessage: "no second factor",
+		},
+		{
+			// RS-21: a closed realm whose migration source provisions an
+			// account on an unauthenticated lookup. internal/config
+			// realm_test.go walks the shapes around it.
+			name: "RS-21 closed registration beside a dual-read migration",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+				set(doc, "stores.migration.region", "eu-west-1")
+				set(doc, "stores.migration.mode", MigrationModeDualRead)
+			},
+			wantRule:    RuleClosedRegistrationDualRead,
+			wantPath:    "stores.migration.mode",
+			wantMessage: "unauthenticated lookup is a sign-up",
+		},
+		{
 			name: "RS-3 CSRF disabled in cookie mode",
 			mutate: func(doc Document) {
 				set(doc, "security.csrf.enabled", false)

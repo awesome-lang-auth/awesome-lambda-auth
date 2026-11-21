@@ -439,12 +439,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 			return nil, err
 		}
 	}
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
+	// The auth router's slot holds the rate limiter and, inside it, the
+	// per-account cap on failed second-factor checks (secondfactor_cap.go):
+	// the cap counts what the limiter let through, and it is filled even when
+	// the limiter is off, because twoFactor.lockout is its own switch.
+	logSecondFactorCapSurface(cfg, users, log)
+	authRL := chainLimiters(newRateLimiter(cfg, counter, log), newSecondFactorCap(cfg, users, core, log))
+	if err := mountAuthSurface(mux, core, cfg, authRL, newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
+	logSecondFactorSurface(cfg, log)
 	logToolsSurface(cfg, tools, log)
 	logScriptRunnerSurface(cfg, tools, log) // D9d
 	logStreamSurface(cfg, tools, stream, log)
@@ -515,7 +522,10 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.String("sessionCheckOn", cfg.Sessions.CheckOn),
 		slog.Bool("identityProvider", core.IDP() != nil),
 		slog.Bool("resourceServer", cfg.ResourceServer.Enabled),
-		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()))
+		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()),
+		slog.Bool("registrationClosed", cfg.Registration.Closed),
+		slog.Bool("twoFactorRequired", cfg.TwoFactor.Required),
+		slog.Bool("twoFactorEnrolOnLogin", cfg.TwoFactor.EnrolOnLogin))
 
 	return app, nil
 }
@@ -530,6 +540,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //
 //   - The console's login limiter, matching one route (POST <admin>/login) and
 //     nothing else; identity when the console or the block is off.
+//   - The second-factor gate (secondfactor.go): under twoFactor.required it
+//     refuses the four passwordless routes in every mode, /link-verify's
+//     loginAfterLinking and POST <admin>/login before any of them reaches the
+//     core; identity when the policy is off. Outside the login limiter, so a console login the
+//     policy refuses spends nothing from the shared counter, and inside
+//     everything else, so a refusal carries the CORS headers a browser needs
+//     to read it and is in the access log like any answer. It classifies a
+//     request by asking mux which pattern would serve it, which is why this
+//     function takes the mux itself.
 //   - The two header middlewares. Neither registers a pattern, so the adapter
 //     still owns every path under the api prefix — that is the only thing this
 //     binary can do about the reference's Swagger page loading an unpinned
@@ -565,11 +584,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 //     ones the adapter does not own — GET /healthz today, whatever a later block
 //     mounts outside the api prefix tomorrow. See the correlation section of
 //     logging.go for why this binary never reads the header itself.
-func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adminLoginRL func(http.Handler) http.Handler) http.Handler {
-	handler := mux
+func assembleHandler(cfg *config.Config, log *slog.Logger, mux *http.ServeMux, adminLoginRL func(http.Handler) http.Handler) http.Handler {
+	var handler http.Handler = mux
 	if adminLoginRL != nil {
 		handler = adminLoginRL(handler)
 	}
+	handler = secondFactorGate(cfg, mux)(handler)
 	handler = docsSecurityHeaders(cfg)(handler)
 	handler = uploadAssetHeaders(cfg)(handler)
 	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
@@ -748,7 +768,7 @@ func loadDocument(getenv func(string) (string, bool), readFile func(string) ([]b
 // Only knobs the core actually accepts appear here. The ones it does not are
 // reported by unwiredKnobs rather than quietly dropped.
 func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.SessionStore, log *slog.Logger) []auth.Option {
-	return []auth.Option{
+	opts := []auth.Option{
 		auth.WithSecret(cfg.AccessTokenSecret()),
 		auth.WithTokenTTLs(cfg.Security.JWT.AccessTokenTTL.Duration(), cfg.Security.JWT.RefreshTokenTTL.Duration()),
 		// The cost every password this deployment hashes is written at. It
@@ -766,6 +786,33 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 			log.Warn("auth core", slog.String("message", fmt.Sprintf(format, args...)))
 		}),
 	}
+	// The refresh token's own key: the reference's refreshTokenSecret, which
+	// signs and verifies every refresh token (token.service.ts:25-29, :154).
+	// The core takes it since v0.13.0 (WithRefreshSecret) and falls back to the
+	// access secret without it (core deviation refresh-secret-falls-back-to-secret),
+	// which is how every refresh token this product minted until now was
+	// signed. Passing it separates the two trust domains — a component that
+	// holds the access secret to verify sessions can no longer mint a refresh
+	// token, and rotating this secret alone signs every session out while
+	// access tokens already handed out run to their expiry — and it is a
+	// one-time global sign-out on the deploy that brings it: every refresh
+	// token outstanding then was signed with the access secret and stops
+	// verifying (CHANGELOG, docs/config-reference.md §3.1).
+	//
+	// Passed exactly when RS-1 has checked it — at least 32 characters, and not
+	// the access secret — which is whenever a route verifies a refresh token:
+	// config.VerifiesRefreshTokens, the one predicate both sides read. A
+	// resource server mounts no /refresh, so RS-1 does not check its refresh
+	// secret and it is not passed either: WithRefreshSecret refuses a short
+	// one, and a resource server configured with one would otherwise have
+	// stopped starting on the release that wired the secret. unwiredKnobs
+	// reports it there instead. The value check stays for a test that builds
+	// the core without the loader: the option refuses an empty value rather
+	// than reading it as "fall back".
+	if refresh := cfg.RefreshTokenSecret(); cfg.VerifiesRefreshTokens() && refresh != "" {
+		opts = append(opts, auth.WithRefreshSecret(refresh))
+	}
+	return opts
 }
 
 // coreOptionSet is one contributor to the core's option list: the block it
@@ -845,7 +892,9 @@ func coreOptionSets(
 			build: func() ([]auth.Option, error) { return emailOptions(ctx, cfg, users, deliver, log) },
 		},
 		{
-			// The TOTP issuer label. One string, no I/O, nothing to refuse.
+			// The TOTP issuer label and the second-factor policy: whether a
+			// login demands a factor, and whether an account that has none may
+			// enrol one there. No I/O, nothing to refuse.
 			name:  "twoFactor",
 			build: func() ([]auth.Option, error) { return twoFactorOptions(cfg), nil },
 		},
@@ -1026,6 +1075,13 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 		// it (auth.ResourceServerGatedRoutes). This is the half of the knob that
 		// changes the mounted surface; the verifier is App.ResourceServerGuard.
 		ResourceServer: cfg.ResourceServer.Enabled,
+		// Closed registration (since core v0.14.0): the adapter does not
+		// register POST <prefix>/register, so it answers the router's 404 as
+		// the reference's hookless deployment does; GET <prefix>/ui/config
+		// reports features.register false and the served OpenAPI document
+		// leaves the path out. The OAuth callback is the other sign-up door,
+		// and RS-19 refuses a closed realm that leaves it open to anyone.
+		ClosedRegistration: cfg.Registration.Closed,
 		// The documentation surface: GET <prefix>/openapi.json and
 		// GET <prefix>/docs, both unguarded and both behind the CSRF
 		// middleware, registered by the adapter and by nothing here. docs.go
@@ -1333,16 +1389,6 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	defaults := config.Defaults()
 	var gaps []knobGap
 
-	if cfg.RefreshTokenSecret() != "" {
-		gaps = append(gaps, knobGap{
-			Path: "security.jwt.refreshTokenSecret",
-			Problem: "the auth core takes a second secret since awesome-go-auth v0.13.0 (WithRefreshSecret), but this build does not " +
-				"pass it yet, so security.jwt.accessTokenSecret still signs the refresh tokens and this one signs nothing",
-			Remedy: "keep it set — RS-1 requires it, and it becomes live when this product wires it, which signs every outstanding " +
-				"session out once — but do not rely on rotating it to invalidate refresh tokens today",
-		})
-	}
-
 	if cfg.Email.Verification.Mode != defaults.Email.Verification.Mode {
 		gaps = append(gaps, knobGap{
 			Path: "email.verification.mode",
@@ -1373,6 +1419,17 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 			Problem: fmt.Sprintf("the auth core exposes no functional option for this lifetime, so the deployed value stays %d minutes and not the configured %d",
 				row.coreValue, row.configured),
 			Remedy: "remove the override until the core exports an option for it",
+		})
+	}
+
+	// A resource server's refresh secret: neither checked by RS-1 nor handed to
+	// the core (coreOptions), because no route there verifies a refresh token.
+	if !cfg.VerifiesRefreshTokens() && cfg.RefreshTokenSecret() != "" {
+		gaps = append(gaps, knobGap{
+			Path: "security.jwt.refreshTokenSecret",
+			Problem: "resource-server mode mounts no route that verifies a refresh token (POST <prefix>/refresh is not mounted), " +
+				"so this secret is neither checked by RS-1 nor handed to the auth core",
+			Remedy: "leave it unset on a resource server; it takes effect, and RS-1 checks it, when resourceServer.enabled is off",
 		})
 	}
 

@@ -91,6 +91,7 @@ type Config struct {
 	Tokens          Tokens          `json:"tokens"`
 	Cookies         Cookies         `json:"cookies"`
 	Sessions        Sessions        `json:"sessions"`
+	Registration    Registration    `json:"registration"`
 	Email           Email           `json:"email"`
 	SMS             SMS             `json:"sms"`
 	OAuth           OAuth           `json:"oauth"`
@@ -267,6 +268,41 @@ type Sessions struct {
 	CheckOn string `json:"checkOn"`
 }
 
+// Registration covers registration.*: whether anyone may create an account
+// through the public route.
+//
+// [new] — the whole block is product-only. The reference has no knob for it:
+// it mounts POST <prefix>/register only when the host passes an onRegister
+// hook (auth.router.ts:712-715), so an invite-only deployment of it is a host
+// that wrote no hook. This product ships registration rather than asking for
+// it, so the hookless deployment is a flag, which the imported core exposes as
+// HTTPConfig.ClosedRegistration since v0.14.0. cmd/auth httpConfig.
+type Registration struct {
+	// Closed unmounts POST <prefix>/register: the route answers the router's
+	// 404, GET <prefix>/ui/config reports features.register false and the
+	// served OpenAPI document leaves the path out — the reference's hookless
+	// deployment on every surface. No route then creates an account: neither
+	// the reference's admin router nor the core's has one. Accounts come from
+	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains
+	// and to verified addresses, or a provisioning tool of the operator's own
+	// on the store. Creating them over HTTP needs an invitation route the
+	// core does not have yet; keeping the route open behind an AWS_IAM route
+	// in front of the function is not advised, because the router serves
+	// percent-encoded spellings of the path and API Gateway was never shown
+	// to route them the same way (config-reference §20). Off by default,
+	// which mounts the route as every earlier release did.
+	//
+	// It closes one of two self-registration doors. An OAuth callback creates
+	// an account for an identity nothing here knows whenever
+	// oauth.provisioning.autoCreate is on, which it is by default, so a closed
+	// realm with a provider configured has to say what the callback does: RS-19
+	// refuses the combination unless autoCreate is off or the callback is
+	// narrowed by allowedEmailDomains together with requireVerifiedEmail (the
+	// domain is matched on the address the provider asserts), and the loader
+	// warns about the narrowed shape it admits (collectWarnings).
+	Closed bool `json:"closed"`
+}
+
 // Email covers email.* (spec §1.5).
 type Email struct {
 	// SiteURLs is the redirect allowlist; the first entry is canonical.
@@ -375,6 +411,83 @@ type TwoFactor struct {
 	// AppName is the TOTP issuer in the otpauth URI; the reference default is
 	// the literal "awesome-node-auth" (src/router/auth.router.ts:830).
 	AppName string `json:"appName"`
+
+	// Required demands a TOTP code of every account at login: the core's
+	// Config.Require2FA (auth.WithRequire2FA), with TOTP as the only second
+	// factor. An enrolled account gets the reference's challenge listing
+	// "totp" alone, and one with no TOTP gets
+	// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
+	// and no session, whatever transports are wired; and POST
+	// <prefix>/2fa/disable answers 403 2FA_REQUIRED to everyone, with or
+	// without a settings store. The core asks at the password login alone and
+	// counts an emailed link or a texted code as a second factor wherever it
+	// can deliver one, so the product holds the rest to the policy: RS-20
+	// refuses it beside oauth.providers (the callback cannot be made to ask),
+	// beside the console's root user and bootstrap secret, and beside an open
+	// console; cmd/auth withholds the magic-link and SMS-code senders from the
+	// core, so the challenge offers neither; and its secondFactorGate refuses
+	// the four passwordless routes in every mode — login and step-up alike —
+	// /link-verify's loginAfterLinking and POST <admin>/login at request time.
+	// A phone number alone therefore never opens a session, and a mailbox opens
+	// one only through EnrolOnLogin, for an account that has not enrolled TOTP
+	// yet — the password reset hands it the password (trust on first use) — or
+	// by guessing the TOTP code of an account that has, which Lockout holds to
+	// MaxFailures wrong codes per account per window.
+	//
+	// [new] — the reference has no deployment-level require2FA: the name lives
+	// on the settings store and on the user record only, and its login demands
+	// a factor of an enrolled account or a flagged user and of nobody else
+	// (the core's config-require2fa-is-a-system-policy-term). It is not
+	// runtimeSettings.require2fa, which seeds the settings store's key and
+	// reaches /2fa/disable alone: that one never makes a login ask for a
+	// factor. Off by default.
+	Required bool `json:"required"`
+
+	// EnrolOnLogin lets an account that must present a second factor and has
+	// none enrol one at login: the tempToken of its 2FA_SETUP_REQUIRED answer
+	// becomes an enrolment token that POST <prefix>/2fa/setup and
+	// POST <prefix>/2fa/verify-setup accept, and the verify-setup that
+	// completes with it opens the session (the core's Config.EnrolOnLogin,
+	// auth.WithEnrolOnLogin; the core deviation
+	// forced-enrolment-opens-a-session).
+	//
+	// It is TRUST ON FIRST USE, which is why it is off by default: whoever
+	// holds an unenrolled account's password — a leaked invitation or initial
+	// password, or the password of an account whose factor an administrator
+	// has just reset — binds a factor of their choosing and gets a full
+	// session, and the owner's next login is a challenge they cannot answer.
+	// Turn it on where the first sign-in with the password is the owner's by
+	// construction, and reset the password together with the factor. It
+	// applies under Required and to accounts whose own require2FA flag is
+	// set, so it is not inert without Required, and is not refused there.
+	EnrolOnLogin bool `json:"enrolOnLogin"`
+
+	// Lockout caps the failed second-factor checks an account may make,
+	// whatever challenge, login or address they come through (cmd/auth
+	// secondfactor_cap.go). [new] — the reference counts nothing.
+	Lockout TwoFactorLockout `json:"lockout"`
+}
+
+// TwoFactorLockout covers twoFactor.lockout.*: the per-account cap on failed
+// second-factor checks.
+//
+// The rateLimit block's budgets are per subject per scope, and the subject of
+// POST <prefix>/2fa/verify is the challenge, so they bound the guesses made at
+// one tempToken; a caller who can log in again gets a fresh challenge, and a
+// fresh budget, every time. This cap is counted against the account the
+// challenge belongs to, read from a token whose signature has been verified,
+// across every challenge, login and source address: once an account has made
+// MaxFailures checks without one succeeding in a fixed, epoch-aligned window
+// of WindowSeconds, every further check for it answers rateLimit's 429 until
+// the window ends, and a check that succeeds clears the count.
+//
+// It is a block of its own rather than part of rateLimit, and rateLimit.enabled
+// does not switch it: a front door that limits by address — a WAF, an API
+// Gateway throttle — cannot do this, because the account is only known once
+// the token is verified. MaxFailures 0 turns it off.
+type TwoFactorLockout struct {
+	MaxFailures   int `json:"maxFailures"`
+	WindowSeconds int `json:"windowSeconds"`
 }
 
 // IDProvider covers idProvider.* (spec §1.10).
@@ -525,7 +638,43 @@ type Admin struct {
 	BasePath     string   `json:"basePath"`
 	SessionTTL   Duration `json:"sessionTtl"`
 	Upload       Upload   `json:"upload"`
+
+	// MachineAccess admits a back-office service to the guarded admin routes
+	// on a credential the platform verified, ahead of the session policy: the
+	// core's AdminOptions.MachineAccess (core deviation
+	// admin-machine-access-is-a-host-seam). [new] — the reference offers a
+	// service only the shared adminSecret or a user's session.
+	// cmd/auth/admin_machine.go.
+	MachineAccess AdminMachineAccess `json:"machineAccess"`
 }
+
+// AdminMachineAccess covers admin.machineAccess.*. One credential kind today,
+// IAM, in a block of its own so that a second (a mutual-TLS peer, say) is an
+// addition and not a rename.
+type AdminMachineAccess struct {
+	IAM AdminMachineAccessIAM `json:"iam"`
+}
+
+// AdminMachineAccessIAM covers admin.machineAccess.iam.*.
+type AdminMachineAccessIAM struct {
+	// Principals are the IAM roles and users admitted, as ARNs:
+	// arn:<partition>:iam::<account>:role/[<path>/]<name> admits every session
+	// of that role — API Gateway reports a role's caller as
+	// arn:<partition>:sts::<account>:assumed-role/<name>/<session>, with the
+	// path dropped and a session name the assumer chose, so the match is on
+	// partition, account and role name — and
+	// arn:<partition>:iam::<account>:user/[<path>/]<name> admits that user
+	// exactly. The caller is read from requestContext.authorizer.iam of an API
+	// Gateway HTTP API (payload 2.0) event, which API Gateway fills only on a
+	// route with AWS_IAM authorization, after verifying the SigV4 signature;
+	// the SAM template's internal admin API is that route. Empty — the
+	// default — admits no machine. Refused while admin.enabled is off,
+	// because there is then no console to admit anyone to.
+	Principals []string `json:"principals"`
+}
+
+// Enabled reports whether any principal is configured, which is the switch.
+func (m AdminMachineAccess) Enabled() bool { return len(m.IAM.Principals) > 0 }
 
 // AdminRootUser covers admin.rootUser.*.
 type AdminRootUser struct {
@@ -966,8 +1115,20 @@ func Defaults() *Config {
 				OnEmailMatch: OAuthEmailMatchLink,
 			},
 		},
+		// The lockout's default is ten failed checks per account per UTC day:
+		// at most 20 in any 24 hours (the fixed window's seam) and about 310 in
+		// 31 days, which against a six-digit code the core accepts at three
+		// steps (TOTPSkew 1) is a chance of about 1 in 1 000 a month for a
+		// caller who already holds the password. Ten is more than a person
+		// mistypes before one code goes through, and a success clears the
+		// count; what an exhausted budget costs the owner is a wait until the
+		// window ends, and only a caller past the first factor can cause it.
 		TwoFactor: TwoFactor{
 			AppName: "awesome-node-auth",
+			Lockout: TwoFactorLockout{
+				MaxFailures:   10,
+				WindowSeconds: 86_400,
+			},
 		},
 		IDProvider: IDProvider{
 			JWKSPath:        "/.well-known/jwks.json",
@@ -1192,6 +1353,41 @@ func (c *Config) RedirectOrigins() []string {
 // endpoints from it, and a second definition of "is the IdP on" in cmd/auth
 // could drift away from the rule that refuses a keyless production deployment.
 func (c *Config) IDProviderActive() bool { return c.IDProvider.active() }
+
+// VerifiesRefreshTokens reports whether this deployment serves a route that
+// verifies a refresh token: every mode but resource-server, which does not
+// mount POST <prefix>/refresh (core auth.ResourceServerGatedRoutes).
+//
+// It is the one predicate both halves of security.jwt.refreshTokenSecret
+// read, so that they cannot disagree. RS-1 holds the secret to its rules —
+// present, at least 32 characters, not the access secret — exactly when this
+// is true, and cmd/auth hands it to the core (auth.WithRefreshSecret, which
+// refuses a short one) exactly when this is true. In resource-server mode
+// neither happens: the secret is not checked, so it is not passed either,
+// and a resource server that configured a short one starts as it always did.
+// The OAuth callback a resource server still mounts mints session pairs whose
+// refresh token then falls back to the access secret, as before the secret
+// was wired; nothing there can redeem one.
+func (c *Config) VerifiesRefreshTokens() bool { return !c.ResourceServer.Enabled }
+
+// MailerConfigured, SMSConfigured and DeliveryWebhookConfigured report which
+// credential transports this deployment wires. They are the schema's own
+// signals rather than new knobs — validate.go refuses a mailer block with no
+// from address, an sms block with no endpoint, and a delivery webhook url
+// with no signing secret — and they are exported for the same reason
+// VerifiesRefreshTokens is: cmd/auth wires the senders from them and the
+// loader warns about twoFactor.required beside them, and the two must not
+// disagree about whether a deployment sends mail.
+func (c *Config) MailerConfigured() bool { return strings.TrimSpace(c.Email.Mailer.From) != "" }
+
+// SMSConfigured: see MailerConfigured.
+func (c *Config) SMSConfigured() bool { return strings.TrimSpace(c.SMS.Endpoint) != "" }
+
+// DeliveryWebhookConfigured: see MailerConfigured. When it is true the webhook
+// carries all five credential seams, mail and SMS alike.
+func (c *Config) DeliveryWebhookConfigured() bool {
+	return strings.TrimSpace(c.Email.DeliveryWebhook.URL) != ""
+}
 
 // CookieDeliveryActive reports whether the stack issues auth cookies at all.
 // Bearer versus cookie is a per-request client choice (X-Auth-Strategy), so the

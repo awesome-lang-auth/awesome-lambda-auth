@@ -98,11 +98,12 @@ func init() {
 					t.Errorf("lang is empty; it falls back to the configured default and then to \"en\"\n  %s", r.where())
 				}
 
-				// features gates what the pages offer. register is the one flag
-				// that is true on every deployment of this port — the route is
-				// always mounted, which is the core's own
-				// register-route-is-always-mounted deviation — but the key has
-				// to be there whatever it says, because the page reads it.
+				// features gates what the pages offer. register is true wherever
+				// the route is mounted, which is every open realm of this port
+				// (the core's register-route-is-always-mounted), and false on a
+				// closed one (registration/closed-realm-hides-sign-up-from-the-ui
+				// pins that half) — but the key has to be there whatever it
+				// says, because the page reads it.
 				if _, ok := doc.Features["register"]; !ok {
 					t.Errorf("features carries no register flag, so the login page cannot decide whether to offer registration: %v\n  %s",
 						keysOf(doc.Features), r.where())

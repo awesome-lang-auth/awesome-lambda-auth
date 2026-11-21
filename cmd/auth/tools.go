@@ -182,9 +182,10 @@ import (
 // And that is all `session` is, which is why it is NOT the ordinary posture
 // here and NOT the SAM template's default. Who holds a session is the host's
 // business in a library; this product has already decided it — POST
-// <prefix>/register is always mounted (upstream register-route-is-always-mounted)
-// — so under `session` "authenticated" means "anyone on the internet who filled
-// in the form". What such a caller can then do is the reference's own shape and
+// <prefix>/register is mounted unless registration.closed says otherwise
+// (upstream register-route-is-always-mounted) — so under `session`, on an open
+// realm, "authenticated" means "anyone on the internet who filled in the
+// form". What such a caller can then do is the reference's own shape and
 // is reproduced, not narrowed: GET <tools>/telemetry is store-wide
 // (tools_telemetry.go says so at length — ?userId=someone-else is honoured and
 // no filter means everyone), and the bridge above writes every identity.* event
@@ -905,18 +906,26 @@ func logToolsSurface(cfg *config.Config, tw *toolsWiring, log *slog.Logger) {
 	// What each guarded posture still costs, said where the operator reads what
 	// came up rather than only in the config reference. The session line is a
 	// warning, like the one for `none`, because the price is of the same kind
-	// and only one registration form away: POST <prefix>/register is always
-	// mounted, so "any signed-in user" is anyone. The apiKey line is not: a key
-	// is minted by an administrator, and what it opens is the posture working
-	// as documented.
+	// and, on an open realm, only one registration form away: POST
+	// <prefix>/register is mounted unless registration.closed says otherwise,
+	// so "any signed-in user" is anyone. On a closed realm it is every account
+	// the deployment created, which is narrower and still every one of them.
+	// The apiKey line is not a warning: a key is minted by an administrator,
+	// and what it opens is the posture working as documented.
 	switch posture {
 	case config.ToolsAuthSession:
+		reaches := "POST " + httpConfig(cfg).Prefix() + "/register is mounted, so any self-registered user holds a session"
+		headline := "the tools routes answer any signed-in user, and anyone can sign up"
+		if cfg.Registration.Closed {
+			reaches = "registration is closed, so a session belongs to an account this deployment created -- every one of them"
+			headline = "the tools routes answer any signed-in user"
+		}
 		// The attribute is not called "csrf": that key is on the redaction
 		// list (logging.go) and the sentence would be written as [REDACTED].
-		log.Warn("the tools routes answer any signed-in user, and anyone can sign up",
+		log.Warn(headline,
 			slog.String("path", "tools.auth"),
-			slog.String("problem", "POST "+httpConfig(cfg).Prefix()+"/register is always mounted, so any self-registered user holds a session; a session may GET "+mount+"/telemetry with no filter and read every user's rows -- the bridge writes every identity.* event there, emails, IP addresses, user agents and session ids included -- may POST "+mount+"/track under any event name with any userId in the body, which fires every matching outgoing webhook signed in this deployment's name, and may POST "+mount+"/notify to any topic"),
-			slog.String("remedy", "set tools.auth: apiKey (the SAM template's default) unless registration is closed or end users are meant to read each other's login history; see docs/config-reference.md §17.6"),
+			slog.String("problem", reaches+"; a session may GET "+mount+"/telemetry with no filter and read every user's rows -- the bridge writes every identity.* event there, emails, IP addresses, user agents and session ids included -- may POST "+mount+"/track under any event name with any userId in the body, which fires every matching outgoing webhook signed in this deployment's name, and may POST "+mount+"/notify to any topic"),
+			slog.String("remedy", "set tools.auth: apiKey (the SAM template's default) unless end users are meant to read each other's login history; see docs/config-reference.md §17.6"),
 			slog.String("cookieCaller", csrfPostureOf(cfg)))
 	case config.ToolsAuthAPIKey:
 		log.Info("the tools routes answer any active API key",

@@ -136,6 +136,13 @@ That is the whole reason the in-process pre-filter exists: an execution
 environment that has already seen the budget exhausted for a key refuses locally
 and spends nothing. It is a saving, never the limit.
 
+The per-account cap on failed second-factor checks (`twoFactor.lockout`) adds one
+more conditional `UpdateItem` to each check it counts — `/2fa/verify`, and the
+step-up and forced-enrolment checks — on the same table, with no pre-filter in
+front of it, and one `DeleteItem` when the check succeeds: **1 WCU per check,
+2 on a successful one**. A check the rate limiter refuses first spends nothing
+there.
+
 The consequence for an incident: a credential-stuffing run against `/login` is
 billed at **USD 1.25 per million attempts in limiter writes alone**, plus the
 platform floor, whether or not a single attempt succeeds. It is also why

@@ -364,11 +364,15 @@ func keysOf(m map[string]any) []string {
 // Provisioning
 // ---------------------------------------------------------------------------
 
-// Account is a set of credentials the suite created for itself.
+// Account is a set of credentials the suite created for itself, or the realm
+// account the operator declared (realm_test.go).
 type Account struct {
 	Email    string
 	Password string
 	UserID   string
+	// TOTPSecret is the base32 secret the account is enrolled with, when it
+	// is; Env.signIn completes a challenge with it.
+	TOTPSecret string
 }
 
 func randomAccount() Account {
@@ -386,8 +390,19 @@ func randomAccount() Account {
 
 // NewAccount registers a fresh account through a throwaway client, so whatever
 // credentials registration may hand back never leak into the caller's jar.
+//
+// On a realm declared closed or 2FA-required it skips the case instead: every
+// caller registers through the route a closed realm refuses, or signs the
+// account in with a password alone, which a 2FA-required realm refuses — so
+// the case was written for an open realm and says so rather than failing. The
+// runner lists the skip with its reason.
 func (e *Env) NewAccount(t *testing.T) Account {
 	t.Helper()
+	if e.Realm.restricted() {
+		e.realmSkip = fmt.Sprintf("provisions an account of its own and signs it in with a password, which a realm declared %s does not allow",
+			e.Realm.describe())
+		t.Skipf("this case %s; it runs against an open realm with an optional second factor", e.realmSkip)
+	}
 	acct := randomAccount()
 	r := e.NewClient().POST(t, "/register", body{"email": acct.Email, "password": acct.Password})
 	r.mustStatusIn(t, 200, 201)

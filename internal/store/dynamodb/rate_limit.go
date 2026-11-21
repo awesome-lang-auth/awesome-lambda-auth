@@ -41,8 +41,9 @@ import (
 // PK=RL#<scope>#<subject>#<window>, SK=RL, with the window index — wall-clock
 // seconds divided by the window length — inside the partition key. A window
 // therefore has its own item, a past window is unreachable rather than stale,
-// and there is nothing to reset: the next window starts at zero because it
-// starts at a key nothing has written yet.
+// and nothing has to be reset between windows: the next window starts at zero
+// because it starts at a key nothing has written yet. (ResetRateLimit, below,
+// clears the current window's item early; only the second-factor cap uses it.)
 //
 // That is a fixed window and it has the property every fixed window has: the
 // boundary is a seam. A subject may spend its whole budget in the last instant
@@ -179,6 +180,15 @@ type rateLimitCounter interface {
 
 var _ rateLimitCounter = (*Store)(nil)
 
+// secondFactorCounter is the shape cmd/auth's per-account cap on failed
+// second-factor checks discovers, pinned here for the same reason.
+type secondFactorCounter interface {
+	rateLimitCounter
+	ResetRateLimit(ctx context.Context, scope, subject string, window time.Duration) error
+}
+
+var _ secondFactorCounter = (*Store)(nil)
+
 // AllowRequest advances the counter for one request and reports whether it may
 // proceed.
 //
@@ -261,6 +271,43 @@ func (s *Store) AllowRequest(ctx context.Context, scope, subject string, max int
 	default:
 		return false, remaining, wrap("rate limit", err)
 	}
+}
+
+// ResetRateLimit clears the counter of (scope, subject) for the window now falls
+// in, so the subject's next AllowRequest in that window starts at zero.
+//
+// It exists for one caller, cmd/auth's per-account cap on failed second-factor
+// checks (secondfactor_cap.go), which reserves each check with AllowRequest
+// before the check runs — the conditional increment is what keeps concurrent
+// guesses from all slipping under the cap — and clears the count when a check
+// succeeds. The rate limiter proper never resets anything: its local
+// pre-filter is sound only while a window's count never goes down (see
+// cmd/auth ratelimit.go), so a scope that is ever reset must not be counted
+// through that pre-filter, and the cap does not.
+//
+// One DeleteItem on the current window's item, unconditional: deleting an item
+// that does not exist is not an error, and a past window needs no reset
+// because nothing reads it. The window is passed rather than remembered,
+// because the item's key depends on it. The error is the store failing.
+func (s *Store) ResetRateLimit(ctx context.Context, scope, subject string, window time.Duration) error {
+	if err := checkRateLimitScope(scope); err != nil {
+		return err
+	}
+	if err := checkRateLimitSubject(subject); err != nil {
+		return err
+	}
+	if window <= 0 {
+		return fmt.Errorf("dynamodb: rate-limit window must be positive, got %s", window)
+	}
+	index, _ := rateLimitWindow(s.now().UTC(), window)
+	_, err := s.api.DeleteItem(ctx, &awsddb.DeleteItemInput{
+		TableName: aws.String(s.table),
+		Key:       key(rateLimitPK(scope, subject, index), skRateLimit),
+	})
+	if err != nil {
+		return wrap("rate limit reset", err)
+	}
+	return nil
 }
 
 // rateLimitWindow returns the index of the fixed window now falls in, and the

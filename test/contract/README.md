@@ -32,12 +32,15 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential,tools,tools-guarded,tools-telemetry,tools-docs,webhook-receiver,tools-inbound-webhooks,sse,sse-resume`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,registration-closed,csrf,secure-cookies,sessions,totp,2fa-required,2fa-enrol-on-login,linked-accounts,oauth-google,idp,docs,ui,rate-limit,admin,admin-session,admin-credential,tools,tools-guarded,tools-telemetry,tools-docs,webhook-receiver,tools-inbound-webhooks,sse,sse-resume`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 | `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_PATH` | Where the admin console is mounted, as an absolute path. Default `/admin`, the same default the reference's swagger base and this product's `admin.basePath` use. |
 | `AWESOME_AUTH_CONTRACT_ADMIN_EMAIL` + `AWESOME_AUTH_CONTRACT_ADMIN_PASSWORD` | An account the console admits — the configured root user, or a user the operator promoted. **Opt-in and unset by default**, because the suite cannot mint an administrator. Both or neither: one without the other is a fault. See below. |
 | `AWESOME_AUTH_CONTRACT_SSE_URL` (D9c) | The SSE function's Function URL origin — the stack's `SseFunctionUrl` output without its trailing slash. With it, the `sse/` cases run against the Function URL as well as against `<base><tools>/stream` (the CloudFront behaviour), so an edge that starts buffering the stream is told apart from a protocol break. Unset, the stream is tried on the base URL alone, which on a stack without CloudFront answers 404 and records `sse` absent; `sse-resume` is this product's added guarantee and is recorded absent against the reference. See `cases_sse_test.go`. |
 | `AWESOME_AUTH_CONTRACT_TOOLS_PATH` | Where the tools router is mounted. Default `/tools`, the reference's own `swaggerBasePath` default, beside the api prefix; a deployment that followed the Angular demo and mounted it under the prefix at `<apiPrefix>/tools` sets this to `/auth/tools`. |
+| `AWESOME_AUTH_CONTRACT_REGISTRATION` | `open` (the default) or `closed`: declares a realm whose `POST <prefix>/register` is closed (`registration.closed`). Declared, not inferred from a `404`, because without it a `404` stands the suite down as before. Needs the realm account below. See *Realm modes*. |
+| `AWESOME_AUTH_CONTRACT_2FA` | `optional` (the default) or `required`: declares a realm whose login demands a second factor (`twoFactor.required`). Needs the realm account below. See *Realm modes*. |
+| `AWESOME_AUTH_CONTRACT_REALM_EMAIL` + `AWESOME_AUTH_CONTRACT_REALM_PASSWORD` (+ `AWESOME_AUTH_CONTRACT_REALM_TOTP_SECRET`) | An account the operator created in a closed or 2FA-required realm, and the base32 TOTP secret it is enrolled with. **Required with either declaration and refused without one**; half-declared is a fault. The suite signs it in — completing its challenge — and never changes it. |
 | `AWESOME_AUTH_CONTRACT_WEBHOOK_RECEIVER_URL` + `AWESOME_AUTH_CONTRACT_WEBHOOK_LISTEN` (D9b) | A public URL the deployment can POST to, tunnelled to the address the suite listens on (default `:8787`). **Opt-in and unset by default**, because a Lambda cannot reach the machine running the suite; with it, `tools/outgoing-webhook-reaches-the-receiver-signed` subscribes through the admin API, logs in, and verifies the signed delivery. Needs the admin credential above too. See `cases_webhook_test.go`. |
 
 All of them are passed through `scripts/toolchain.sh` into the container.
@@ -99,7 +102,8 @@ it registers the accounts it needs through `POST <prefix>/register` and throws
 them away. Addresses are random under `@contract.invalid` — a reserved TLD
 (RFC 2606) — so a stack with a live mailer cannot be made to send real mail by
 running this. If registration is not mounted, the whole suite skips with that
-reason rather than failing.
+reason rather than failing — unless the realm is declared closed, in which case
+it runs on an account the operator declares (see *Realm modes*).
 
 **It reads the deployment instead of assuming one.** A probe runs once at the
 start and reports what this stack offers:
@@ -530,6 +534,81 @@ the login is fanned out whatever the posture.
 | Case | Pins | Needs |
 |---|---|---|
 | `tools/outgoing-webhook-reaches-the-receiver-signed` | the product deviation `library-events-are-bridged-into-the-tools-fan-out` — a login reaches a subscription to `identity.auth.login.success`, which a reference deployment never does, so there it fails by timing out — and the reference's delivery wire (`webhook-sender.ts:17-48`): at least one POST (queued delivery is at-least-once) with `X-Webhook-Event` equal to the body's `event`, a lowercase v4 `X-Webhook-Delivery`, `X-Webhook-Timestamp` in `toISOString` form equal to the body's `timestamp`, an envelope of exactly `event`/`version`/`timestamp`/`data`/`metadata`, and `X-Webhook-Signature: sha256=<hex HMAC-SHA256(secret, raw body)>` for the secret the suite chose | `admin`, `admin-session`, `admin-credential`, `webhook-receiver` |
+
+## Realm modes
+
+An invite-only realm — registration closed, a second factor demanded at
+login, the staff realm of a deployment — refuses the two things the suite is
+built on: it cannot register an account, and it cannot sign one in with a
+password alone. So the operator declares the realm and an account in it,
+exactly as the admin credential is declared, and the suite runs what that
+realm lets a client see:
+
+```sh
+AWESOME_AUTH_CONTRACT_BASE_URL=https://<front door of the staff realm> \
+AWESOME_AUTH_CONTRACT_REGISTRATION=closed \
+AWESOME_AUTH_CONTRACT_2FA=required \
+AWESOME_AUTH_CONTRACT_REALM_EMAIL=contract-staff@example.org \
+AWESOME_AUTH_CONTRACT_REALM_PASSWORD=… \
+AWESOME_AUTH_CONTRACT_REALM_TOTP_SECRET=… \
+AWESOME_AUTH_CONTRACT_REQUIRE=registration-closed,2fa-required,csrf,secure-cookies,sessions,totp \
+  ./scripts/toolchain.sh go test -count=1 -v ./test/contract/...
+```
+
+What a declaration changes, and nothing changes without one:
+
+- **The probe pass runs on the declared account.** It is signed in — its TOTP
+  challenge completed with the declared secret — instead of a registered one,
+  so `csrf`, `sessions`, `totp` and the rest are probed exactly as before. The
+  account is created out of band (an invitation, the admin console,
+  `cmd/migrate`) and enrolled before the run; the suite never enrols it,
+  disables its factor, changes its password or email, or deletes it, and signs
+  it in as few times as the pass allows, because the login route is rate
+  limited per account.
+- **`registration-closed` is the declared closure, verified.** It is settled by
+  the `register` probe from the same request: `on` when `POST <prefix>/register`
+  answers `404`, **`BROKEN`** when a realm declared closed registers anyone.
+  `register` is then `absent`, so `REQUIRE=register` fails a closed realm, as it
+  should.
+- **`2fa-required` is the declared policy — every session proves a TOTP code —
+  verified as far as the realm lets it be seen.** The declared account must be
+  challenged, never signed in on its password, and for TOTP alone:
+  `available2faMethods` must be `["totp"]`, because an emailed link or a texted
+  code offered as the second step lets a mailbox (which also receives the reset
+  link) or a phone answer for the factor. On an open realm a fresh account's
+  password must answer `403 2FA_SETUP_REQUIRED`, whatever transports are wired.
+  A session on a password alone, a challenge offering anything but TOTP, or a
+  fresh account challenged instead of told to enrol is `BROKEN`. What a closed
+  realm answers an account with no factor cannot be observed, because it has
+  none to offer; the probe says so.
+- **`2fa-enrol-on-login`** (`twoFactor.enrolOnLogin`) is probed on an open
+  2FA-required realm: `POST /2fa/setup` with the fresh account's setup-required
+  token answers a secret (`on`) or is refused (`absent`). It stores nothing.
+- **A declared admin credential is `absent` on a 2FA-required realm**, with that
+  reason: the credentialed console cases sign in at `POST <admin>/login`, which
+  such a realm does not serve (the console admits a session from `POST /login`
+  and its factor instead), so they cannot run there.
+- **Every case that provisions an account of its own skips**, with that reason
+  on the list at the end of the run: `Env.NewAccount` — and `LoginCookie` and
+  `LoginBearer` through it — registers through the route a closed realm
+  refuses, or signs in with a password alone. Those cases are covered against
+  an open realm of the same build; the ones below are written for these realms.
+
+A misdeclared run fails rather than skipping: an unknown value, a half-declared
+account, a declaration with no account, or an account with no declaration. And
+a 2FA-required realm run with no declaration fails at the probe pass, naming
+the variables to set.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `registration/closed-realm-refuses-self-registration` | `POST <prefix>/register` answers the router's `404` in cookie and bearer mode, sets no session cookie, and the address it named cannot sign in — the reference's deployment with no `onRegister` hook (`auth.router.ts:712-715`) | `registration-closed` |
+| `registration/closed-realm-hides-sign-up-from-the-ui` | `GET <prefix>/ui/config` answers `features.register: false` (`ui.router.ts:115`), which is what hides the hosted login page's sign-up link | `registration-closed`, `ui` |
+| `registration/closed-realm-documents-no-sign-up` | the served OpenAPI document has no `<base>/register` path | `registration-closed`, `docs` |
+| `2fa-required/password-alone-opens-no-session` | the declared account's password login is the challenge in both modes, offering `["totp"]` alone — no token in the body, no session cookie, `GET /me` still `403 No access token provided` — and its TOTP code completes it with `isTotpEnabled: true`; on an open realm a fresh account's login is `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`, sets no session cookie, and its token opens nothing, whatever transports are wired | `2fa-required` |
+| `2fa-required/setup-token-enrols-and-opens-the-session` | the setup-required token, as `Authorization: Bearer`, enrols through `/2fa/setup` and `/2fa/verify-setup` and the latter opens the session — cookies in cookie mode, top-level tokens and no cookie in bearer mode — with `isTotpEnabled: true`; a replay is `401 INVALID_TEMP_TOKEN`; the next login is the challenge. The core's `forced-enrolment-opens-a-session` | `2fa-required`, `2fa-enrol-on-login` |
+| `2fa-required/disable-is-refused` | `POST /2fa/disable` is `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}` under the policy, driven on a fresh account enrolled at login and never on the declared one | `2fa-required`, `2fa-enrol-on-login` |
+| `2fa-required/one-factor-sign-ins-are-refused` | `POST /magic-link/send`, `/magic-link/verify`, `/sms/send` and `/sms/verify` answer `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}` in every mode — the login mode in cookie and bearer mode with no session cookie, and the step-up (`mode: "2fa"`) with the tempToken of the declared account's genuine challenge, because a TOTP code is the only second factor — and so does `POST /link-verify` with `loginAfterLinking`, whatever transports and stores the deployment has. Product deviation `two-factor-required-refuses-one-factor-sign-ins` | `2fa-required` |
+| `2fa-required/console-login-is-not-served` | `POST <admin>/login` answers the router's `404` and sets nothing; the console is entered with a session from `POST /login` and its factor | `2fa-required`, `admin-session` |
 
 ## Adding a case
 

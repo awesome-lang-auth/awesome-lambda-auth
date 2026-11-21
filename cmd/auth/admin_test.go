@@ -275,6 +275,18 @@ func TestAdminHTTPOptionsCarryTheWholeBlock(t *testing.T) {
 	if plain.CookiePrefix != nil {
 		t.Errorf("CookiePrefix = %q for an unset knob, want nil", *plain.CookiePrefix)
 	}
+	// No principal is no machine access: nil is the reference's guard.
+	if plain.MachineAccess != nil {
+		t.Error("MachineAccess is set with no admin.machineAccess.iam.principals")
+	}
+	if got.MachineAccess != nil {
+		t.Error("MachineAccess is set for a document that configures no principal")
+	}
+	withMachine := adminHTTPOptions(loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", "arn:aws:iam::123456789012:role/identity-service")))
+	if withMachine.MachineAccess == nil {
+		t.Error("MachineAccess is nil with a principal configured")
+	}
 }
 
 func TestAdminAccessPolicyMapsEverySpelling(t *testing.T) {
@@ -1090,6 +1102,39 @@ func TestAdminUserDetailSpansTenants(t *testing.T) {
 	rec := s.call(t, http.MethodGet, "/admin/api/users/usr_nobody", nil, withCookie(cookie))
 	if rec.Code != http.StatusNotFound || decodeJSON(t, rec)["error"] != "User not found" {
 		t.Errorf("detail of an unknown id answered %d %s, want 404 {\"error\":\"User not found\"}", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminUserWritesReachTheTenantTheListingShows: since the v0.14.0 pin the
+// two console writes that address a user by id — POST <admin>/users/{id}/promote
+// with method=flag and DELETE <admin>/api/users/{id} — resolve the tenant
+// through auth.UserLookupStore before they write, as the detail route already
+// did. Through v0.13.0 both passed the empty tenant, found no row for a user
+// stored under one and answered 500. It widens what an administrator can write
+// (docs/deviations.md, admin-user-detail-spans-tenants-only-through-a-lookup-store),
+// which is why it is pinned here rather than taken on trust from the pin.
+func TestAdminUserWritesReachTheTenantTheListingShows(t *testing.T) {
+	t.Parallel()
+	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin)), Options{}, nil)
+	cookie := s.rootLogin(t)
+	ctx := context.Background()
+	const tenantedID = "usr_0000000000000000000000000writes"
+	if _, err := s.stores.CreateUser(ctx, auth.User{ID: tenantedID, Email: "writes@acme.test", TenantID: "acme"}); err != nil {
+		t.Fatalf("create a tenanted user: %v", err)
+	}
+
+	if rec := s.call(t, http.MethodPost, "/admin/users/"+tenantedID+"/promote", map[string]string{"method": "flag"}, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Fatalf("promote with method=flag of a user under tenant acme answered %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if u, err := s.stores.GetUserByID(ctx, tenantedID, "acme"); err != nil || !u.IsAdmin {
+		t.Fatalf("after the promote the row under tenant acme reads isAdmin=%v (err %v), want true", u.IsAdmin, err)
+	}
+
+	if rec := s.call(t, http.MethodDelete, "/admin/api/users/"+tenantedID, nil, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE of a user under tenant acme answered %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.stores.GetUserByID(ctx, tenantedID, "acme"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Errorf("after the DELETE the row under tenant acme is still readable (err %v), want auth.ErrUserNotFound", err)
 	}
 }
 

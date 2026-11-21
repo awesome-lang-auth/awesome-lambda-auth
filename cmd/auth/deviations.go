@@ -169,7 +169,8 @@ func WireDeviations() []WireDeviation {
 			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled",
 			Behaviour: "The callback issues a session and redirects, for every account it resolves. " +
 				"An account whose POST /login answers the second-factor challenge is signed in " +
-				"through a provider without presenting one.",
+				"through a provider without presenting one. Under twoFactor.required it would be every " +
+				"account, so that combination does not start: RS-20 refuses oauth.providers beside the policy.",
 			Reference: "The callback is 2FA-aware: such an account is redirected to " +
 				"${redirectTo}/auth/2fa?tempToken=<jwt>&methods=<list> with no session issued " +
 				"(src/router/auth.router.ts:1298-1313).",
@@ -177,11 +178,13 @@ func WireDeviations() []WireDeviation {
 				"second-factor branch, and the rule against forking the core stands. It is " +
 				"registered rather than left in a comment because wiring oauth.providers is what " +
 				"makes it reachable at all -- before P4 the route answered the not-configured stub -- " +
-				"and an operator who requires 2FA has to learn this from the cold-start log rather " +
-				"than from an incident. cmd/auth/oauth_test.go " +
+				"and an operator whose accounts enrol a factor has to learn this from the cold-start log " +
+				"rather than from an incident. Nothing in front of the callback can turn its session into " +
+				"a challenge, which is why the deployment-wide policy refuses the provider instead of " +
+				"gating the route (RS-20, docs/spec/decisions.md D-27). cmd/auth/oauth_test.go " +
 				"TestOAuthCallbackIssuesASessionEvenForATwoFactorAccount fails the day upstream " +
-				"grows the branch, which is when this entry is retired.",
-			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §8.4",
+				"grows the branch, which is when this entry is retired and RS-20 can let providers back in.",
+			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §7.1 and §8.4",
 		},
 		{
 			ID: "rate-limited-routes-answer-429",
@@ -203,7 +206,14 @@ func WireDeviations() []WireDeviation {
 				"The promote route shares the budget, the window " +
 				"and the switch, runs its limiter ahead of the admin guard, and is keyed by the client address under either " +
 				"keyBy: its body names how to promote and its path names the person being promoted, and neither is a subject " +
-				"a caller should be able to mint budgets with. The admin login is deliberately not limited, on either line. " +
+				"a caller should be able to mint budgets with. POST <admin>/login is limited under its own scope, admin-login, " +
+				"with the same budget, window and keyBy rule as POST <prefix>/login: the body's email read the way the login " +
+				"reads it, and the client address for the bootstrap arm's empty email. " +
+				"The checks of a second factor -- POST <prefix>/2fa/verify, /magic-link/verify and /sms/verify in mode \"2fa\", " +
+				"and /2fa/verify-setup with an enrolment token -- are also counted against the account a verified token names, " +
+				"across every challenge, login and address (twoFactor.lockout, by default 10 failed checks per account per " +
+				"86400-second window, its own switch), and over that count answer this same 429 until the window ends; a " +
+				"successful check clears it. " +
 				// D9d
 				"The inbound-webhook route shares the budget, the window and the switch, runs its limiter before the core looks the " +
 				"provider up, and is keyed by the client address and a hash of the provider under either keyBy, because every request " +
@@ -249,10 +259,12 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID:      "admin-login-skips-the-second-factor",
-			Surface: "POST <admin>/login, for an account with a second factor enabled or a deployment whose settings require one",
+			Surface: "POST <admin>/login, for an account with a second factor enabled or a deployment whose settings store's require2FA requires one",
 			Behaviour: "The route mints a 24-hour admin token on email and password alone. It consults neither the account's " +
-				"enrolment nor the settings store's require2FA, so an account that POST <prefix>/login would challenge for a " +
-				"TOTP or SMS code is signed into the console without one. The product puts the rateLimit block in front of the " +
+				"enrolment nor the settings store's require2FA, so an account that POST <prefix>/login would challenge for a TOTP " +
+				"or SMS code is signed into the console without one. Under twoFactor.required the route is not served at all " +
+				"(two-factor-required-refuses-one-factor-sign-ins) and the console admits a session from POST <prefix>/login. " +
+				"The product puts the rateLimit block in front of the " +
 				"route -- same budget, same window, same keyBy rule as POST <prefix>/login, its own counter scope -- and " +
 				"documents admin.loginPath, pointed at the hosted login, as the way a browser reaches the console through the " +
 				"flow that does enforce the second factor.",
@@ -268,8 +280,8 @@ func WireDeviations() []WireDeviation {
 				"requires 2FA has to learn it from the register and not from an incident. What the product can add without a " +
 				"route it adds: the limiter, because the route was otherwise an unlimited password oracle for every user in " +
 				"the empty tenant, and for the bootstrap secret a constant-time compare with no bcrypt cost at all; and RS-6's " +
-				"length floor on that secret. cmd/auth/admin_test.go TestAdminLoginSkipsTheSecondFactor fails the day upstream " +
-				"makes the login honour TwoFactorPolicy, which is when this entry is retired.",
+				"length floor on that secret. cmd/auth/admin_test.go TestAdminLoginSkipsTheSecondFactor fails the day upstream makes " +
+				"the login honour the account's factor, which is when this entry is retired.",
 			Spec: "docs/config-reference.md §16.2 and §16.7; upstream deviation admin-guard-accepts-only-typed-session-tokens",
 		},
 		{
@@ -781,6 +793,42 @@ func WireDeviations() []WireDeviation {
 				"front door never sees it. cmd/auth/origin_verify_test.go TestOriginVerifyRefusesWhatDidNotComeThroughTheFrontDoor " +
 				"pins the status, the empty body and the absent headers.",
 			Spec: "docs/config-reference.md §19; docs/spec/decisions.md D-23; infra/sam/README.md (Origin verification)",
+		},
+		{
+			ID: "two-factor-required-refuses-one-factor-sign-ins",
+			Surface: "under twoFactor.required: POST <prefix>/magic-link/send, /magic-link/verify, /sms/send and /sms/verify in every mode; " +
+				"the login challenge's available2faMethods and GET <prefix>/ui/config's features.magicLink and features.sms; " +
+				"POST <prefix>/link-verify with loginAfterLinking; POST <admin>/login",
+			Behaviour: "The four passwordless routes answer 403 {\"error\":\"Two-factor authentication required\",\"code\":\"2FA_REQUIRED\"} " +
+				"in every mode -- the login mode and the step-up (mode \"2fa\", with the password login's tempToken) alike -- " +
+				"before anything is minted, sent or consumed, and the magic-link and SMS-code senders are not handed to the core: " +
+				"the challenge lists totp alone, an account with no TOTP is answered 403 2FA_SETUP_REQUIRED whatever transports " +
+				"are wired, and ui/config reports magicLink and sms false. The reset, verification and email-change mails go out " +
+				"as before. POST <prefix>/link-verify answers the same 403 when loginAfterLinking is set, before the link token is " +
+				"read, and links without it as before. POST <admin>/login answers the router's bare 404, the core's answer wherever " +
+				"the route is not mounted; the console still admits the access token of a session that came through POST <prefix>/login " +
+				"and its TOTP code, and admin.machineAccess. Without twoFactor.required nothing changes.",
+			Reference: "There is no deployment-wide second-factor policy (the core's config-require2fa-is-a-system-policy-term): " +
+				"magic-link and SMS verify in login mode open a session on the delivered credential alone (the magic link's two " +
+				"branches at awesome-node-auth v1.10.8 auth.router.ts:1747-1767), the challenge offers magic-link wherever mail is " +
+				"configured and sms to an account with a number (:556-559), and either completes it; /link-verify with " +
+				"loginAfterLinking opens a session on the link token, and the console's login mints its token on a password " +
+				"(src/router/admin.router.ts:543-616).",
+			Why: "twoFactor.required promises that every session proved a TOTP code, and the core keeps a narrower promise at POST " +
+				"<prefix>/login alone: a second step of any kind, the emailed link and the texted code included. The mailbox that " +
+				"receives the link also receives the password-reset link, so with the link a second step the mailbox alone answered " +
+				"both (review of 872008e: forgot-password, reset-password, login, then the step-up link, and a session with TOTP " +
+				"never presented), and a phone number answered the second. So neither is a factor under the policy: the senders are " +
+				"withheld, which is the core's own switch for what the challenge offers, and the routes refused in every mode, which " +
+				"also covers a link or a code minted before the policy was switched on. The other doors open a session on a single " +
+				"factor -- the link token, the password -- and each is one request the product can recognise and refuse before the " +
+				"core acts, without forking it: linking does not need a session, and the console has a door that asks for the " +
+				"factor. Refusing the transports at start instead would have taken the password reset with them, and refusing the " +
+				"console would have taken machine access. The gate classifies a request by asking the router which pattern serves " +
+				"it, and reads /link-verify's body with the core's own decoding, so a spelling or a body the core accepts cannot walk " +
+				"around it. cmd/auth/secondfactor_test.go pins each door against a credential that opened a session before, with the " +
+				"TOTP code as the control.",
+			Spec: "docs/config-reference.md §7.1; docs/spec/decisions.md D-27; internal/config RS-20",
 		},
 	}
 }

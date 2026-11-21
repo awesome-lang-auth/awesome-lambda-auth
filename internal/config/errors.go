@@ -112,6 +112,44 @@ const (
 	// `none` need Secure; this one makes it and the console exclusive.
 	RuleAdminCrossSiteCookie = "RS-18"
 
+	// RuleClosedRegistrationOAuth refuses registration.closed beside an OAuth
+	// provider whose callback still creates accounts for anyone:
+	// oauth.provisioning.autoCreate on, which is its default, with no
+	// allowedEmailDomains to narrow it, or narrowed by domain while
+	// oauth.provisioning.requireVerifiedEmail is off, so that the domain is
+	// matched on whatever address the provider asserts. Closing POST
+	// <prefix>/register closes one of two self-registration doors (the core
+	// says so on HTTPConfig.ClosedRegistration), and a realm configured as
+	// invite-only whose Sign-in-with-Google signs up the whole internet is the
+	// silent misconfiguration this table exists for. A product rule: the
+	// reference has no closed-registration knob to combine with anything.
+	RuleClosedRegistrationOAuth = "RS-19"
+
+	// RuleTwoFactorRequiredSignIn refuses twoFactor.required beside a sign-in
+	// that cannot be held to the second factor: an OAuth provider, whose
+	// callback the imported core completes with a session and no second-factor
+	// branch; the two console credentials whose only door is
+	// POST <admin>/login — admin.rootUser and admin.bootstrapSecret — which
+	// the product does not serve under the policy; and an open console
+	// (admin.accessPolicy: open), which asks for no credential at all. The
+	// passwordless routes, /link-verify's loginAfterLinking and
+	// POST <admin>/login itself are held to the policy at request time instead
+	// (cmd/auth secondFactorGate), so they are not refused here. A product
+	// rule: the reference has no deployment-level 2FA policy (core
+	// config-require2fa-is-a-system-policy-term).
+	RuleTwoFactorRequiredSignIn = "RS-20"
+
+	// RuleClosedRegistrationDualRead refuses registration.closed beside
+	// stores.migration.mode: dual-read. Dual-read creates the local account
+	// for any address the source pool holds on an unauthenticated lookup — a
+	// POST <prefix>/login or /forgot-password naming it — and the pool's own
+	// state is not consulted: a user disabled or unconfirmed in the pool is
+	// provisioned like any other, and on a pool that allows self sign-up the
+	// pool's sign-up becomes this realm's. So the realm would not be closed
+	// for the length of the migration window, whatever registration.closed
+	// says. A product rule: the reference has neither knob.
+	RuleClosedRegistrationDualRead = "RS-21"
+
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start
 	// with the same posture as any §2 rule.

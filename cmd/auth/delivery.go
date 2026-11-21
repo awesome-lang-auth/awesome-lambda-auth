@@ -94,6 +94,28 @@ import (
 // start without a mailer. A deployment serving bearer clients that never touch
 // a passwordless route is legitimate, and upstream's Config.validate agrees: it
 // does not ask for a sender either.
+//
+// ── under twoFactor.required ─────────────────────────────────────────────────
+//
+// Two of the five seams are not handed to the core at all: the magic link and
+// the SMS code. The core counts each as a second factor wherever it can
+// deliver one — availableTwoFactorMethods offers "magic-link" to every
+// challenged account when Config.SendMagicLink is set, and "sms" to every one
+// with a number when Config.SendSMSCode is — and the same mailbox receives the
+// password-reset link, so with the seams wired a mailbox alone (reset, then the
+// emailed step-up) or a phone number would answer both steps. Under the policy
+// a TOTP code is the only second factor: without the two senders the challenge
+// lists "totp" alone, an account with no TOTP is answered 2FA_SETUP_REQUIRED
+// (and enrols, under twoFactor.enrolOnLogin) instead of being challenged for a
+// link, and GET <prefix>/ui/config reports features.magicLink and features.sms
+// false, so the hosted page offers neither. The four routes stay mounted and
+// secondFactorGate answers them 403 2FA_REQUIRED in every mode before the core
+// sees them, which also covers a link or a code minted before the policy was
+// switched on. The other three seams — reset, verification, email change —
+// and the email-changed notice are wired as ever: a reset changes a password
+// and opens no session, so the next login still asks for TOTP — except that
+// under twoFactor.enrolOnLogin an account that has not enrolled yet then
+// enrols one of the resetter's choosing (trust on first use, warned).
 
 // delivery holds the transports a cold start could build, plus everything the
 // upstream mailers need to render with. A nil transport means "this deployment
@@ -120,15 +142,20 @@ type delivery struct {
 	appName string
 	baseURL string
 	locale  string
+
+	// passwordlessWithheld is twoFactor.required: the magic-link and SMS-code
+	// senders are not handed to the core, whatever transports exist. See the
+	// file header, "under twoFactor.required".
+	passwordlessWithheld bool
 }
 
 // webhookConfigured is the third enable signal, and like the other two it is
 // validation's own: validate.go refuses a delivery webhook url without its
 // signing secret and a secret without a url, so a non-empty url is exactly "the
-// operator configured a signed receiver and it passed validation".
-func webhookConfigured(cfg *config.Config) bool {
-	return strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
-}
+// operator configured a signed receiver and it passed validation". It is
+// config.DeliveryWebhookConfigured, which the loader's twoFactor.required
+// warning reads too.
+func webhookConfigured(cfg *config.Config) bool { return cfg.DeliveryWebhookConfigured() }
 
 // mailConfigured and smsConfigured are the enable signals, and they are the
 // schema's own rather than a new knob.
@@ -139,9 +166,10 @@ func webhookConfigured(cfg *config.Config) bool {
 // configured a mailer and it passed validation", and a non-empty sms endpoint is
 // exactly the same statement about SMS. Deriving the signal from validation
 // instead of re-implementing "is this block non-default" means the two can never
-// disagree about whether a deployment sends mail.
-func mailConfigured(cfg *config.Config) bool { return strings.TrimSpace(cfg.Email.Mailer.From) != "" }
-func smsConfigured(cfg *config.Config) bool  { return strings.TrimSpace(cfg.SMS.Endpoint) != "" }
+// disagree about whether a deployment sends mail. Both are the config package's
+// own predicates, which the loader's twoFactor.required warning reads too.
+func mailConfigured(cfg *config.Config) bool { return cfg.MailerConfigured() }
+func smsConfigured(cfg *config.Config) bool  { return cfg.SMSConfigured() }
 
 // newDelivery builds the transports this configuration asks for.
 //
@@ -168,6 +196,8 @@ func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTran
 		// siteUrl and is warned about below.
 		baseURL: strings.TrimSuffix(httpConfig(cfg).UILink(canonical, ""), "/"),
 		locale:  cfg.Email.Mailer.DefaultLang,
+
+		passwordlessWithheld: cfg.TwoFactor.Required,
 	}
 
 	if mailConfigured(cfg) {
@@ -257,6 +287,10 @@ func mailerAppName(cfg *config.Config) string {
 // call is made for those routes even when the mailer or sms block is also
 // configured. Those blocks still serve the email-changed notice — the webhook
 // has no seam for it — and, through oauthOptions, the link-token mail.
+//
+// Under twoFactor.required the magic-link and SMS-code seams are left unwired
+// whichever transport would have carried them (d.passwordlessWithheld; the
+// file header says why), and the line below says so.
 func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 	var opts []auth.Option
 
@@ -266,17 +300,19 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 		// does one thing: keep the receiver's URL out of the error the core
 		// logs. See scrubbedWebhookError.
 		receiver := d.webhook.URL
+		if !d.passwordlessWithheld {
+			opts = append(opts,
+				auth.WithMagicLinkSender(scrubbedSender(d.webhook.SendMagicLink, receiver)),
+				auth.WithSMSCodeSender(scrubbedSender(d.webhook.SendSMSCode, receiver)),
+			)
+		}
 		opts = append(opts,
-			auth.WithMagicLinkSender(scrubbedSender(d.webhook.SendMagicLink, receiver)),
 			auth.WithPasswordResetSender(scrubbedSender(d.webhook.SendPasswordReset, receiver)),
 			auth.WithEmailVerificationSender(scrubbedSender(d.webhook.SendEmailVerification, receiver)),
 			auth.WithEmailChangeSender(scrubbedSender(d.webhook.SendEmailChange, receiver)),
-			auth.WithSMSCodeSender(scrubbedSender(d.webhook.SendSMSCode, receiver)),
 		)
 	default:
 		if d.mail != nil {
-			magic := auth.NewMagicLinkMailer(d.mail, d.appName, d.baseURL)
-			magic.Locale = d.locale
 			reset := auth.NewPasswordResetMailer(d.mail, d.appName, d.baseURL)
 			reset.Locale = d.locale
 			verify := auth.NewEmailVerificationMailer(d.mail, d.appName, d.baseURL)
@@ -284,14 +320,18 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 			change := auth.NewEmailChangeMailer(d.mail, d.appName, d.baseURL)
 			change.Locale = d.locale
 
+			if !d.passwordlessWithheld {
+				magic := auth.NewMagicLinkMailer(d.mail, d.appName, d.baseURL)
+				magic.Locale = d.locale
+				opts = append(opts, auth.WithMagicLinkSender(magic.Send))
+			}
 			opts = append(opts,
-				auth.WithMagicLinkSender(magic.Send),
 				auth.WithPasswordResetSender(reset.Send),
 				auth.WithEmailVerificationSender(verify.Send),
 				auth.WithEmailChangeSender(change.Send),
 			)
 		}
-		if d.sms != nil {
+		if d.sms != nil && !d.passwordlessWithheld {
 			opts = append(opts, auth.WithSMSCodeSender(auth.SMSTransportSender(d.sms)))
 		}
 	}
@@ -312,6 +352,11 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 	// transport name appears only when that half is actually on, so the line
 	// cannot be misread as "mail is wired" by someone skimming for "ses".
 	mailTransport, smsTransport := "none — POST /magic-link/send answers 500 EMAIL_NOT_CONFIGURED", "none — POST /sms/send answers 500 SMS_NOT_CONFIGURED"
+	if d.passwordlessWithheld {
+		// Neither route reaches the core under the policy, so neither answers
+		// the coded 500: the gate answers both 403 2FA_REQUIRED first.
+		mailTransport, smsTransport = "none", "none"
+	}
 	if d.mail != nil {
 		mailTransport = "ses"
 	}
@@ -330,13 +375,27 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 		mailTransport, smsTransport = "webhook", "webhook"
 		webhook = webhookOrigin(d.webhook.URL)
 	}
-	log.Info("credential delivery wired",
-		slog.String("mailTransport", mailTransport),
-		slog.String("smsTransport", smsTransport),
+	attrs := []any{slog.String("mailTransport", mailTransport)}
+	if d.passwordlessWithheld {
+		// The texted code is the SMS half's one credential seam, so under the
+		// policy that half carries no credential whatever is configured, and
+		// the field must not read "sns" or "webhook". The mail half carries the
+		// reset, verification and change mails, and no magic link.
+		if smsTransport != "none" {
+			smsTransport = "withheld — " + smsTransport + " is configured, and the texted code, its one credential seam, is not handed to the core under twoFactor.required"
+		}
+		attrs = append(attrs,
+			slog.String("smsTransport", smsTransport),
+			slog.String("magicLinkAndSMSCode", "withheld under twoFactor.required: a TOTP code is the only second factor, so no link or code is minted or sent, "+
+				"the login challenge offers totp alone, and POST /magic-link/{send,verify} and /sms/{send,verify} answer 403 2FA_REQUIRED in every mode"))
+	} else {
+		attrs = append(attrs, slog.String("smsTransport", smsTransport))
+	}
+	log.Info("credential delivery wired", append(attrs,
 		slog.String("emailChangedNotice", noticeTransport),
 		slog.String("deliveryWebhook", webhook),
 		slog.String("linkBase", d.baseURL),
-		slog.String("locale", d.locale))
+		slog.String("locale", d.locale))...)
 
 	return opts
 }
