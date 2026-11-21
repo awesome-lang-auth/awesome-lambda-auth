@@ -572,14 +572,16 @@ What a declaration changes, and nothing changes without one:
   should.
 - **`2fa-required` is the declared policy, verified as far as the realm lets
   it be seen.** The declared account must be challenged, never signed in on its
-  password; on an open realm a fresh account's login must also answer
-  `403 2FA_SETUP_REQUIRED`. Either failing is `BROKEN`. What a closed realm
-  answers an account with no factor cannot be observed, because it has none to
-  offer; the probe says so.
+  password; on an open realm a fresh account's password must open no session
+  either — `403 2FA_SETUP_REQUIRED`, or, where a mail or SMS transport makes the
+  emailed link or texted code a factor the core counts, the challenge. A session
+  on a password alone is `BROKEN`. What a closed realm answers an account with
+  no factor cannot be observed, because it has none to offer; the probe says so.
 - **`2fa-enrol-on-login`** (`twoFactor.enrolOnLogin`) is probed on an open
-  2FA-required realm only: `POST /2fa/setup` with a fresh account's
-  setup-required token answers a secret (`on`) or is refused (`absent`). It
-  stores nothing.
+  2FA-required realm whose fresh account is told to enrol: `POST /2fa/setup`
+  with its setup-required token answers a secret (`on`) or is refused
+  (`absent`). It stores nothing. Where the fresh account is challenged instead,
+  it is `absent` with that reason.
 - **Every case that provisions an account of its own skips**, with that reason
   on the list at the end of the run: `Env.NewAccount` — and `LoginCookie` and
   `LoginBearer` through it — registers through the route a closed realm
@@ -596,7 +598,7 @@ the variables to set.
 | `registration/closed-realm-refuses-self-registration` | `POST <prefix>/register` answers the router's `404` in cookie and bearer mode, sets no session cookie, and the address it named cannot sign in — the reference's deployment with no `onRegister` hook (`auth.router.ts:712-715`) | `registration-closed` |
 | `registration/closed-realm-hides-sign-up-from-the-ui` | `GET <prefix>/ui/config` answers `features.register: false` (`ui.router.ts:115`), which is what hides the hosted login page's sign-up link | `registration-closed`, `ui` |
 | `registration/closed-realm-documents-no-sign-up` | the served OpenAPI document has no `<base>/register` path | `registration-closed`, `docs` |
-| `2fa-required/password-alone-opens-no-session` | the declared account's password login is the challenge in both modes — no token in the body, no session cookie, `GET /me` still `403 No access token provided` — and its factor completes it with `isTotpEnabled: true`; on an open realm a fresh account's login is `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`, sets no session cookie, and its token opens nothing | `2fa-required` |
+| `2fa-required/password-alone-opens-no-session` | the declared account's password login is the challenge in both modes — no token in the body, no session cookie, `GET /me` still `403 No access token provided` — and its factor completes it with `isTotpEnabled: true`; on an open realm a fresh account's login sets no session cookie and is either `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`, whose token opens nothing, or — with a mail or SMS transport — the challenge with no token in it | `2fa-required` |
 | `2fa-required/setup-token-enrols-and-opens-the-session` | the setup-required token, as `Authorization: Bearer`, enrols through `/2fa/setup` and `/2fa/verify-setup` and the latter opens the session — cookies in cookie mode, top-level tokens and no cookie in bearer mode — with `isTotpEnabled: true`; a replay is `401 INVALID_TEMP_TOKEN`; the next login is the challenge. The core's `forced-enrolment-opens-a-session` | `2fa-required`, `2fa-enrol-on-login` |
 | `2fa-required/disable-is-refused` | `POST /2fa/disable` is `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}` under the policy, driven on a fresh account enrolled at login and never on the declared one | `2fa-required`, `2fa-enrol-on-login` |
 
