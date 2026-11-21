@@ -1001,6 +1001,15 @@ func coreOptionSets(
 			name:  "tools",
 			build: func() ([]auth.Option, error) { return toolsOptions(tools, cfg, log), nil },
 		},
+		{
+			// invitations.* — the store, the token TTL and the re-invitation
+			// policy (core v0.15.0). After the reserved tail, so that no
+			// earlier set's refusal precedence moves. No I/O; it refuses only
+			// for a driver with no invitation store (invitations.go). The
+			// sender is the delivery slot's, the reveal flag the admin mount's.
+			name:  "invitations",
+			build: func() ([]auth.Option, error) { return invitationOptions(cfg, users, log) },
+		},
 	}
 }
 
@@ -1162,6 +1171,11 @@ type memoryStoreBundle struct {
 	templates auth.TemplateStore
 	settings  auth.SettingsStore
 	codes     auth.AuthCodeStore
+	// invitations is the core's in-process store: per execution environment,
+	// so an invitation minted by one is unknown to the next. RS-12 refuses
+	// this driver in production; internal/store/dynamodb/invitations.go is the
+	// shared one.
+	invitations auth.InvitationStore
 	// The five stores behind the console's tabs and the three the tools block consumes.
 	metadata  auth.UserMetadataStore
 	rbac      auth.RolesPermissionsStore
@@ -1194,7 +1208,8 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		// on the same one. RS-12 already refuses this driver in production; the
 		// dynamodb store (internal/store/dynamodb/auth_codes.go) is what makes
 		// the flow work across instances.
-		codes: auth.NewMemoryAuthCodeStore(),
+		codes:       auth.NewMemoryAuthCodeStore(),
+		invitations: auth.NewMemoryInvitationStore(),
 		// The console's five and the tools block's three, per execution environment.
 		metadata:  auth.NewMemoryMetadataStore(),
 		rbac:      auth.NewMemoryRolesPermissionsStore(),
@@ -1210,6 +1225,7 @@ func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.p
 func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
 func (m memoryStoreBundle) Settings() auth.SettingsStore            { return m.settings }
 func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.codes }
+func (m memoryStoreBundle) Invitations() auth.InvitationStore       { return m.invitations }
 func (m memoryStoreBundle) Metadata() auth.UserMetadataStore        { return m.metadata }
 func (m memoryStoreBundle) Roles() auth.RolesPermissionsStore       { return m.rbac }
 func (m memoryStoreBundle) Tenants() auth.TenantStore               { return m.tenants }

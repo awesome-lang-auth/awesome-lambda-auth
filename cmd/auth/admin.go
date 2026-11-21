@@ -472,6 +472,11 @@ func adminHTTPOptions(cfg *config.Config) auth.AdminOptions {
 		// an AWS_IAM route, admitted ahead of the session policy. Nil without
 		// the block, which is the reference's guard. admin_machine.go.
 		MachineAccess: adminMachineAccess(cfg),
+		// admin.revealInvitationToken: POST <admin>/api/users/invitations
+		// answers the token and accept URL to its caller. The core honours it
+		// only with no invitation sender, and internal/config refuses it beside
+		// one, so the two can never disagree about who delivers.
+		RevealInvitationToken: cfg.Admin.RevealInvitationToken,
 	}
 	if prefix := cfg.Admin.CookiePrefix; prefix != "" {
 		out.CookiePrefix = &prefix

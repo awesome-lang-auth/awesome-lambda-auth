@@ -92,6 +92,7 @@ type Config struct {
 	Cookies         Cookies         `json:"cookies"`
 	Sessions        Sessions        `json:"sessions"`
 	Registration    Registration    `json:"registration"`
+	Invitations     Invitations     `json:"invitations"`
 	Email           Email           `json:"email"`
 	SMS             SMS             `json:"sms"`
 	OAuth           OAuth           `json:"oauth"`
@@ -301,6 +302,44 @@ type Registration struct {
 	// domain is matched on the address the provider asserts), and the loader
 	// warns about the narrowed shape it admits (collectWarnings).
 	Closed bool `json:"closed"`
+}
+
+// Invitations covers invitations.*: staff invitations, the way a closed realm
+// gets its accounts over HTTP (core v0.15.0, Config.Invitations; core
+// deviation invitations-are-an-addition).
+//
+// [new] — the whole block is product-only. The reference ships the
+// `invitation` mail and no route around it; the core adds the routes, and this
+// block is the switch and the two policies the core exposes. With it on, cmd/auth
+// hands the core the driver's InvitationStore (the DynamoDB single-table one,
+// or the core's in-memory store on the development driver) and the invitation
+// sender of whichever transport carries the other credential mails. Then, and
+// only then: POST/GET <admin>/api/users/invitations and DELETE
+// <admin>/api/users/invitations/{id} behind the admin guard — machine access
+// included — and the public POST <prefix>/invitations/accept, mounted under
+// registration.closed too. config-reference §21.
+type Invitations struct {
+	// Enabled mounts the four routes. Off by default, which mounts none of
+	// them, as every earlier release did. Refused without the admin console
+	// (the invite route is on it), without a way to deliver the token — a
+	// mailer, the delivery webhook, or admin.revealInvitationToken — and in
+	// resource-server mode, which mounts no credential route.
+	Enabled bool `json:"enabled"`
+
+	// TTL is how long an invitation's token is honoured (the core's
+	// Config.InvitationTTL). Defaults to 72h, the core's own default; at most
+	// 30d, since an unredeemed invitation is a standing credential for an
+	// account with no password. The token expires; the pending account and
+	// the listed invitation do not, until an administrator revokes it or the
+	// store's retention runs out (CompatibilityNotes).
+	TTL Duration `json:"ttl"`
+
+	// Reinvite lets an administrator invite again an address whose account is
+	// still pending — no password, no factor, an invitation outstanding —
+	// answering 200 with a fresh token and retiring the earlier ones (the
+	// core's Config.InvitationReinvite). Off, such an address is 409 like any
+	// existing account, and the way to re-send is revoke, then invite.
+	Reinvite bool `json:"reinvite"`
 }
 
 // Email covers email.* (spec §1.5).
@@ -646,6 +685,21 @@ type Admin struct {
 	// service only the shared adminSecret or a user's session.
 	// cmd/auth/admin_machine.go.
 	MachineAccess AdminMachineAccess `json:"machineAccess"`
+
+	// RevealInvitationToken lets POST <admin>/api/users/invitations answer
+	// the invitation's token and accept URL to its caller (the core's
+	// AdminOptions.RevealInvitationToken), for a back office that delivers
+	// invitations through a channel of its own. [new].
+	//
+	// It moves the guarantee the acceptance rests on: accepting marks the
+	// address verified on the strength of the token having reached that
+	// mailbox, and a revealed token reaches whoever called the admin API — a
+	// machine principal, its logs, whatever it forwards the URL through. So it
+	// is off by default, refused while a mailer or the delivery webhook is
+	// wired (the core ignores it then, and an operator who set it would believe
+	// otherwise), refused without invitations.enabled, and the loader warns
+	// whenever it is on.
+	RevealInvitationToken bool `json:"revealInvitationToken"`
 }
 
 // AdminMachineAccess covers admin.machineAccess.*. One credential kind today,
@@ -1095,6 +1149,9 @@ func Defaults() *Config {
 			Path:     "/",
 		},
 		Sessions: Sessions{CheckOn: SessionCheckOnRefresh},
+		// The core's DefaultInvitationTTL, written out so the reference
+		// document shows it.
+		Invitations: Invitations{TTL: mustDuration("72h")},
 		Email: Email{
 			Mailer:          Mailer{DefaultLang: "en"},
 			Verification:    EmailVerification{Mode: EmailVerificationNone},

@@ -595,6 +595,13 @@ func collectRealmWarnings(cfg *Config) {
 	// webhook, and it hands a new password to whoever reads it.
 	resetMail := cfg.MailerConfigured() || cfg.DeliveryWebhookConfigured()
 
+	if cfg.Admin.RevealInvitationToken {
+		cfg.warn("admin.revealInvitationToken",
+			"POST <admin>/api/users/invitations answers the invitation's token and accept URL to its caller; accepting marks the address verified on the strength of the token having reached that mailbox, "+
+				"so whoever handles the answer -- the machine principal, its logs, the channel it forwards the URL through -- holds a credential that activates the account",
+			"deliver the token only to the invited mailbox, keep it out of logs, and prefer email.mailer or email.deliveryWebhook, which keep the token off the admin API entirely")
+	}
+
 	if cfg.TwoFactor.EnrolOnLogin {
 		scope := "an account under twoFactor.required"
 		if !cfg.TwoFactor.Required {

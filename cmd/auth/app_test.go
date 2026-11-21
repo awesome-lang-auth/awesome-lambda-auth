@@ -735,7 +735,7 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 
 	wantOrder := []string{
 		"delivery", "email", "twoFactor", "claims", "oauth", "idp", "migration",
-		"settings", "docs", "ui", "admin", "tools",
+		"settings", "docs", "ui", "admin", "tools", "invitations",
 	}
 	if strings.Join(names, ",") != strings.Join(wantOrder, ",") {
 		t.Errorf("core option sets are %v, want %v", names, wantOrder)

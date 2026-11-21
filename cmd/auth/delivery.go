@@ -147,6 +147,13 @@ type delivery struct {
 	// senders are not handed to the core, whatever transports exist. See the
 	// file header, "under twoFactor.required".
 	passwordlessWithheld bool
+
+	// invitations is invitations.enabled: the invitation sender is handed to
+	// the core only then, by the transport that carries the other credential
+	// mails. Not withheld under twoFactor.required: the invitation is how a
+	// closed realm's accounts are made, and accepting one opens no session
+	// without the second factor the policy demands.
+	invitations bool
 }
 
 // webhookConfigured is the third enable signal, and like the other two it is
@@ -198,6 +205,7 @@ func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTran
 		locale:  cfg.Email.Mailer.DefaultLang,
 
 		passwordlessWithheld: cfg.TwoFactor.Required,
+		invitations:          cfg.Invitations.Enabled,
 	}
 
 	if mailConfigured(cfg) {
@@ -333,6 +341,23 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 		}
 		if d.sms != nil && !d.passwordlessWithheld {
 			opts = append(opts, auth.WithSMSCodeSender(auth.SMSTransportSender(d.sms)))
+		}
+	}
+
+	// The invitation (core v0.15.0), by the transport the other credential
+	// mails take: the webhook posts kind "invitation", the mailer renders the
+	// reference's `invitation` template with {link} — the template store's
+	// override when one is enabled, found on the context as the four bridge
+	// mailers find it. With neither, admin.revealInvitationToken is the only
+	// delivery, which internal/config has already required.
+	if d.invitations {
+		switch {
+		case d.webhook != nil:
+			opts = append(opts, auth.WithInvitationSender(scrubbedSender(d.webhook.SendInvitation, d.webhook.URL)))
+		case d.mail != nil:
+			invite := auth.NewInvitationMailer(d.mail, d.appName, d.baseURL)
+			invite.Locale = d.locale
+			opts = append(opts, auth.WithInvitationSender(invite.Send))
 		}
 	}
 
