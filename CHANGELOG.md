@@ -16,21 +16,35 @@ under [Unreleased].
   reports `features.register: false`, and the served OpenAPI document leaves the
   path out. New refuse-to-start rule **RS-19**: a closed realm beside an OAuth
   provider whose callback still creates accounts for anyone
-  (`oauth.provisioning.autoCreate`, on by default, with no `allowedEmailDomains`);
-  with a domain list it loads and warns. The SAM Rule
+  (`oauth.provisioning.autoCreate`, on by default, with no `allowedEmailDomains`),
+  or narrowed by a domain list while `oauth.provisioning.requireVerifiedEmail` is
+  off — the domain is matched on the address the provider asserts, so without
+  verification it narrows nothing; with both it loads and warns. The SAM Rule
   `ClosedRegistrationRefusesOAuthSignUp` refuses the same at changeset time when no
   `ConfigFile` is supplied. No route creates an account on a closed realm — the
   admin console has none — so accounts come from `cmd/migrate`, a domain-narrowed
   OAuth callback or a tool on the store; a deployment that invites over HTTP
   closes the route in front of the function instead (`docs/config-reference.md` §20).
-- **A second factor required at login** (`twoFactor.required`, off by default;
-  `AWESOME_AUTH_2FA_REQUIRED`; SAM `TwoFactorRequired`). A password login opens no
-  session without a second factor: the challenge for an account with one,
-  `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` for an
-  account with none; `POST <prefix>/2fa/disable` is refused. Distinct from
-  `runtimeSettings.require2fa`, which reaches `/2fa/disable` alone. The loader warns
-  that the OAuth callback, `POST <admin>/login` and the magic-link and SMS logins
-  do not ask for the factor (`docs/config-reference.md` §7.1).
+- **A second factor required of every session** (`twoFactor.required`, off by
+  default; `AWESOME_AUTH_2FA_REQUIRED`; SAM `TwoFactorRequired`). A password login
+  opens no session without a second factor: the challenge for an account with
+  one, `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`
+  for an account with none; `POST <prefix>/2fa/disable` is refused. Every other
+  door is held to it: the login mode of `/magic-link/{send,verify}` and
+  `/sms/{send,verify}` and `/link-verify` with `loginAfterLinking` answer
+  `403 2FA_REQUIRED` (their step-up mode and linking alone work as before), and
+  `POST <admin>/login` answers `404` — the console admits a two-factor session
+  from `POST <prefix>/login`, and machine access (product deviation
+  `two-factor-required-refuses-one-factor-sign-ins`). New refuse-to-start rule
+  **RS-20**: the policy beside `oauth.providers` (the callback opens a session with
+  no second-factor step), or beside `admin.rootUser` or `admin.bootstrapSecret` on
+  a mounted console; SAM Rules `TwoFactorRequiredRefusesOAuthSignIn` and
+  `TwoFactorRequiredRefusesTheRootUser`. The identity provider's `/authorize`
+  refuses every account under the policy, and the loader warns. Not retroactive:
+  sessions opened before it is switched on keep refreshing, so rotate the refresh
+  secret in the same deploy. Distinct from `runtimeSettings.require2fa`, which
+  reaches `/2fa/disable` alone (`docs/config-reference.md` §7.1,
+  `docs/spec/decisions.md` D-27).
 - **Forced enrolment at login** (`twoFactor.enrolOnLogin`, off by default;
   `AWESOME_AUTH_2FA_ENROL_ON_LOGIN`; SAM `TwoFactorEnrolOnLogin`). The
   `2FA_SETUP_REQUIRED` token enrols through `/2fa/setup` and `/2fa/verify-setup`,
@@ -45,14 +59,20 @@ under [Unreleased].
   (`ANY /admin/{proxy+}`), that CloudFront never routes, with outputs
   `AdminMachineApiEndpoint` and `AdminMachineApiInvokeArn` and the Rule
   `AdminMachineAccessNeedsTheConsole`. Each grant is audited as
-  `identity.admin.machine.access`. It does not lift `http.originVerify`: with that
-  on, a machine caller sends the front door's header too
-  (`docs/config-reference.md` §16.9, `docs/spec/decisions.md` D-26).
+  `identity.admin.machine.access`. The trust boundary is `lambda:InvokeFunction` on
+  the auth function — whoever may invoke it directly can forge the IAM caller —
+  so keep that permission to API Gateway alone. `AdminMachinePrincipalArns`'
+  `AllowedPattern` is the loader's grammar, so a value the function would refuse
+  is refused at changeset time. It does not lift `http.originVerify`: with that
+  on, a machine caller sends the front door's header too; whether to exempt the
+  internal API instead is an open owner decision (`docs/config-reference.md`
+  §16.9, `docs/spec/decisions.md` D-26).
 - **Contract suite realm modes.** `AWESOME_AUTH_CONTRACT_REGISTRATION=closed` and
   `AWESOME_AUTH_CONTRACT_2FA=required` declare an invite-only realm, checked through
   a declared, enrolled account (`AWESOME_AUTH_CONTRACT_REALM_EMAIL`, `_PASSWORD`,
   `_TOTP_SECRET`); new capabilities `registration-closed`, `2fa-required`,
-  `2fa-enrol-on-login`, and six cases (`test/contract/README.md`, *Realm modes*).
+  `2fa-enrol-on-login`, and eight cases, two of them the one-factor sign-ins the
+  policy refuses (`test/contract/README.md`, *Realm modes*).
 
 - **Origin verification** (`http.originVerify`, off by default). With
   `http.originVerify.secretArn` naming a Secrets Manager secret, the auth
@@ -97,18 +117,23 @@ under [Unreleased].
   and each client signs in again once its access token expires (15 minutes by
   default). Rolling back is a second sign-out. Afterwards a component holding the
   access secret can no longer mint refresh tokens, and the refresh secret rotates
-  on its own (`docs/config-reference.md` §3.1, `docs/spec/decisions.md` D-25).
+  on its own (`docs/config-reference.md` §3.1, `docs/spec/decisions.md` D-25). A
+  resource server is not affected: it verifies no refresh token, so its refresh
+  secret is neither checked nor wired, and one shorter than 32 characters still
+  starts (the cold start reports it as unwired).
 - **Pinned to `awesome-go-auth` `v0.14.0`** (closed registration, enforced second
   factor with opt-in forced enrolment, admin machine access). Two core deviations
   are indexed, `forced-enrolment-opens-a-session` and
   `admin-machine-access-is-a-host-seam`.
-- **The console's user writes reach every tenant.** With the pin,
-  `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
+- **BREAKING (security) — the console's user writes reach every tenant.** With
+  the pin, `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
   (`method=flag`) resolve the user's tenant through the lookup the detail route
   already used, so they reach a user stored under a tenant where they answered
-  `500`. This widens what an administrator can write: a policy that admits
-  per-tenant administrators now lets them delete and promote across tenants
-  (`docs/config-reference.md` §16.4).
+  `500`. This widens what an administrator can write with no configuration
+  change: a policy that admits per-tenant administrators — `is-admin-flag` on a
+  tenant's row, or `rbac:<role>` held in one tenant — now lets them delete and
+  promote across every tenant. **A deployment with per-tenant administrators
+  reads `docs/config-reference.md` §16.4 before upgrading.**
 
 ### Security
 

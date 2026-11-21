@@ -377,8 +377,8 @@ closed the realm.
 
 | Parameter | Variable | Effect |
 |---|---|---|
-| `ClosedRegistration` | `AWESOME_AUTH_REGISTRATION_CLOSED` | `POST <ApiPrefix>/register` is not mounted (`404`), the hosted UI hides its sign-up link and the OpenAPI document drops the path. **No route then creates an account** — the admin console has none, for people or machines — so accounts come from `cmd/migrate`, an OAuth callback narrowed by a `ConfigFile`, or a tool of your own on the table; to create them over HTTP, leave this off and put an `AWS_IAM` route for `POST <ApiPrefix>/register` in front of the function instead. The OAuth callback still creates accounts by default, so with an OAuth client id and no `ConfigFile` the Rule `ClosedRegistrationRefusesOAuthSignUp` refuses the changeset, and with a `ConfigFile` the function refuses to start (RS-19) unless it sets `oauth.provisioning.autoCreate: false` or narrows it with `allowedEmailDomains`. [config-reference.md §20](../../docs/config-reference.md) |
-| `TwoFactorRequired` | `AWESOME_AUTH_2FA_REQUIRED` | A password login opens no session without a second factor: the challenge for an account with one, `403 2FA_SETUP_REQUIRED` for an account with none, and `POST /2fa/disable` refused. An account with none can only enrol with `TwoFactorEnrolOnLogin`, or through whatever provisions it. **Not** `runtimeSettings.require2fa`, which only blocks `/2fa/disable`. The OAuth callback, `POST /admin/login` and the magic-link and SMS logins do not ask for it; the function says so at start. [§7.1](../../docs/config-reference.md) |
+| `ClosedRegistration` | `AWESOME_AUTH_REGISTRATION_CLOSED` | `POST <ApiPrefix>/register` is not mounted (`404`), the hosted UI hides its sign-up link and the OpenAPI document drops the path. **No route then creates an account** — the admin console has none, for people or machines — so accounts come from `cmd/migrate`, an OAuth callback narrowed by a `ConfigFile`, or a tool of your own on the table; to create them over HTTP, leave this off and put an `AWS_IAM` route for `POST <ApiPrefix>/register` in front of the function instead. The OAuth callback still creates accounts by default, so with an OAuth client id and no `ConfigFile` the Rule `ClosedRegistrationRefusesOAuthSignUp` refuses the changeset, and with a `ConfigFile` the function refuses to start (RS-19) unless it sets `oauth.provisioning.autoCreate: false`, or narrows it with `allowedEmailDomains` **and** `requireVerifiedEmail: true` — the domain is matched on the address the provider asserts, so the list alone narrows nothing. [config-reference.md §20](../../docs/config-reference.md) |
+| `TwoFactorRequired` | `AWESOME_AUTH_2FA_REQUIRED` | No session opens without a second factor: a password login gets the challenge for an account with one and `403 2FA_SETUP_REQUIRED` for an account with none, `POST /2fa/disable` is refused, the magic-link and SMS logins and `/link-verify`'s `loginAfterLinking` answer `403 2FA_REQUIRED` unless used as the second step, and `POST /admin/login` answers `404` — the console admits a two-factor session from the auth login, and machine access. An OAuth client id (Rule `TwoFactorRequiredRefusesOAuthSignIn`) or a root user (Rule `TwoFactorRequiredRefusesTheRootUser`) beside it is refused (RS-20), since neither sign-in can be made to ask. An account with no factor can only enrol with `TwoFactorEnrolOnLogin`, or through whatever provisions it. Not retroactive: rotate the refresh secret in the deploy that turns it on. **Not** `runtimeSettings.require2fa`, which only blocks `/2fa/disable`. [§7.1](../../docs/config-reference.md) |
 | `TwoFactorEnrolOnLogin` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | An account with no factor enrols one at login with the `tempToken` of its `2FA_SETUP_REQUIRED` answer, and gets its session when it does. **Trust on first use** — whoever holds the password binds the factor — so leave it off unless initial passwords reach their owners and nobody else, and enrol out of band otherwise. [§7.2](../../docs/config-reference.md) |
 
 An invite-only staff realm sets the first two. Verify it with the contract
@@ -717,8 +717,10 @@ store, so `SessionCheckOn=allcalls` does not reach it, `/admin/logout` only
 clears the cookie, and rotating the access-token secret is the one kill switch;
 `/admin/login` **does not enforce a second factor** — password alone opens the
 console for an account the deployment would otherwise challenge, so a
-deployment that requires 2FA points `admin.loginPath` at the hosted login,
-whose flow does (`admin-login-skips-the-second-factor`); and it has **no CSRF
+deployment whose accounts enrol one points `admin.loginPath` at the hosted
+login, whose flow does (`admin-login-skips-the-second-factor`); with
+`TwoFactorRequired=true` the route is not served at all and the console admits
+a two-factor session from the auth login; and it has **no CSRF
 check**, so the Rule refuses the console beside `CookieSameSite=none` (RS-18).
 The function rate-limits `/admin/login` under the same `rateLimit` block as the
 auth login.
@@ -759,7 +761,18 @@ contract; what you do to use it:
 4. With `OriginVerifySecretArn` set, send that header too, from the same secret
    (`secretsmanager:GetSecretValue` on it, granted by the service's role):
    the origin check runs before the guard on every request this function
-   receives.
+   receives. That puts the front door's secret in the service's hands too —
+   whoever holds it can call the public origin past CloudFront — and exempting
+   the internal API from the check instead is an open decision
+   ([config-reference.md §16.9](../../docs/config-reference.md) sets out both).
+5. Keep `lambda:InvokeFunction` on the auth function to API Gateway alone (an
+   SCP or a permissions boundary): whoever may invoke the function directly can
+   hand it an event naming a listed role and gets the whole console. And list
+   only roles whose trust policy names the one calling service — every session
+   of a listed role is admitted. A role or user whose name or path holds a comma
+   cannot be listed through this parameter (it is comma separated); the
+   `AllowedPattern` refuses everything else the function would, a duplicate
+   aside.
 
 Every admitted call is audited as `identity.admin.machine.access` with the
 caller's ARN: a telemetry row and any matching webhook with `EnableTools`, a

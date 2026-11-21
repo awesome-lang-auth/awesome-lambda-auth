@@ -283,8 +283,9 @@ type Registration struct {
 	// served OpenAPI document leaves the path out — the reference's hookless
 	// deployment on every surface. No route then creates an account: neither
 	// the reference's admin router nor the core's has one. Accounts come from
-	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains,
-	// or a provisioning tool of the operator's own on the store; a deployment
+	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains
+	// and to verified addresses, or a provisioning tool of the operator's own
+	// on the store; a deployment
 	// that must create accounts over HTTP closes the route in front of the
 	// function instead (config-reference §20). Off by default, which mounts
 	// the route as every earlier release did.
@@ -293,8 +294,10 @@ type Registration struct {
 	// an account for an identity nothing here knows whenever
 	// oauth.provisioning.autoCreate is on, which it is by default, so a closed
 	// realm with a provider configured has to say what the callback does: RS-19
-	// refuses the combination with no allowedEmailDomains, and the loader warns
-	// when a domain list narrows it (collectWarnings).
+	// refuses the combination unless autoCreate is off or the callback is
+	// narrowed by allowedEmailDomains together with requireVerifiedEmail (the
+	// domain is matched on the address the provider asserts), and the loader
+	// warns about the narrowed shape it admits (collectWarnings).
 	Closed bool `json:"closed"`
 }
 
@@ -414,9 +417,12 @@ type TwoFactor struct {
 	// the core counts as factors — and one with none gets
 	// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
 	// and no session; and POST <prefix>/2fa/disable answers 403 2FA_REQUIRED
-	// to everyone, with or without a settings store. The passwordless logins
-	// (magic-link and SMS in login mode), the OAuth callback and the console's
-	// own login are not password logins and do not ask; the loader warns.
+	// to everyone, with or without a settings store. The core asks at the
+	// password login alone, so the product holds the other sign-ins to it:
+	// RS-20 refuses it beside oauth.providers (the callback cannot be made to
+	// ask) and beside the console's root user and bootstrap secret, and
+	// cmd/auth's secondFactorGate refuses the passwordless logins' login mode,
+	// /link-verify's loginAfterLinking and POST <admin>/login at request time.
 	//
 	// [new] — the reference has no deployment-level require2FA: the name lives
 	// on the settings store and on the user record only, and its login demands

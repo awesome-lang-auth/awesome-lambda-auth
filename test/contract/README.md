@@ -582,6 +582,10 @@ What a declaration changes, and nothing changes without one:
   with its setup-required token answers a secret (`on`) or is refused
   (`absent`). It stores nothing. Where the fresh account is challenged instead,
   it is `absent` with that reason.
+- **A declared admin credential is `absent` on a 2FA-required realm**, with that
+  reason: the credentialed console cases sign in at `POST <admin>/login`, which
+  such a realm does not serve (the console admits a session from `POST /login`
+  and its factor instead), so they cannot run there.
 - **Every case that provisions an account of its own skips**, with that reason
   on the list at the end of the run: `Env.NewAccount` — and `LoginCookie` and
   `LoginBearer` through it — registers through the route a closed realm
@@ -601,6 +605,8 @@ the variables to set.
 | `2fa-required/password-alone-opens-no-session` | the declared account's password login is the challenge in both modes — no token in the body, no session cookie, `GET /me` still `403 No access token provided` — and its factor completes it with `isTotpEnabled: true`; on an open realm a fresh account's login sets no session cookie and is either `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`, whose token opens nothing, or — with a mail or SMS transport — the challenge with no token in it | `2fa-required` |
 | `2fa-required/setup-token-enrols-and-opens-the-session` | the setup-required token, as `Authorization: Bearer`, enrols through `/2fa/setup` and `/2fa/verify-setup` and the latter opens the session — cookies in cookie mode, top-level tokens and no cookie in bearer mode — with `isTotpEnabled: true`; a replay is `401 INVALID_TEMP_TOKEN`; the next login is the challenge. The core's `forced-enrolment-opens-a-session` | `2fa-required`, `2fa-enrol-on-login` |
 | `2fa-required/disable-is-refused` | `POST /2fa/disable` is `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}` under the policy, driven on a fresh account enrolled at login and never on the declared one | `2fa-required`, `2fa-enrol-on-login` |
+| `2fa-required/one-factor-sign-ins-are-refused` | the login mode of `POST /magic-link/send`, `/magic-link/verify`, `/sms/send` and `/sms/verify`, and `POST /link-verify` with `loginAfterLinking`, answer `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}` in cookie and bearer mode with no session cookie, whatever transports and stores the deployment has; the step-up mode reaches the route, which answers a tempToken that is not one with its own `401 INVALID_TEMP_TOKEN`. Product deviation `two-factor-required-refuses-one-factor-sign-ins` | `2fa-required` |
+| `2fa-required/console-login-is-not-served` | `POST <admin>/login` answers the router's `404` and sets nothing; the console is entered with a session from `POST /login` and its factor | `2fa-required`, `admin-session` |
 
 ## Adding a case
 
