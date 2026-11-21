@@ -91,6 +91,7 @@ type Config struct {
 	Tokens          Tokens          `json:"tokens"`
 	Cookies         Cookies         `json:"cookies"`
 	Sessions        Sessions        `json:"sessions"`
+	Registration    Registration    `json:"registration"`
 	Email           Email           `json:"email"`
 	SMS             SMS             `json:"sms"`
 	OAuth           OAuth           `json:"oauth"`
@@ -267,6 +268,33 @@ type Sessions struct {
 	CheckOn string `json:"checkOn"`
 }
 
+// Registration covers registration.*: whether anyone may create an account
+// through the public route.
+//
+// [new] — the whole block is product-only. The reference has no knob for it:
+// it mounts POST <prefix>/register only when the host passes an onRegister
+// hook (auth.router.ts:712-715), so an invite-only deployment of it is a host
+// that wrote no hook. This product ships registration rather than asking for
+// it, so the hookless deployment is a flag, which the imported core exposes as
+// HTTPConfig.ClosedRegistration since v0.14.0. cmd/auth httpConfig.
+type Registration struct {
+	// Closed unmounts POST <prefix>/register: the route answers the router's
+	// 404, GET <prefix>/ui/config reports features.register false and the
+	// served OpenAPI document leaves the path out — the reference's hookless
+	// deployment on every surface. Accounts are then created only by a hand
+	// the deployment controls: the admin console, cmd/migrate, an invitation
+	// flow of the operator's own. Off by default, which mounts the route as
+	// every earlier release did.
+	//
+	// It closes one of two self-registration doors. An OAuth callback creates
+	// an account for an identity nothing here knows whenever
+	// oauth.provisioning.autoCreate is on, which it is by default, so a closed
+	// realm with a provider configured has to say what the callback does: RS-19
+	// refuses the combination with no allowedEmailDomains, and the loader warns
+	// when a domain list narrows it (collectWarnings).
+	Closed bool `json:"closed"`
+}
+
 // Email covers email.* (spec §1.5).
 type Email struct {
 	// SiteURLs is the redirect allowlist; the first entry is canonical.
@@ -375,6 +403,41 @@ type TwoFactor struct {
 	// AppName is the TOTP issuer in the otpauth URI; the reference default is
 	// the literal "awesome-node-auth" (src/router/auth.router.ts:830).
 	AppName string `json:"appName"`
+
+	// Required demands a second factor of every account at login: the core's
+	// Config.Require2FA (auth.WithRequire2FA). An account with an enrolled
+	// factor gets the reference's challenge; one with none gets
+	// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
+	// and no session; and POST <prefix>/2fa/disable answers 403 2FA_REQUIRED
+	// to everyone, with or without a settings store.
+	//
+	// [new] — the reference has no deployment-level require2FA: the name lives
+	// on the settings store and on the user record only, and its login demands
+	// a factor of an enrolled account or a flagged user and of nobody else
+	// (the core's config-require2fa-is-a-system-policy-term). It is not
+	// runtimeSettings.require2fa, which seeds the settings store's key and
+	// reaches /2fa/disable alone: that one never makes a login ask for a
+	// factor. Off by default.
+	Required bool `json:"required"`
+
+	// EnrolOnLogin lets an account that must present a second factor and has
+	// none enrol one at login: the tempToken of its 2FA_SETUP_REQUIRED answer
+	// becomes an enrolment token that POST <prefix>/2fa/setup and
+	// POST <prefix>/2fa/verify-setup accept, and the verify-setup that
+	// completes with it opens the session (the core's Config.EnrolOnLogin,
+	// auth.WithEnrolOnLogin; the core deviation
+	// forced-enrolment-opens-a-session).
+	//
+	// It is TRUST ON FIRST USE, which is why it is off by default: whoever
+	// holds an unenrolled account's password — a leaked invitation or initial
+	// password, or the password of an account whose factor an administrator
+	// has just reset — binds a factor of their choosing and gets a full
+	// session, and the owner's next login is a challenge they cannot answer.
+	// Turn it on where the first sign-in with the password is the owner's by
+	// construction, and reset the password together with the factor. It
+	// applies under Required and to accounts whose own require2FA flag is
+	// set, so it is not inert without Required, and is not refused there.
+	EnrolOnLogin bool `json:"enrolOnLogin"`
 }
 
 // IDProvider covers idProvider.* (spec §1.10).

@@ -176,6 +176,11 @@ func envBindings() []envBinding {
 		// §1.4 sessions
 		envString("AWESOME_AUTH_SESSIONS_CHECK_ON", "sessions.checkOn", func(c *Config, v string) { c.Sessions.CheckOn = v }),
 
+		// registration.* is product-only (config.go, Registration), so the name is
+		// invented to the AWESOME_AUTH_ + upper-snaked-path convention the §1.19
+		// seeds use. A stack template sets it from a parameter.
+		envBool("AWESOME_AUTH_REGISTRATION_CLOSED", "registration.closed", func(c *Config, v bool) { c.Registration.Closed = v }),
+
 		// §1.5 email
 		envList("AWESOME_AUTH_EMAIL_SITE_URLS", "email.siteUrls", func(c *Config, v []string) { c.Email.SiteURLs = v }),
 		envString("AWESOME_AUTH_MAILER_ENDPOINT", "email.mailer.endpoint", func(c *Config, v string) { c.Email.Mailer.Endpoint = v }),
@@ -204,8 +209,12 @@ func envBindings() []envBinding {
 		envBool("AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL", "oauth.provisioning.requireVerifiedEmail", func(c *Config, v bool) { c.OAuth.Provisioning.RequireVerifiedEmail = v }),
 		envString("AWESOME_AUTH_OAUTH_PROVISIONING_ON_EMAIL_MATCH", "oauth.provisioning.onEmailMatch", func(c *Config, v string) { c.OAuth.Provisioning.OnEmailMatch = v }),
 
-		// §1.8 two-factor
+		// §1.8 two-factor. The two policy knobs are [new] and follow the
+		// domain's own spelling, AWESOME_AUTH_2FA_, which the spec gave its one
+		// knob, so that every variable of the block lists under one prefix.
 		envString("AWESOME_AUTH_2FA_APP_NAME", "twoFactor.appName", func(c *Config, v string) { c.TwoFactor.AppName = v }),
+		envBool("AWESOME_AUTH_2FA_REQUIRED", "twoFactor.required", func(c *Config, v bool) { c.TwoFactor.Required = v }),
+		envBool("AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "twoFactor.enrolOnLogin", func(c *Config, v bool) { c.TwoFactor.EnrolOnLogin = v }),
 
 		// §1.10 identity provider
 		envBool("AWESOME_AUTH_IDP_ENABLED", "idProvider.enabled", func(c *Config, v bool) { c.IDProvider.Enabled = v }),

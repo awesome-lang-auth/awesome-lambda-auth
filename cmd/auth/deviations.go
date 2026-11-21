@@ -166,10 +166,12 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID:      "oauth-callback-skips-the-second-factor",
-			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled",
+			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled or a deployment under twoFactor.required",
 			Behaviour: "The callback issues a session and redirects, for every account it resolves. " +
 				"An account whose POST /login answers the second-factor challenge is signed in " +
-				"through a provider without presenting one.",
+				"through a provider without presenting one, and so, under twoFactor.required, is an " +
+				"account with no factor at all, whose password login answers 403 2FA_SETUP_REQUIRED. " +
+				"The loader warns on twoFactor.required beside oauth.providers.",
 			Reference: "The callback is 2FA-aware: such an account is redirected to " +
 				"${redirectTo}/auth/2fa?tempToken=<jwt>&methods=<list> with no session issued " +
 				"(src/router/auth.router.ts:1298-1313).",
@@ -179,7 +181,8 @@ func WireDeviations() []WireDeviation {
 				"makes it reachable at all -- before P4 the route answered the not-configured stub -- " +
 				"and an operator who requires 2FA has to learn this from the cold-start log rather " +
 				"than from an incident. cmd/auth/oauth_test.go " +
-				"TestOAuthCallbackIssuesASessionEvenForATwoFactorAccount fails the day upstream " +
+				"TestOAuthCallbackIssuesASessionEvenForATwoFactorAccount and cmd/auth/realm_test.go " +
+				"TestOAuthCallbackSkipsTheFactorTheRealmRequires fail the day upstream " +
 				"grows the branch, which is when this entry is retired.",
 			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §8.4",
 		},
@@ -249,10 +252,11 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID:      "admin-login-skips-the-second-factor",
-			Surface: "POST <admin>/login, for an account with a second factor enabled or a deployment whose settings require one",
+			Surface: "POST <admin>/login, for an account with a second factor enabled or a deployment whose settings or twoFactor.required require one",
 			Behaviour: "The route mints a 24-hour admin token on email and password alone. It consults neither the account's " +
-				"enrolment nor the settings store's require2FA, so an account that POST <prefix>/login would challenge for a " +
-				"TOTP or SMS code is signed into the console without one. The product puts the rateLimit block in front of the " +
+				"enrolment, nor the settings store's require2FA, nor twoFactor.required, so an account that POST <prefix>/login would " +
+				"challenge for a TOTP or SMS code -- or refuse a session until it enrols one -- is signed into the console without one. " +
+				"The loader warns on twoFactor.required beside admin.enabled. The product puts the rateLimit block in front of the " +
 				"route -- same budget, same window, same keyBy rule as POST <prefix>/login, its own counter scope -- and " +
 				"documents admin.loginPath, pointed at the hosted login, as the way a browser reaches the console through the " +
 				"flow that does enforce the second factor.",
@@ -268,8 +272,9 @@ func WireDeviations() []WireDeviation {
 				"requires 2FA has to learn it from the register and not from an incident. What the product can add without a " +
 				"route it adds: the limiter, because the route was otherwise an unlimited password oracle for every user in " +
 				"the empty tenant, and for the bootstrap secret a constant-time compare with no bcrypt cost at all; and RS-6's " +
-				"length floor on that secret. cmd/auth/admin_test.go TestAdminLoginSkipsTheSecondFactor fails the day upstream " +
-				"makes the login honour TwoFactorPolicy, which is when this entry is retired.",
+				"length floor on that secret. cmd/auth/admin_test.go TestAdminLoginSkipsTheSecondFactor and cmd/auth/realm_test.go " +
+				"TestAdminLoginSkipsTheFactorTheRealmRequires fail the day upstream makes the login honour TwoFactorPolicy, which is " +
+				"when this entry is retired.",
 			Spec: "docs/config-reference.md §16.2 and §16.7; upstream deviation admin-guard-accepts-only-typed-session-tokens",
 		},
 		{

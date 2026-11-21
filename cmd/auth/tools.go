@@ -182,9 +182,10 @@ import (
 // And that is all `session` is, which is why it is NOT the ordinary posture
 // here and NOT the SAM template's default. Who holds a session is the host's
 // business in a library; this product has already decided it — POST
-// <prefix>/register is always mounted (upstream register-route-is-always-mounted)
-// — so under `session` "authenticated" means "anyone on the internet who filled
-// in the form". What such a caller can then do is the reference's own shape and
+// <prefix>/register is mounted unless registration.closed says otherwise
+// (upstream register-route-is-always-mounted) — so under `session`, on an open
+// realm, "authenticated" means "anyone on the internet who filled in the
+// form". What such a caller can then do is the reference's own shape and
 // is reproduced, not narrowed: GET <tools>/telemetry is store-wide
 // (tools_telemetry.go says so at length — ?userId=someone-else is honoured and
 // no filter means everyone), and the bridge above writes every identity.* event

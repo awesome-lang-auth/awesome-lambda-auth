@@ -63,8 +63,14 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		{"oauth.provisioning.onEmailMatch", c.OAuth.Provisioning.OnEmailMatch, OAuthEmailMatchLink},
 		{"oauth.provisioning.requireVerifiedEmail", c.OAuth.Provisioning.RequireVerifiedEmail, false},
 
-		// §1.8 two-factor
+		// §1.8 two-factor. The two policy knobs are [new]; off is the core's
+		// own default and the reference's behaviour without a stored setting.
 		{"twoFactor.appName", c.TwoFactor.AppName, "awesome-node-auth"},
+		{"twoFactor.required", c.TwoFactor.Required, false},
+		{"twoFactor.enrolOnLogin", c.TwoFactor.EnrolOnLogin, false},
+
+		// registration.* is product-only: open, as the route has always been.
+		{"registration.closed", c.Registration.Closed, false},
 
 		// §1.10 identity provider
 		{"idProvider.enabled", c.IDProvider.Enabled, false},

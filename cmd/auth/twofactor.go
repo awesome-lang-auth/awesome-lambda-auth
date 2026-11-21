@@ -55,13 +55,54 @@ import (
 // identity-provider block in P5, which is where a deployment first has a reason
 // to name itself on the wire.
 
-// twoFactorOptions hands the core the TOTP issuer.
+// ── the policy: twoFactor.required and twoFactor.enrolOnLogin ────────────────
+//
+// Two booleans, both off by default, both handed to the core as written.
+//
+// twoFactor.required is the core's Config.Require2FA (WithRequire2FA). Since
+// v0.14.0 the core enforces it at login: an account with an enrolled factor
+// gets the challenge, and one with none gets the reference's
+// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"} and
+// no session. It is also a term of POST <prefix>/2fa/disable's refusal, with
+// or without a settings store. Before this knob the product could not ask for
+// either: runtimeSettings.require2fa seeds the settings store, which the core
+// reads on /2fa/disable and nowhere else, so "require2fa" in a document
+// switched off the off-switch and left the login asking for nothing. The two
+// stay distinct — the seed is the run-time switch an administrator flips in
+// the console, and this is the deployment's policy — and config-reference §7
+// says which does what.
+//
+// twoFactor.enrolOnLogin is Config.EnrolOnLogin (WithEnrolOnLogin): the
+// 2FA_SETUP_REQUIRED tempToken becomes an enrolment token that
+// POST <prefix>/2fa/setup and POST <prefix>/2fa/verify-setup accept, and the
+// verify-setup it completes opens the session (core deviation
+// forced-enrolment-opens-a-session). Without it the token completes nothing
+// and an account under the policy has to be enrolled out of band — which is
+// the safe default, because the option is trust on first use: whoever holds
+// the password binds the factor. The loader warns whenever it is on.
+//
+// What neither reaches, stated here because the operator who turns them on
+// will assume otherwise: the OAuth callback issues a session with no second
+// factor (oauth-callback-skips-the-second-factor), and the console's own
+// POST <admin>/login is password-only (admin-login-skips-the-second-factor).
+// The loader warns on both combinations; oauth_test.go and admin_test.go pin
+// that both still hold with twoFactor.required on.
+
+// twoFactorOptions hands the core the TOTP issuer and the second-factor
+// policy.
 //
 // Unconditional, unlike the delivery and claims option sets: there is no "off"
-// for this one. Every deployment mounts /2fa/setup, the schema default is a
+// for the issuer. Every deployment mounts /2fa/setup, the schema default is a
 // real value rather than a zero one, and validate.go refuses an empty appName —
 // so there is no configuration in which passing it is wrong, and a gate here
-// would only be able to disagree with validation.
+// would only be able to disagree with validation. The two policy options are
+// passed as written for the same reason: false is the core's own default, so a
+// document that sets neither builds the core it built before they existed, and
+// a gate could only make the deployed value differ from the configured one.
 func twoFactorOptions(cfg *config.Config) []auth.Option {
-	return []auth.Option{auth.WithTwoFactorAppName(cfg.TwoFactor.AppName)}
+	return []auth.Option{
+		auth.WithTwoFactorAppName(cfg.TwoFactor.AppName),
+		auth.WithRequire2FA(cfg.TwoFactor.Required),
+		auth.WithEnrolOnLogin(cfg.TwoFactor.EnrolOnLogin),
+	}
 }

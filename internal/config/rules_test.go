@@ -78,6 +78,20 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantPath: "deployment.publicUrl",
 		},
 		{
+			// RS-19: a closed realm whose OAuth callback signs up any account
+			// at the provider. internal/config/realm_test.go walks the shapes
+			// around it.
+			name: "RS-19 closed registration beside a provider that creates accounts",
+			mutate: func(doc Document) {
+				set(doc, "registration.closed", true)
+				googleProvider(doc)
+			},
+			env:         googleEnv(),
+			wantRule:    RuleClosedRegistrationOAuth,
+			wantPath:    "oauth.provisioning.autoCreate",
+			wantMessage: "second sign-up form",
+		},
+		{
 			name: "RS-3 CSRF disabled in cookie mode",
 			mutate: func(doc Document) {
 				set(doc, "security.csrf.enabled", false)

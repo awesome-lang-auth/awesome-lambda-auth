@@ -112,6 +112,18 @@ const (
 	// `none` need Secure; this one makes it and the console exclusive.
 	RuleAdminCrossSiteCookie = "RS-18"
 
+	// RuleClosedRegistrationOAuth refuses registration.closed beside an OAuth
+	// provider whose callback still creates accounts for anyone:
+	// oauth.provisioning.autoCreate on, which is its default, and no
+	// allowedEmailDomains to narrow it. Closing POST <prefix>/register closes
+	// one of two self-registration doors (the core says so on
+	// HTTPConfig.ClosedRegistration), and a realm configured as invite-only
+	// whose Sign-in-with-Google signs up the whole internet is the silent
+	// misconfiguration this table exists for. Not in the §2 table for the
+	// reason RS-13 is not: the reference has no closed-registration knob to
+	// combine with anything.
+	RuleClosedRegistrationOAuth = "RS-19"
+
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start
 	// with the same posture as any §2 rule.

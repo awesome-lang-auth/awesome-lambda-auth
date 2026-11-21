@@ -42,7 +42,45 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS15ToolsInboundWebhooks(c, d)
 	checkRS17FirstUserRandomIDs(c, d)
 	checkRS18AdminCrossSiteCookie(c, d)
+	checkRS19ClosedRegistrationOAuth(c, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS19ClosedRegistrationOAuth: a closed realm whose OAuth callback still
+// signs up anyone is refused.
+//
+// registration.closed unmounts POST <prefix>/register and nothing else. The
+// OAuth callback creates an account for a provider identity no row knows
+// whenever oauth.provisioning.autoCreate is on — the default, because it is
+// what keeps "configure a provider and nothing else" working (Defaults) — so a
+// realm that closed the form and configured Google is open to every Google
+// account, and nothing anywhere says so. The core names the gap on the flag
+// itself ("it is not the only self-registration path").
+//
+// Three conditions, each of which takes the rule off:
+//
+//   - no provider configured: autoCreate is then a default nothing reads, so a
+//     rule on it alone would refuse every closed realm;
+//   - autoCreate off: the callback signs in only identities already linked or
+//     matched, which is what invite-only means;
+//   - allowedEmailDomains non-empty: the callback creates accounts, but only
+//     for addresses at domains the operator named — the "sign in with your
+//     company Google account" realm, which is a deliberate posture rather than
+//     a mistake. It loads, and collectWarnings says what it does.
+//
+// Reported on oauth.provisioning.autoCreate, because that is the knob whose
+// default is doing the damage and the one the remedy turns first.
+func checkRS19ClosedRegistrationOAuth(c *Config, d *diagnostics) {
+	p := c.OAuth.Provisioning
+	if !c.Registration.Closed || len(c.OAuth.Providers) == 0 || !p.AutoCreate || len(p.AllowedEmailDomains) > 0 {
+		return
+	}
+	d.errf(RuleClosedRegistrationOAuth, "oauth.provisioning.autoCreate",
+		fmt.Sprintf("registration.closed is on, and the OAuth provider(s) %s create an account for any identity they assert that no account holds yet, "+
+			"because oauth.provisioning.autoCreate is on (its default) with no allowedEmailDomains -- the callback is a second sign-up form open to anyone with an account at the provider",
+			strings.Join(sortedKeys(c.OAuth.Providers), ", ")),
+		"set oauth.provisioning.autoCreate: false (AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE=false) so the callback signs in only accounts that already exist, "+
+			"or narrow it to your own domains with oauth.provisioning.allowedEmailDomains, or remove oauth.providers -- or set registration.closed: false if sign-up is meant to be open")
 }
 
 // checkRS14ToolsSSEDistributor: an SSE configuration that names a distributor

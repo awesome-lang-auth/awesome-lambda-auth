@@ -515,7 +515,10 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.String("sessionCheckOn", cfg.Sessions.CheckOn),
 		slog.Bool("identityProvider", core.IDP() != nil),
 		slog.Bool("resourceServer", cfg.ResourceServer.Enabled),
-		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()))
+		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()),
+		slog.Bool("registrationClosed", cfg.Registration.Closed),
+		slog.Bool("twoFactorRequired", cfg.TwoFactor.Required),
+		slog.Bool("twoFactorEnrolOnLogin", cfg.TwoFactor.EnrolOnLogin))
 
 	return app, nil
 }
@@ -845,7 +848,9 @@ func coreOptionSets(
 			build: func() ([]auth.Option, error) { return emailOptions(ctx, cfg, users, deliver, log) },
 		},
 		{
-			// The TOTP issuer label. One string, no I/O, nothing to refuse.
+			// The TOTP issuer label and the second-factor policy: whether a
+			// login demands a factor, and whether an account that has none may
+			// enrol one there. No I/O, nothing to refuse.
 			name:  "twoFactor",
 			build: func() ([]auth.Option, error) { return twoFactorOptions(cfg), nil },
 		},
@@ -1026,6 +1031,13 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 		// it (auth.ResourceServerGatedRoutes). This is the half of the knob that
 		// changes the mounted surface; the verifier is App.ResourceServerGuard.
 		ResourceServer: cfg.ResourceServer.Enabled,
+		// Closed registration (since core v0.14.0): the adapter does not
+		// register POST <prefix>/register, so it answers the router's 404 as
+		// the reference's hookless deployment does; GET <prefix>/ui/config
+		// reports features.register false and the served OpenAPI document
+		// leaves the path out. The OAuth callback is the other sign-up door,
+		// and RS-19 refuses a closed realm that leaves it open to anyone.
+		ClosedRegistration: cfg.Registration.Closed,
 		// The documentation surface: GET <prefix>/openapi.json and
 		// GET <prefix>/docs, both unguarded and both behind the CSRF
 		// middleware, registered by the adapter and by nothing here. docs.go

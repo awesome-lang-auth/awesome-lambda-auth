@@ -560,6 +560,49 @@ func collectWarnings(cfg *Config) {
 			"setting a cookie domain forfeits the __Host- prefix, so cookies fall back to __Secure-",
 			"leave cookies.domain unset unless subdomains genuinely need to share the session")
 	}
+	collectRealmWarnings(cfg)
+}
+
+// collectRealmWarnings says what the realm knobs do where they meet a surface
+// that does not follow them. None of the three is refused: each is a posture
+// an operator can choose deliberately, and each is the kind a document can
+// express without the operator noticing — so it is said here, where the
+// deployment tooling reads before an upload, and again in the cold-start log.
+func collectRealmWarnings(cfg *Config) {
+	// A closed realm whose OAuth callback still creates accounts, narrowed to
+	// named domains. RS-19 refuses the unnarrowed shape; this one is the
+	// "sign in with your company account" realm, and it is a sign-up path all
+	// the same.
+	p := cfg.OAuth.Provisioning
+	if cfg.Registration.Closed && len(cfg.OAuth.Providers) > 0 && p.AutoCreate && len(p.AllowedEmailDomains) > 0 {
+		cfg.warn("oauth.provisioning.allowedEmailDomains",
+			fmt.Sprintf("registration.closed is on and the OAuth callback still creates an account for any identity at %s that no account holds yet, so anyone holding an address there signs up through the provider",
+				strings.Join(p.AllowedEmailDomains, ", ")),
+			"keep it if that is the realm you mean; otherwise set oauth.provisioning.autoCreate: false so the callback signs in only accounts that already exist")
+	}
+
+	if cfg.TwoFactor.EnrolOnLogin {
+		scope := "an account under twoFactor.required"
+		if !cfg.TwoFactor.Required {
+			scope = "an account whose own require2FA flag is set (twoFactor.required is off)"
+		}
+		cfg.warn("twoFactor.enrolOnLogin",
+			"forced enrolment is trust on first use: when "+scope+" has no factor yet, whoever presents its password binds a factor of their choosing and gets a full session, "+
+				"and the owner's next login is a challenge they cannot answer -- a leaked invitation or initial password, or the password of an account whose factor an administrator just reset, is enough",
+			"keep it only where the first sign-in with the password is the owner's by construction, and reset the password together with the factor; enrol out of band and leave it off otherwise")
+	}
+
+	if cfg.TwoFactor.Required && len(cfg.OAuth.Providers) > 0 {
+		cfg.warn("twoFactor.required",
+			fmt.Sprintf("a second factor is required at POST <prefix>/login, and the OAuth callback of %s issues a session without asking for one, whatever the account (product deviation oauth-callback-skips-the-second-factor)",
+				strings.Join(sortedKeys(cfg.OAuth.Providers), ", ")),
+			"rely on the provider's own second factor for those sign-ins, or remove oauth.providers from a realm whose policy is that every session proved two factors here")
+	}
+	if cfg.TwoFactor.Required && cfg.Admin.Enabled {
+		cfg.warn("twoFactor.required",
+			"a second factor is required at POST <prefix>/login, and the admin console's own POST <admin>/login mints a 24-hour admin token on the password alone (product deviation admin-login-skips-the-second-factor)",
+			"set admin.loginPath to the hosted login so browsers go through the factor, keep <admin>/login off the internet at the front door, and enter the console with a session from <prefix>/login")
+	}
 }
 
 func joinPath(prefix, key string) string {
