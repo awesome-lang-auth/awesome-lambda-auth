@@ -27,7 +27,7 @@ func TestAdminMachineAccessIsOffByDefault(t *testing.T) {
 }
 
 func TestAdminMachineAccessLoadsFromEitherSource(t *testing.T) {
-	const role = "arn:aws:iam::123456789012:role/service/plat-identity"
+	const role = "arn:aws:iam::123456789012:role/service/identity-service"
 	const user = "arn:aws:iam::123456789012:user/ops/backfill"
 
 	doc := consoleDoc()
@@ -66,20 +66,20 @@ func TestAdminMachineAccessRefusesWhatItCannotRead(t *testing.T) {
 		wantPath   string
 		wantText   string
 	}{
-		{"a role session copied from a log line", []any{"arn:aws:sts::123456789012:assumed-role/plat-identity/1795000000"}, false, path + "[0]", "session name"},
+		{"a role session copied from a log line", []any{"arn:aws:sts::123456789012:assumed-role/identity-service/1795000000"}, false, path + "[0]", "session name"},
 		{"the account's root user", []any{"arn:aws:iam::123456789012:root"}, false, path + "[0]", "root user"},
 		{"a wildcard", []any{"arn:aws:iam::123456789012:role/*"}, false, path + "[0]", "wildcard"},
 		{"an empty entry", []any{""}, false, path + "[0]", "wildcard"},
-		{"a role name with no ARN", []any{"plat-identity"}, false, path + "[0]", "not an IAM role or user ARN"},
+		{"a role name with no ARN", []any{"identity-service"}, false, path + "[0]", "not an IAM role or user ARN"},
 		{"a group", []any{"arn:aws:iam::123456789012:group/admins"}, false, path + "[0]", "not an IAM role or user ARN"},
-		{"an account id that is not one", []any{"arn:aws:iam::12345:role/plat-identity"}, false, path + "[0]", "not an IAM role or user ARN"},
+		{"an account id that is not one", []any{"arn:aws:iam::12345:role/identity-service"}, false, path + "[0]", "not an IAM role or user ARN"},
 		{"a federated user", []any{"arn:aws:sts::123456789012:federated-user/ops"}, false, path + "[0]", "not an IAM role or user ARN"},
 		{
 			"one role twice, with and without its path",
-			[]any{"arn:aws:iam::123456789012:role/service/plat-identity", "arn:aws:iam::123456789012:role/plat-identity"},
+			[]any{"arn:aws:iam::123456789012:role/service/identity-service", "arn:aws:iam::123456789012:role/identity-service"},
 			false, path + "[1]", "already names",
 		},
-		{"principals with the console off", []any{"arn:aws:iam::123456789012:role/plat-identity"}, true, path, "admin.enabled is off"},
+		{"principals with the console off", []any{"arn:aws:iam::123456789012:role/identity-service"}, true, path, "admin.enabled is off"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -102,11 +102,11 @@ func TestAdminMachineAccessRefusesWhatItCannotRead(t *testing.T) {
 func TestAdminMachineAccessAcceptsTheShapesItDocuments(t *testing.T) {
 	doc := consoleDoc()
 	set(doc, "admin.machineAccess.iam.principals", []any{
-		"arn:aws:iam::123456789012:role/plat-identity",
+		"arn:aws:iam::123456789012:role/identity-service",
 		"arn:aws:iam::123456789012:role/service/team/backfill-runner",
-		"arn:aws:iam::210987654321:role/plat-identity",
+		"arn:aws:iam::210987654321:role/identity-service",
 		"arn:aws:iam::123456789012:user/ops",
-		"arn:aws-cn:iam::123456789012:role/plat-identity",
+		"arn:aws-cn:iam::123456789012:role/identity-service",
 		"arn:aws:iam::123456789012:role/name+with=all,the.@chars_-",
 	})
 	if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())}); err != nil {
@@ -118,19 +118,19 @@ func TestAdminMachineAccessAcceptsTheShapesItDocuments(t *testing.T) {
 // ARN and for the caller ARN API Gateway reports.
 func TestIAMPrincipalKey(t *testing.T) {
 	for arn, want := range map[string]string{
-		"arn:aws:iam::123456789012:role/plat-identity":                   "role:aws:123456789012:plat-identity",
-		"arn:aws:iam::123456789012:role/service/plat-identity":           "role:aws:123456789012:plat-identity",
-		"arn:aws:sts::123456789012:assumed-role/plat-identity/session-1": "role:aws:123456789012:plat-identity",
-		"arn:aws-us-gov:sts::123456789012:assumed-role/plat-identity/s":  "role:aws-us-gov:123456789012:plat-identity",
-		"arn:aws:iam::123456789012:user/ops/backfill":                    "user:arn:aws:iam::123456789012:user/ops/backfill",
-		"arn:aws:iam::123456789012:root":                                 "",
-		"arn:aws:iam::123456789012:group/admins":                         "",
-		"arn:aws:sts::123456789012:assumed-role/plat-identity":           "",
-		"arn:aws:sts::123456789012:assumed-role/plat-identity/has space": "",
-		"arn:aws:sts::123456789012:federated-user/ops":                   "",
-		"arn:aws:iam::123456789012:role/":                                "",
-		"arn:aws:iam:eu-west-1:123456789012:role/plat-identity":          "",
-		"arn:aws:iam::1234567890ab:role/plat-identity":                   "",
+		"arn:aws:iam::123456789012:role/identity-service":                   "role:aws:123456789012:identity-service",
+		"arn:aws:iam::123456789012:role/service/identity-service":           "role:aws:123456789012:identity-service",
+		"arn:aws:sts::123456789012:assumed-role/identity-service/session-1": "role:aws:123456789012:identity-service",
+		"arn:aws-us-gov:sts::123456789012:assumed-role/identity-service/s":  "role:aws-us-gov:123456789012:identity-service",
+		"arn:aws:iam::123456789012:user/ops/backfill":                       "user:arn:aws:iam::123456789012:user/ops/backfill",
+		"arn:aws:iam::123456789012:root":                                    "",
+		"arn:aws:iam::123456789012:group/admins":                            "",
+		"arn:aws:sts::123456789012:assumed-role/identity-service":           "",
+		"arn:aws:sts::123456789012:assumed-role/identity-service/has space": "",
+		"arn:aws:sts::123456789012:federated-user/ops":                      "",
+		"arn:aws:iam::123456789012:role/":                                   "",
+		"arn:aws:iam:eu-west-1:123456789012:role/identity-service":          "",
+		"arn:aws:iam::1234567890ab:role/identity-service":                   "",
 		"": "",
 	} {
 		got, ok := IAMPrincipalKey(arn)

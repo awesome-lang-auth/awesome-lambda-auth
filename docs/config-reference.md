@@ -607,8 +607,10 @@ alone:
   `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` and no
   session. Its `tempToken` completes nothing unless `twoFactor.enrolOnLogin` is
   on (§7.2); otherwise the account has to be enrolled out of band before it can
-  sign in — by whoever provisions it, through its own first session or a seeding
-  tool.
+  sign in — by whatever provisions it, writing the factor through the store —
+  because under the policy it can never get the session that `/2fa/setup` on
+  the voluntary path needs. Pick one before turning the policy on: forced
+  enrolment (trust on first use), or a provisioning tool that enrols.
 - `POST <prefix>/2fa/disable` answers
   `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}`
   to everyone, with or without a settings store.
@@ -3458,10 +3460,23 @@ so the hookless deployment is this switch — the core's
   the route that is gone);
 - the served OpenAPI document leaves the path out.
 
-Nothing else closes. Accounts are created by a hand the deployment controls —
-the admin console, `cmd/migrate`, an invitation flow of the operator's own
-calling the console as a machine (§16.9) — and every other route answers as it
-did.
+Nothing else closes: every other route answers as it did.
+
+**No route creates an account on a closed realm.** The reference's admin router
+has no user-creating route and the core reproduces it, so neither the console
+nor a machine caller on it (§16.9) can create one — they list, flag, promote and
+delete. On a closed realm accounts come from outside the HTTP surface:
+`cmd/migrate cognito` imports them from a Cognito pool; an OAuth callback narrowed
+with `oauth.provisioning.allowedEmailDomains` provisions them for your own
+domains; or a provisioning tool of your own writes them through the store
+(`internal/store/dynamodb`, the way `cmd/migrate` does) — enrolling their
+second factor there too when `twoFactor.required` is on and
+`twoFactor.enrolOnLogin` is off (§7.1). A deployment that has to create accounts
+over HTTP — an invitation service calling the auth API — leaves this switch off
+and closes the route **in front of** the function instead: an `AWS_IAM`-authorized
+route for `POST <prefix>/register` on the public API, which only an IAM principal
+granted `execute-api:Invoke` on it can call, plus a block at the edge. An
+invitation route in the admin API would close that gap upstream.
 
 **The OAuth callback is the other sign-up door.** It creates an account for any
 provider identity no account holds whenever `oauth.provisioning.autoCreate` is

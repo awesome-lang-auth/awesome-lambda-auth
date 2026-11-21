@@ -283,7 +283,7 @@ func TestAdminHTTPOptionsCarryTheWholeBlock(t *testing.T) {
 		t.Error("MachineAccess is set for a document that configures no principal")
 	}
 	withMachine := adminHTTPOptions(loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
-		"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", "arn:aws:iam::123456789012:role/plat-identity")))
+		"AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS", "arn:aws:iam::123456789012:role/identity-service")))
 	if withMachine.MachineAccess == nil {
 		t.Error("MachineAccess is nil with a principal configured")
 	}

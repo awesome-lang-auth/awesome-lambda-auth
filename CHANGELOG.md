@@ -19,7 +19,10 @@ under [Unreleased].
   (`oauth.provisioning.autoCreate`, on by default, with no `allowedEmailDomains`);
   with a domain list it loads and warns. The SAM Rule
   `ClosedRegistrationRefusesOAuthSignUp` refuses the same at changeset time when no
-  `ConfigFile` is supplied (`docs/config-reference.md` §20).
+  `ConfigFile` is supplied. No route creates an account on a closed realm — the
+  admin console has none — so accounts come from `cmd/migrate`, a domain-narrowed
+  OAuth callback or a tool on the store; a deployment that invites over HTTP
+  closes the route in front of the function instead (`docs/config-reference.md` §20).
 - **A second factor required at login** (`twoFactor.required`, off by default;
   `AWESOME_AUTH_2FA_REQUIRED`; SAM `TwoFactorRequired`). A password login opens no
   session without a second factor: the challenge for an account with one,

@@ -384,8 +384,11 @@ Parameters:
     Description: >-
       AWESOME_AUTH_REGISTRATION_CLOSED. "true" unmounts POST <ApiPrefix>/register
       (it answers 404, the hosted UI hides its sign-up link and the OpenAPI
-      document drops the path); accounts are then created only by the admin
-      console, cmd/migrate or a flow of your own. It does not close the OAuth
+      document drops the path). No route then creates an account — the admin
+      console has none — so accounts come from cmd/migrate, an OAuth callback
+      narrowed by a ConfigFile, or a tool of your own on the table; to create
+      them over HTTP, leave this "false" and close the route in front of the
+      function (config-reference.md §20). It does not close the OAuth
       callback, which creates accounts for new identities by default: with an
       OAuth client id set and no ConfigFile the Rule
       ClosedRegistrationRefusesOAuthSignUp refuses the stack, and with a

@@ -177,6 +177,8 @@ Registered as the product deviation `origin-verify-refusal-is-a-bare-403`, for t
 
 **The SAM parameters set their variables only when `"true"`.** The environment beats the document, so a `"false"` in the environment would silently reopen a realm a `ConfigFile` closed.
 
+**What a closed realm cannot do yet: create an account over HTTP.** The reference's admin router has no user-creating route and the core reproduces it, so with the form closed accounts come from `cmd/migrate`, a domain-narrowed OAuth callback, or a tool on the store — and under `twoFactor.required` without `enrolOnLogin`, the factor has to be enrolled by that tool too. Adding a route here was not an option (this binary adds no route to the surface); the fix is an invitation route in the core's admin API, and until then a deployment that invites over HTTP keeps the form mounted at the function and closes it with an `AWS_IAM` route in front.
+
 ## D-25 — The refresh secret reaches the core, at the cost of one sign-out (2026-11-21)
 
 RS-1 has required a distinct `security.jwt.refreshTokenSecret` since P1, and until this release nothing signed with it: the core fell back to the access secret (`refresh-secret-falls-back-to-secret`), and `unwiredKnobs` said so on every cold start. `coreOptions` now passes it (`auth.WithRefreshSecret`), which is the reference's separation — a component holding the access secret cannot mint refresh tokens, and the refresh secret rotates on its own.

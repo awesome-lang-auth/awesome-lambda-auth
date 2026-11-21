@@ -23,10 +23,10 @@ const (
 	// testMachineRole is the role the identity service runs as, written the
 	// way an operator writes it: with a path, which the caller ARN API
 	// Gateway reports does not carry.
-	testMachineRole = "arn:aws:iam::123456789012:role/service/plat-identity"
+	testMachineRole = "arn:aws:iam::123456789012:role/service/identity-service"
 	// testMachineCaller is a session of that role, as requestContext.authorizer.iam.userArn
 	// reports it: the sts form, no path, a session name the assumer chose.
-	testMachineCaller = "arn:aws:sts::123456789012:assumed-role/plat-identity/1795000000123"
+	testMachineCaller = "arn:aws:sts::123456789012:assumed-role/identity-service/1795000000123"
 )
 
 // iamEvent is v2Event with requestContext.authorizer.iam filled the way API
@@ -135,21 +135,21 @@ func TestIAMPrincipalMatching(t *testing.T) {
 	}
 	for caller, admitted := range map[string]bool{
 		testMachineCaller: true,
-		"arn:aws:sts::123456789012:assumed-role/plat-identity/another-session":     true,
-		"arn:aws:iam::123456789012:user/ops/backfill":                              true,
-		"arn:aws:sts::210987654321:assumed-role/plat-identity/1795000000123":       false, // same name, another account
-		"arn:aws-cn:sts::123456789012:assumed-role/plat-identity/1795000000123":    false, // another partition
-		"arn:aws:sts::123456789012:assumed-role/plat-identity-admin/1795000000123": false, // a name it is a prefix of
-		"arn:aws:sts::123456789012:assumed-role/PLAT-IDENTITY/1795000000123":       false, // IAM reports the name as created
-		"arn:aws:iam::123456789012:user/backfill":                                  false, // the user's path is part of it
-		"arn:aws:iam::123456789012:user/plat-identity":                             false, // a user is not the role of its name
-		"arn:aws:sts::123456789012:federated-user/plat-identity":                   false,
-		"arn:aws:iam::123456789012:root":                                           false,
-		"arn:aws:sts::123456789012:assumed-role/plat-identity":                     false, // no session: not a caller ARN
-		"arn:aws:sts::123456789012:assumed-role/plat-identity/a/b":                 false,
-		"plat-identity": false,
-		"arn:aws:sts::12345678901x:assumed-role/plat-identity/1795000000123":               false,
-		"arn:aws:sts::123456789012:assumed-role/plat-identity/1795000000123 trailing junk": false,
+		"arn:aws:sts::123456789012:assumed-role/identity-service/another-session":     true,
+		"arn:aws:iam::123456789012:user/ops/backfill":                                 true,
+		"arn:aws:sts::210987654321:assumed-role/identity-service/1795000000123":       false, // same name, another account
+		"arn:aws-cn:sts::123456789012:assumed-role/identity-service/1795000000123":    false, // another partition
+		"arn:aws:sts::123456789012:assumed-role/identity-service-admin/1795000000123": false, // a name it is a prefix of
+		"arn:aws:sts::123456789012:assumed-role/IDENTITY-SERVICE/1795000000123":       false, // IAM reports the name as created
+		"arn:aws:iam::123456789012:user/backfill":                                     false, // the user's path is part of it
+		"arn:aws:iam::123456789012:user/identity-service":                             false, // a user is not the role of its name
+		"arn:aws:sts::123456789012:federated-user/identity-service":                   false,
+		"arn:aws:iam::123456789012:root":                                              false,
+		"arn:aws:sts::123456789012:assumed-role/identity-service":                     false, // no session: not a caller ARN
+		"arn:aws:sts::123456789012:assumed-role/identity-service/a/b":                 false,
+		"identity-service": false,
+		"arn:aws:sts::12345678901x:assumed-role/identity-service/1795000000123":               false,
+		"arn:aws:sts::123456789012:assumed-role/identity-service/1795000000123 trailing junk": false,
 	} {
 		req, err := lambdahttp.NewRequest(context.Background(), events.APIGatewayV2HTTPRequest{
 			RawPath: "/admin/api/ping",

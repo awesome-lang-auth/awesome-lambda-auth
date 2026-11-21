@@ -281,10 +281,13 @@ type Registration struct {
 	// Closed unmounts POST <prefix>/register: the route answers the router's
 	// 404, GET <prefix>/ui/config reports features.register false and the
 	// served OpenAPI document leaves the path out — the reference's hookless
-	// deployment on every surface. Accounts are then created only by a hand
-	// the deployment controls: the admin console, cmd/migrate, an invitation
-	// flow of the operator's own. Off by default, which mounts the route as
-	// every earlier release did.
+	// deployment on every surface. No route then creates an account: neither
+	// the reference's admin router nor the core's has one. Accounts come from
+	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains,
+	// or a provisioning tool of the operator's own on the store; a deployment
+	// that must create accounts over HTTP closes the route in front of the
+	// function instead (config-reference §20). Off by default, which mounts
+	// the route as every earlier release did.
 	//
 	// It closes one of two self-registration doors. An OAuth callback creates
 	// an account for an identity nothing here knows whenever
