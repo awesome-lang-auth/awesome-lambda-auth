@@ -45,6 +45,10 @@ func TestRealmPolicyVariablesAreSetOnlyWhenTrue(t *testing.T) {
 		"ClosedRegistration":    {"RegistrationClosed", "AWESOME_AUTH_REGISTRATION_CLOSED"},
 		"TwoFactorRequired":     {"TwoFactorIsRequired", "AWESOME_AUTH_2FA_REQUIRED"},
 		"TwoFactorEnrolOnLogin": {"TwoFactorEnrolsOnLogin", "AWESOME_AUTH_2FA_ENROL_ON_LOGIN"},
+		// Staff invitations (v0.15.0), by the same rule.
+		"InvitationsEnabled":         {"InvitationsAreEnabled", "AWESOME_AUTH_INVITATIONS_ENABLED"},
+		"InvitationsReinvite":        {"InvitationsMayReinvite", "AWESOME_AUTH_INVITATIONS_REINVITE"},
+		"AdminRevealInvitationToken": {"AdminRevealsInvitationToken", "AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN"},
 	} {
 		p, ok := tpl.parameters[param]
 		if !ok {
@@ -352,5 +356,31 @@ func TestAdminMachinePrincipalPatternIsTheLoaders(t *testing.T) {
 	}
 	if loads(dup) == nil {
 		t.Errorf("the loader admits a principal named twice: %q", dup)
+	}
+}
+
+// TestInvitationsTtlIsSetOnlyWhenGiven: the one invitation knob that is not a
+// switch reaches the auth function only when the operator wrote a value, so
+// an empty parameter leaves a ConfigFile's invitations.ttl, or the 72h
+// default, in place.
+func TestInvitationsTtlIsSetOnlyWhenGiven(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	p, ok := tpl.parameters["InvitationsTtl"]
+	if !ok {
+		t.Fatal("parameter InvitationsTtl is gone")
+	}
+	if p.fields["Default"] != "''" {
+		t.Errorf("InvitationsTtl Default=%s, want ''", p.fields["Default"])
+	}
+	if got, want := tpl.conditions["HasInvitationsTtl"], "!Not [!Equals [!Ref InvitationsTtl, '']]"; got != want {
+		t.Errorf("condition HasInvitationsTtl = %q, want %q", got, want)
+	}
+	want := "AWESOME_AUTH_INVITATIONS_TTL: !If [HasInvitationsTtl, !Ref InvitationsTtl, !Ref 'AWS::NoValue']"
+	if got := envBlocks(t, tpl.resources["AuthFunction"])["AWESOME_AUTH_INVITATIONS_TTL"]; got != want {
+		t.Errorf("AuthFunction's AWESOME_AUTH_INVITATIONS_TTL is\n%s\nwant\n%s", got, want)
+	}
+	if _, ok := envBlocks(t, tpl.resources["SseFunction"])["AWESOME_AUTH_INVITATIONS_TTL"]; ok {
+		t.Error("SseFunction sets AWESOME_AUTH_INVITATIONS_TTL; the stream path reads no realm policy")
 	}
 }

@@ -67,7 +67,7 @@ Metadata:
       - Label: {default: Email flows}
         Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn]
       - Label: {default: Realm policy (registration and second factor)}
-        Parameters: [ClosedRegistration, TwoFactorRequired, TwoFactorEnrolOnLogin]
+        Parameters: [ClosedRegistration, TwoFactorRequired, TwoFactorEnrolOnLogin, InvitationsEnabled, InvitationsTtl, InvitationsReinvite, AdminRevealInvitationToken]
       - Label: {default: Second factor and token claims}
         Parameters: [TotpIssuer, ClaimsWebhookUrl, ClaimsWebhookTimeoutMs, ClaimsWebhookSecretArn]
       - Label: {default: OAuth providers}
@@ -448,6 +448,62 @@ Parameters:
       mailbox, so the mailbox alone can claim an account that has not
       enrolled yet. "false" — the default — means such accounts are enrolled
       out of band before their first login.
+
+  # Staff invitations (awesome-go-auth v0.15.0; config-reference §21): how a
+  # closed realm's accounts are made over HTTP. With InvitationsEnabled the
+  # console gains POST/GET <AdminPath>/api/users/invitations and DELETE
+  # .../{id} — machine access (AdminMachinePrincipalArns) included — and the
+  # public POST <ApiPrefix>/invitations/accept {token, password}, mounted
+  # under ClosedRegistration too. The token is single use and only its
+  # SHA-256 is stored (the table's INV#, INVTOKEN# and INVUSER# items, which
+  # the AuthTableItems grants already cover). It needs EnableAdminConsole and
+  # a sender (MailerFromAddress or EmailDeliveryWebhookUrl) or
+  # AdminRevealInvitationToken; the function refuses to start otherwise.
+  InvitationsEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_INVITATIONS_ENABLED. "true" mounts the invitation routes:
+      an administrator or a machine principal invites an address, which
+      creates a pending account (no password, address unverified), and the
+      invitee accepts once at POST <ApiPrefix>/invitations/accept, setting a
+      password; under TwoFactorRequired the answer is 2FA_SETUP_REQUIRED and,
+      with TwoFactorEnrolOnLogin, the invitee enrols TOTP before any session
+      opens. Needs EnableAdminConsole and a sender or
+      AdminRevealInvitationToken. "false" — the default — mounts none of them.
+
+  InvitationsTtl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[0-9]+(m|h|d)$'
+    Description: >-
+      AWESOME_AUTH_INVITATIONS_TTL. How long an invitation's token is honoured,
+      as "72h" or "3d"; at most 30d. Empty — the default — keeps 72h.
+
+  InvitationsReinvite:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_INVITATIONS_REINVITE. "true" lets an address whose account
+      is still pending be invited again (200, a fresh token, the earlier
+      tokens retired). "false" — the default — answers 409, and the way to
+      re-send is revoke, then invite.
+
+  AdminRevealInvitationToken:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN. "true" makes the invite
+      answer carry the token and its accept URL, for a back office that
+      delivers invitations itself. RISK: accepting marks the address verified
+      on the strength of the token having reached that mailbox, and a revealed
+      token reaches whoever called the admin API instead — its logs, and the
+      channel it forwards the link through. Refused beside MailerFromAddress
+      or EmailDeliveryWebhookUrl (the function would mail the token anyway).
+      "false" — the default — never puts a token in an admin answer.
 
   # -----------------------------------------------------------------------
   # Second factor and token claims (config-schema.md §1.1, §1.8). The TOTP
@@ -1843,6 +1899,10 @@ Conditions:
   RegistrationClosed: !Equals [!Ref ClosedRegistration, 'true']
   TwoFactorIsRequired: !Equals [!Ref TwoFactorRequired, 'true']
   TwoFactorEnrolsOnLogin: !Equals [!Ref TwoFactorEnrolOnLogin, 'true']
+  InvitationsAreEnabled: !Equals [!Ref InvitationsEnabled, 'true']
+  HasInvitationsTtl: !Not [!Equals [!Ref InvitationsTtl, '']]
+  InvitationsMayReinvite: !Equals [!Ref InvitationsReinvite, 'true']
+  AdminRevealsInvitationToken: !Equals [!Ref AdminRevealInvitationToken, 'true']
 
   # Observability. HasAlarmTarget is the one every notifying resource is gated
   # on: with neither parameter set, no topic is created, no subscription exists,
@@ -2678,6 +2738,13 @@ Resources:
           AWESOME_AUTH_REGISTRATION_CLOSED: !If [RegistrationClosed, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_2FA_REQUIRED: !If [TwoFactorIsRequired, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_2FA_ENROL_ON_LOGIN: !If [TwoFactorEnrolsOnLogin, 'true', !Ref 'AWS::NoValue']
+          # Staff invitations, by the same rule: set only when switched on, so
+          # a ConfigFile's invitations.* and admin.revealInvitationToken are
+          # never overridden by a value the operator did not write.
+          AWESOME_AUTH_INVITATIONS_ENABLED: !If [InvitationsAreEnabled, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_INVITATIONS_TTL: !If [HasInvitationsTtl, !Ref InvitationsTtl, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_INVITATIONS_REINVITE: !If [InvitationsMayReinvite, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN: !If [AdminRevealsInvitationToken, 'true', !Ref 'AWS::NoValue']
           AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL: !If [HasClaimsWebhook, !Ref ClaimsWebhookUrl, !Ref 'AWS::NoValue']
           # !Sub rather than !Ref: a Lambda environment variable is a string,
           # and the parameter is a Number so that CloudFormation enforces the
@@ -2920,6 +2987,14 @@ Resources:
         #     this template.
         #   * Index ARNs only accept read actions, and the store only ever
         #     Queries GSI1.
+        #   * Staff invitations (internal/store/dynamodb/invitations.go) add
+        #     access patterns, not actions: a consistent GetItem of the
+        #     INVTOKEN#<hash> pointer and the INV#<id> record, a consistent
+        #     Query of the INVUSER#<userId> partition with a BatchGetItem of
+        #     the records it names, a Query of GSI1's INVITATION partition,
+        #     and transactions of conditioned Put/Update/Delete for create,
+        #     consume, revoke and release — no bare ConditionCheck, so the
+        #     list below already covers them, and iam_test.go pins it.
         #
         # If you copy one thing out of this template, copy this. A wildcard
         # resource in an auth service's execution role is a bad example that
