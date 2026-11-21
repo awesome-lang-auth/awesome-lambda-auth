@@ -197,8 +197,10 @@ func WireDeviations() []WireDeviation {
 				"Set-Cookie, not even the CSRF auto-init one, because the limiter is outermost and nothing that sets a cookie " +
 				"has run. No RateLimit-Limit, RateLimit-Remaining or RateLimit-Reset header is sent, on this response or on a " +
 				"successful one. The default budget is 10 requests per 60-second fixed window per subject per scope, and the " +
-				"default subject is the normalised email in the request body, falling back to the sha256 of a presented " +
-				"tempToken and then to the client address the event reported. The promote route shares the budget, the window " +
+				"default subject is what the route's handler acts on, read with the handler's own JSON decoding and mode: the " +
+				"normalised email in the request body, the sha256 of the tempToken where the handler acts on a challenge, the " +
+				"userId where it acts on an id, and the client address the event reported where it acts on none of them. " +
+				"The promote route shares the budget, the window " +
 				"and the switch, runs its limiter ahead of the admin guard, and is keyed by the client address under either " +
 				"keyBy: its body names how to promote and its path names the person being promoted, and neither is a subject " +
 				"a caller should be able to mint budgets with. The admin login is deliberately not limited, on either line. " +

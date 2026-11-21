@@ -40,3 +40,25 @@ under [Unreleased].
   beside `EnableCloudFront`, whose distribution does not send the header.
   New product deviation `origin-verify-refusal-is-a-bare-403`;
   `docs/config-reference.md` §19.
+
+### Security
+
+- **Rate-limit subject canonicalisation** (`rateLimit.keyBy: email`, the
+  default). The limiter read a request's subject from the body by rules of its
+  own rather than the way the route reads the same body, so a request could be
+  counted against a different subject from the one the route then acted on,
+  and a per-account or per-challenge budget did not reliably bound the
+  requests made against that account or challenge. The limiter now decodes the
+  body with the routes' own decoder (`encoding/json`, the first JSON value,
+  into the routes' own member names) and chooses the member the way each route
+  does, `mode` included, on every route it reads a body on: `POST
+  <prefix>/login`, `/register`, `/forgot-password`, `/magic-link/send`,
+  `/magic-link/verify`, `/sms/send`, `/sms/verify` and `/2fa/verify`, and
+  `POST <admin>/login`. It reads the body to the end of that first value, as
+  the route does, rather than at most 8 KiB of it. Two subjects change with
+  it: `POST <prefix>/sms/send` without an email is now keyed by its `userId`,
+  where it was keyed by the client address, and `POST
+  <prefix>/magic-link/verify` outside `mode: "2fa"` by the client address
+  whatever else its body holds. `keyBy: ip`, the address fallback and the
+  response are unchanged. Deployments on the default `keyBy` should redeploy;
+  no configuration change is needed. `docs/config-reference.md` §14.1–14.2.
