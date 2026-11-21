@@ -290,6 +290,20 @@ func TestTwoFactorPolicyWarnings(t *testing.T) {
 			t.Errorf("the remedy does not name admin.loginPath: %s", w.Error())
 		}
 	})
+	t.Run("required beside a mail or SMS transport", func(t *testing.T) {
+		ws := warningsFor(t, func(doc Document) {
+			set(doc, "twoFactor.required", true)
+			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+			set(doc, "email.mailer.from", "no-reply@example.com")
+		}, baseEnv())
+		w := find(ws, "twoFactor.required", "magic-link/verify")
+		if w == nil {
+			t.Fatalf("no warning that the magic-link login skips the factor: %v", ws)
+		}
+		if strings.Contains(w.Problem, "sms/verify") {
+			t.Errorf("the warning names the SMS login with no SMS transport: %s", w.Error())
+		}
+	})
 	t.Run("required alone warns about nothing", func(t *testing.T) {
 		ws := warningsFor(t, func(doc Document) { set(doc, "twoFactor.required", true) }, baseEnv())
 		for _, w := range ws {

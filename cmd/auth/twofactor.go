@@ -60,10 +60,11 @@ import (
 // Two booleans, both off by default, both handed to the core as written.
 //
 // twoFactor.required is the core's Config.Require2FA (WithRequire2FA). Since
-// v0.14.0 the core enforces it at login: an account with an enrolled factor
-// gets the challenge, and one with none gets the reference's
-// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"} and
-// no session. It is also a term of POST <prefix>/2fa/disable's refusal, with
+// v0.14.0 the core enforces it at login: an account with a factor it can
+// present gets the challenge — an enrolled TOTP, or the emailed link or texted
+// code where a mail or SMS transport is wired — and one with none gets the
+// reference's 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
+// and no session. It is also a term of POST <prefix>/2fa/disable's refusal, with
 // or without a settings store. Before this knob the product could not ask for
 // either: runtimeSettings.require2fa seeds the settings store, which the core
 // reads on /2fa/disable and nowhere else, so "require2fa" in a document
@@ -83,10 +84,12 @@ import (
 //
 // What neither reaches, stated here because the operator who turns them on
 // will assume otherwise: the OAuth callback issues a session with no second
-// factor (oauth-callback-skips-the-second-factor), and the console's own
-// POST <admin>/login is password-only (admin-login-skips-the-second-factor).
-// The loader warns on both combinations; oauth_test.go and admin_test.go pin
-// that both still hold with twoFactor.required on.
+// factor (oauth-callback-skips-the-second-factor), the console's own
+// POST <admin>/login is password-only (admin-login-skips-the-second-factor),
+// and the passwordless logins — magic-link and SMS in login mode — open a
+// session on the one factor they delivered, as the reference's do. The loader
+// warns on each combination; realm_test.go pins that all three still hold
+// with twoFactor.required on.
 
 // twoFactorOptions hands the core the TOTP issuer and the second-factor
 // policy.

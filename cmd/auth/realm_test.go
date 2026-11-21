@@ -464,3 +464,39 @@ func TestAdminLoginSkipsTheFactorTheRealmRequires(t *testing.T) {
 			"If upstream's admin login now honours the policy, retire admin-login-skips-the-second-factor and the loader's warning", rec.Code, rec.Body.String())
 	}
 }
+
+// TestMagicLinkLoginSkipsTheFactorTheRealmRequires: POST
+// <prefix>/magic-link/verify in login mode opens a session on the emailed link
+// alone, under twoFactor.required too — the reference's passwordless login,
+// which the policy does not reach. With a mail transport wired the emailed link
+// is also a second factor the password login can be challenged for
+// (available2faMethods carries magic-link), so that login is the challenge
+// rather than 2FA_SETUP_REQUIRED and opens nothing; the direct link login is
+// one factor all the same. The loader warns whenever a mail transport is wired;
+// this pins that the warning describes the wire.
+func TestMagicLinkLoginSkipsTheFactorTheRealmRequires(t *testing.T) {
+	t.Parallel()
+	d := newDeliveryApp(t, mailerEnv(with(baseEnv(), "AWESOME_AUTH_2FA_REQUIRED", "true")))
+	const owner = "passwordless@example.test"
+	if reg := invoke(t, d.app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(owner)); reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register answered %d %s", reg.StatusCode, reg.Body)
+	}
+	login := invoke(t, d.app, http.MethodPost, "/auth/login", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, loginBody(owner, testPassword))
+	if login.StatusCode != http.StatusOK || decodeBody(t, login)["requiresTwoFactor"] != true || decodeBody(t, login)["accessToken"] != nil {
+		t.Fatalf("the password login answered %d %s, want the challenge and no session; the policy is not on and this test proves nothing", login.StatusCode, login.Body)
+	}
+	methods, _ := decodeBody(t, login)["available2faMethods"].([]any)
+	if len(methods) != 1 || methods[0] != "magic-link" {
+		t.Errorf("available2faMethods = %v, want [magic-link]: with a mailer the emailed link is the account's second factor", methods)
+	}
+	if send := invoke(t, d.app, http.MethodPost, "/auth/magic-link/send", jsonHeaders(), nil, fmt.Sprintf(`{"email":%q}`, owner)); send.StatusCode != http.StatusOK {
+		t.Fatalf("magic-link/send answered %d %s", send.StatusCode, send.Body)
+	}
+	verify := invoke(t, d.app, http.MethodPost, "/auth/magic-link/verify",
+		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil,
+		fmt.Sprintf(`{"token":%q}`, tokenIn(t, linkIn(t, d.mail.only(t).Body))))
+	if verify.StatusCode != http.StatusOK || decodeBody(t, verify)["accessToken"] == nil {
+		t.Fatalf("magic-link/verify answered %d %s under twoFactor.required.\n"+
+			"If the core now applies the policy to the passwordless logins, retire the loader's warning", verify.StatusCode, verify.Body)
+	}
+}

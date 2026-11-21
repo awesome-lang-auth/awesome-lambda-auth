@@ -598,6 +598,27 @@ func collectRealmWarnings(cfg *Config) {
 				strings.Join(sortedKeys(cfg.OAuth.Providers), ", ")),
 			"rely on the provider's own second factor for those sign-ins, or remove oauth.providers from a realm whose policy is that every session proved two factors here")
 	}
+	// The two passwordless logins. In their login mode POST
+	// <prefix>/magic-link/verify and POST <prefix>/sms/verify open a session on
+	// the one factor they delivered, as the reference's do — the policy is a
+	// term of the password login and of /2fa/disable, not of these — and
+	// either is reachable whenever its transport is wired: a mailer or the
+	// delivery webhook for the link, an SMS endpoint or the webhook for the
+	// code.
+	mail := strings.TrimSpace(cfg.Email.Mailer.From) != "" || strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
+	sms := strings.TrimSpace(cfg.SMS.Endpoint) != "" || strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
+	if cfg.TwoFactor.Required && (mail || sms) {
+		var routes []string
+		if mail {
+			routes = append(routes, "POST <prefix>/magic-link/verify")
+		}
+		if sms {
+			routes = append(routes, "POST <prefix>/sms/verify")
+		}
+		cfg.warn("twoFactor.required",
+			"a second factor is required at POST <prefix>/login, and "+strings.Join(routes, " and ")+" in login mode open a session on the one factor delivered, as the reference's do",
+			"keep the transport only if an emailed link or a texted code is meant to sign in on its own; otherwise leave it unconfigured, or refuse the login mode at the front door")
+	}
 	if cfg.TwoFactor.Required && cfg.Admin.Enabled {
 		cfg.warn("twoFactor.required",
 			"a second factor is required at POST <prefix>/login, and the admin console's own POST <admin>/login mints a 24-hour admin token on the password alone (product deviation admin-login-skips-the-second-factor)",

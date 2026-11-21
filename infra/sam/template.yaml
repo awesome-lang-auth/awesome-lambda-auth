@@ -398,12 +398,12 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       AWESOME_AUTH_2FA_REQUIRED. "true" demands a second factor at every
-      password login: an enrolled account gets the TOTP challenge, an account
+      password login: an account with a factor gets the challenge, an account
       with none answers 403 2FA_SETUP_REQUIRED and gets no session, and POST
       /2fa/disable is refused. Not the same as runtimeSettings.require2fa,
-      which only blocks /2fa/disable. The OAuth callback and the admin
-      console's own POST /admin/login still issue sessions without a factor
-      (the function warns at start).
+      which only blocks /2fa/disable. The OAuth callback, the admin console's
+      own POST /admin/login and the magic-link and SMS logins still issue
+      sessions without a second factor (the function warns at start).
 
   TwoFactorEnrolOnLogin:
     Type: String

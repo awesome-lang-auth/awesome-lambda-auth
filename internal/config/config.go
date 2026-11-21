@@ -405,11 +405,15 @@ type TwoFactor struct {
 	AppName string `json:"appName"`
 
 	// Required demands a second factor of every account at login: the core's
-	// Config.Require2FA (auth.WithRequire2FA). An account with an enrolled
-	// factor gets the reference's challenge; one with none gets
+	// Config.Require2FA (auth.WithRequire2FA). An account with a factor it can
+	// present gets the reference's challenge — an enrolled TOTP, or, with a
+	// mail or SMS transport wired, the emailed link or the texted code, which
+	// the core counts as factors — and one with none gets
 	// 403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}
 	// and no session; and POST <prefix>/2fa/disable answers 403 2FA_REQUIRED
-	// to everyone, with or without a settings store.
+	// to everyone, with or without a settings store. The passwordless logins
+	// (magic-link and SMS in login mode), the OAuth callback and the console's
+	// own login are not password logins and do not ask; the loader warns.
 	//
 	// [new] — the reference has no deployment-level require2FA: the name lives
 	// on the settings store and on the user record only, and its login demands
