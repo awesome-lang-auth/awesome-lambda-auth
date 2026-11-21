@@ -17,13 +17,13 @@ package contract
 //     challenge — instead of registering one, so every capability is still
 //     probed.
 //   - registration-closed is the declared closure, verified: POST /register
-//     must answer 404. 2fa-required is the declared policy, verified as far as
-//     the realm lets it be seen: on an open realm a fresh account's password
-//     must open no session — 403 2FA_SETUP_REQUIRED, or the challenge where a
-//     mail or SMS transport makes a factor deliverable; on a closed one the
-//     declared account must be challenged rather than logged straight in.
-//     2fa-enrol-on-login is probed on an open realm whose fresh account is
-//     told to enrol, with that account's token.
+//     must answer 404. 2fa-required is the declared policy — every session
+//     proves a TOTP code — verified as far as the realm lets it be seen: the
+//     declared account must be challenged rather than logged straight in, and
+//     for TOTP alone, never for an emailed link or a texted code; on an open
+//     realm a fresh account's password must answer 403 2FA_SETUP_REQUIRED,
+//     whatever transports are wired. 2fa-enrol-on-login is probed on an open
+//     realm, with that fresh account's token.
 //   - Every case that provisions an account of its own (Env.NewAccount, and
 //     LoginCookie and LoginBearer through it) skips, with that reason, because
 //     it registers through the closed route or signs in with a password alone.
@@ -190,6 +190,15 @@ func init() {
 			login := p.Env.NewClient().POST(t, "/login", body{"email": r.account.Email, "password": r.account.Password})
 			switch {
 			case login.Status == 200 && login.obj(t)["requiresTwoFactor"] == true:
+				// Challenged — for TOTP alone. An emailed link or a texted code
+				// offered as the second step lets a mailbox (which also
+				// receives the reset link) or a phone answer for the factor.
+				if methods, _ := login.obj(t)["available2faMethods"].([]any); len(methods) != 1 || methods[0] != "totp" {
+					p.Set(Cap2FARequired, capability{state: capBroken, why: fmt.Sprintf(
+						"declared required, and the realm account's challenge offers %v: under the policy a TOTP code is the only second factor — %s", methods, login.where())})
+					p.Set(Cap2FAEnrolOnLogin, capability{state: capBroken, why: "the policy itself is broken; see 2fa-required"})
+					return
+				}
 			case login.Status == 200:
 				p.Set(Cap2FARequired, capability{state: capBroken, why: "declared required, and the realm account's password alone opened a session: " + login.where()})
 				p.Set(Cap2FAEnrolOnLogin, capability{state: capBroken, why: "the policy itself is broken; see 2fa-required"})
@@ -200,39 +209,31 @@ func init() {
 				return
 			}
 			if r.closed {
-				p.Set(Cap2FARequired, capability{state: capOn, why: "the realm account is challenged for its factor; what an account with none is answered cannot be seen on a closed realm"})
+				p.Set(Cap2FARequired, capability{state: capOn, why: "the realm account is challenged for TOTP alone; what an account with none is answered cannot be seen on a closed realm"})
 				p.Set(Cap2FAEnrolOnLogin, capability{state: capAbsent, why: "a closed realm has no unenrolled account to probe forced enrolment with"})
 				return
 			}
 
 			// An open realm: a fresh account has no TOTP, so its login is the
-			// policy's own answer, and it has two right ones. Where no factor
-			// is deliverable it is told to enrol: 403 2FA_SETUP_REQUIRED.
-			// Where a mail or SMS transport is wired the emailed link or the
-			// texted code is a factor the core counts (the core's
-			// advertised-2fa-methods-require-store-support), so it is
-			// challenged instead. Either way a password alone opens nothing,
-			// which is the claim; a session is the fault.
+			// policy's own answer: 403 2FA_SETUP_REQUIRED, whatever transports
+			// are wired. A challenge here would be one for a mailed or texted
+			// factor — the core counts both wherever it can deliver them
+			// (advertised-2fa-methods-require-store-support) — which is the
+			// mailbox or the phone standing in for the factor, and broken.
 			fresh := p.Env.registerFresh(t)
 			gated := p.Env.NewClient().POST(t, "/login", body{"email": fresh.Email, "password": fresh.Password})
 			m := map[string]any{}
 			if gated.Status == 403 || gated.Status == 200 {
 				m = gated.obj(t)
 			}
-			_, session := m["accessToken"]
-			if gated.Status == 200 && m["requiresTwoFactor"] == true && !session && gated.cookie(cookieAccess) == nil {
-				p.Set(Cap2FARequired, capability{state: capOn, why: fmt.Sprintf(
-					"a fresh account's login answered the challenge for a factor the deployment delivers (available2faMethods %v), and the realm account is challenged", m["available2faMethods"])})
-				p.Set(Cap2FAEnrolOnLogin, capability{state: capAbsent, why: "a fresh account here is challenged for a mailed or texted factor rather than told to enrol, so forced enrolment cannot be probed"})
-				return
-			}
 			temp, _ := m["tempToken"].(string)
 			if gated.Status != 403 || m["code"] != "2FA_SETUP_REQUIRED" || m["requires2FASetup"] != true || temp == "" {
-				p.Set(Cap2FARequired, capability{state: capBroken, why: "declared required, and a fresh account's password login is neither 403 2FA_SETUP_REQUIRED nor the challenge: " + gated.where()})
+				p.Set(Cap2FARequired, capability{state: capBroken, why: "declared required, and a fresh account's password login is not 403 2FA_SETUP_REQUIRED with a tempToken " +
+					"(a challenge for an account with no TOTP is one for a mailed or texted factor): " + gated.where()})
 				p.Set(Cap2FAEnrolOnLogin, capability{state: capBroken, why: "the policy itself is broken; see 2fa-required"})
 				return
 			}
-			p.Set(Cap2FARequired, capability{state: capOn, why: "a fresh account's login answered 403 2FA_SETUP_REQUIRED and the realm account is challenged"})
+			p.Set(Cap2FARequired, capability{state: capOn, why: "a fresh account's login answered 403 2FA_SETUP_REQUIRED and the realm account is challenged for TOTP alone"})
 
 			// Forced enrolment: does the token enrol? POST /2fa/setup with it
 			// answers a secret and stores nothing, so the probe costs nothing
@@ -325,9 +326,9 @@ func init() {
 		Case{
 			Name: "2fa-required/password-alone-opens-no-session",
 			Doc: "core config-require2fa-is-a-system-policy-term (twoFactor.required here) — under the policy a password alone " +
-				"opens no session: an enrolled account gets the challenge (auth.router.ts:569-576) and completes it with its " +
-				"factor; an account with none gets 403 {\"requires2FASetup\":true,\"tempToken\":…,\"code\":\"2FA_SETUP_REQUIRED\"} " +
-				"(:562-568), whose token opens nothing",
+				"opens no session: an enrolled account gets the challenge (auth.router.ts:569-576), offering TOTP alone, and " +
+				"completes it with its code; an account with no TOTP gets 403 {\"requires2FASetup\":true,\"tempToken\":…," +
+				"\"code\":\"2FA_SETUP_REQUIRED\"} (:562-568), whose token opens nothing, whatever transports are wired",
 			Needs: []Capability{Cap2FARequired},
 			Run: func(t *testing.T, e *Env) {
 				acct := e.Realm.account
@@ -341,6 +342,10 @@ func init() {
 					m := login.obj(t)
 					if m["requiresTwoFactor"] != true {
 						t.Fatalf("%s mode: the realm account was not challenged\n  %s", mode.name, login.where())
+					}
+					if methods, _ := m["available2faMethods"].([]any); len(methods) != 1 || methods[0] != "totp" {
+						t.Errorf("%s mode: the challenge offers %v, want [totp]: an emailed link or a texted code as the second step "+
+							"lets a mailbox or a phone answer for the factor\n  %s", mode.name, methods, login.where())
 					}
 					for _, credential := range []string{"accessToken", "refreshToken"} {
 						if _, leaked := m[credential]; leaked {
@@ -368,34 +373,22 @@ func init() {
 					t.Log("a closed realm has no account without a factor to show the setup-required answer on; it is covered on an open realm")
 					return
 				}
-				// A fresh account has no TOTP. Told to enrol where no factor is
-				// deliverable; challenged where a mailed or texted one is.
+				// A fresh account has no TOTP, and is told to enrol whatever
+				// transports are wired: under the policy neither a mailed nor
+				// a texted code is a factor it can be challenged for.
 				fresh := e.registerFresh(t)
 				gated := e.NewClient().POST(t, "/login", body{"email": fresh.Email, "password": fresh.Password})
 				if ck := gated.cookie(cookieAccess); ck != nil {
 					t.Errorf("a password alone set %s\n  %s", ck.Name, gated.where())
 				}
-				switch gated.Status {
-				case 403:
-					g := gated.obj(t)
-					if g["requires2FASetup"] != true || g["code"] != "2FA_SETUP_REQUIRED" {
-						t.Errorf("want {requires2FASetup:true, code:2FA_SETUP_REQUIRED}\n  %s", gated.where())
-					}
-					temp := gated.str(t, "tempToken")
-					if me := e.NewClient().GET(t, "/me", Bearer(temp)); me.Status == 200 {
-						t.Errorf("the setup-required tempToken opened GET /me\n  %s", me.where())
-					}
-				case 200:
-					g := gated.obj(t)
-					methods, _ := g["available2faMethods"].([]any)
-					if g["requiresTwoFactor"] != true || len(methods) == 0 {
-						t.Errorf("a fresh account's password alone was answered 200 without the challenge\n  %s", gated.where())
-					}
-					if _, leaked := g["accessToken"]; leaked {
-						t.Errorf("the challenge carries an access token\n  %s", gated.where())
-					}
-				default:
-					t.Errorf("want 403 2FA_SETUP_REQUIRED, or the challenge where a mailed or texted factor is deliverable\n  %s", gated.where())
+				gated.mustStatus(t, 403)
+				g := gated.obj(t)
+				if g["requires2FASetup"] != true || g["code"] != "2FA_SETUP_REQUIRED" {
+					t.Errorf("want {requires2FASetup:true, code:2FA_SETUP_REQUIRED}\n  %s", gated.where())
+				}
+				temp := gated.str(t, "tempToken")
+				if me := e.NewClient().GET(t, "/me", Bearer(temp)); me.Status == 200 {
+					t.Errorf("the setup-required tempToken opened GET /me\n  %s", me.where())
 				}
 			},
 		},
@@ -452,12 +445,12 @@ func init() {
 
 		Case{
 			Name: "2fa-required/one-factor-sign-ins-are-refused",
-			Doc: "product deviation two-factor-required-refuses-one-factor-sign-ins (twoFactor.required here) — under the policy the " +
-				"login mode of POST /magic-link/send, /magic-link/verify, /sms/send and /sms/verify, and POST /link-verify with " +
-				"loginAfterLinking, answer 403 {\"error\":\"Two-factor authentication required\",\"code\":\"2FA_REQUIRED\"} before " +
-				"anything is minted, sent or consumed, whatever transports and stores the deployment has; the step-up mode " +
-				"(mode \"2fa\") reaches the route, which judges its tempToken. The reference has no such policy: there the link " +
-				"or the code alone opens a session",
+			Doc: "product deviation two-factor-required-refuses-one-factor-sign-ins (twoFactor.required here) — under the policy " +
+				"POST /magic-link/send, /magic-link/verify, /sms/send and /sms/verify answer 403 {\"error\":\"Two-factor " +
+				"authentication required\",\"code\":\"2FA_REQUIRED\"} in every mode — the step-up (mode \"2fa\") with a genuine " +
+				"challenge's tempToken included, because a TOTP code is the only second factor — and so does POST /link-verify with " +
+				"loginAfterLinking, before anything is minted, sent or consumed, whatever transports and stores the deployment " +
+				"has. The reference has no such policy: there the link or the code alone opens a session, or answers the challenge",
 			Needs: []Capability{Cap2FARequired},
 			Run: func(t *testing.T, e *Env) {
 				stranger := randomAccount()
@@ -484,12 +477,28 @@ func init() {
 						}
 					}
 				}
-				// The step-up mode is the second factor itself and reaches the
-				// route, which refuses a tempToken that is not one with its own
-				// 401 — not the policy's 403.
-				e.NewClient().POST(t, "/magic-link/verify",
-					body{"token": "0123456789abcdef0123456789abcdef", "mode": "2fa", "tempToken": "not.a.token"}, BearerStrategy()).
-					mustError(t, 401, "INVALID_TEMP_TOKEN", "")
+				// The step-up mode, with the tempToken of a genuine challenge — the
+				// realm account's: refused too, before the route judges the
+				// token. Under the policy neither the emailed link nor the
+				// texted code may stand in for the TOTP code.
+				login := e.NewClient().POST(t, "/login", body{"email": e.Realm.account.Email, "password": e.Realm.account.Password}, BearerStrategy())
+				login.mustStatus(t, 200)
+				temp := login.str(t, "tempToken")
+				for _, probe := range []struct {
+					path string
+					b    body
+				}{
+					{"/magic-link/send", body{"mode": "2fa", "tempToken": temp}},
+					{"/magic-link/verify", body{"token": "0123456789abcdef0123456789abcdef", "mode": "2fa", "tempToken": temp}},
+					{"/sms/send", body{"mode": "2fa", "tempToken": temp}},
+					{"/sms/verify", body{"code": "000000", "mode": "2fa", "tempToken": temp}},
+				} {
+					r := e.NewClient().POST(t, probe.path, probe.b, BearerStrategy())
+					r.mustError(t, 403, "2FA_REQUIRED", "Two-factor authentication required")
+					if _, leaked := r.obj(t)["accessToken"]; leaked {
+						t.Errorf("the step-up refusal at %s carries a token\n  %s", probe.path, r.where())
+					}
+				}
 			},
 		},
 
