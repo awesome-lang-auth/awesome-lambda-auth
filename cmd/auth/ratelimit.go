@@ -153,12 +153,45 @@ import (
 // all in one partition under one budget — a self-inflicted denial of service an
 // attacker triggers on purpose by sending nothing. Skipping the limiter would
 // leave POST /2fa/verify, a six-digit code, unlimited, which is the single route
-// a limiter is most obviously for. So each route declares an ordered list of
-// subject sources and every list ends, implicitly, at the client address:
-// `email` where the body has one, the sha256 of the presented `tempToken` where
-// it has a challenge instead, and the address otherwise. Nothing in that chain
-// verifies anything or reads a store — a hash is not a check — so the refusal
-// still costs nothing downstream.
+// a limiter is most obviously for. So each route names its subject the way its
+// handler names what it acts on — the `email` where the handler acts on an
+// address, the sha256 of the `tempToken` where it acts on a challenge, the
+// `userId` where it acts on an id — and falls back to the client address where
+// the handler would act on none of them. Nothing in that verifies anything or
+// reads a store — a hash is not a check — so the refusal still costs nothing
+// downstream.
+//
+// ── the limiter reads the body the way the handler does ──────────────────────
+//
+// A subject read from the body is a limit only if it is the subject the handler
+// then acts on. Wherever the two readings can differ, a request is counted
+// against one subject and served for another, and the budget being spent is not
+// the one the operator configured. So rateLimitSubject keeps no reading of its
+// own:
+//
+//   - It decodes the body with the call the core's handlers make —
+//     encoding/json's Decoder over the body, the first JSON value only
+//     (auth.DecodeOptionalJSON; POST <admin>/login decodes the same way and
+//     discards the error) — into rateLimitFields, whose members carry the
+//     handlers' own json tags. A member name therefore matches exactly when it
+//     matches for the handler: case-insensitively, by the Unicode folding
+//     encoding/json applies and not by ASCII case alone. A member present more
+//     than once is read at its last appearance, a null leaves the value in
+//     place, and bytes after the first value are ignored rather than an error —
+//     all as the handler reads them.
+//   - It chooses the member the way the handler does, branch for branch,
+//     including the auth.TwoFactorMode(mode) switch between the address or id a
+//     body names and the challenge it presents. A member the handler ignores on
+//     its branch never names the subject.
+//   - It reads the body to the end of that first value, however long the body
+//     is, because the handler does: a bound the handler did not share would be
+//     one more place for the two readings to part.
+//
+// A literally shared decode function is out of reach: the request types are
+// unexported in the core's adapter and the core is not forked. What is shared is
+// the decoder and auth.TwoFactorMode; the tags and the branches are mirrored
+// here, TestRateLimitSubjectFollowsTheHandler pins the mirror route by route,
+// and the end-to-end cases beside it hold it against the real handlers.
 
 // The exact 429. It is one literal because the deviation register quotes it
 // verbatim and rateLimitResponseIsExactlyThis pins it; anything that reassembled
@@ -214,60 +247,99 @@ func writeRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
 	_, _ = io.WriteString(w, rateLimitBody)
 }
 
-// rateLimitSubjectSource is one place a route's subject may be read from, in the
-// order the route prefers them. It is only consulted when `keyBy: email`: with
-// `keyBy: ip` the subject is the client address on every route and no body is
-// ever read.
-type rateLimitSubjectSource struct {
-	// field is the JSON body member to read.
-	field string
-
-	// address normalises the value the way the core normalises an address
-	// (lower-cased and trimmed, service.go:58), so that Alice@Example.com and
-	// alice@example.com are one budget rather than two. Without it, case is a
-	// free reset.
-	address bool
-
-	// hash replaces the value with a truncated sha256 of it. Set for anything
-	// that is a credential: a tempToken names the challenge it belongs to, which
-	// is exactly the subject wanted, but it is also a bearer credential and must
-	// not become a partition key in the clear. The hash is a stable name for the
-	// same challenge and reveals nothing about it.
-	hash bool
+// rateLimitFields is what a limited route's handler reads its subject from: the
+// members it acts on, under the json tags the core's handlers declare for them —
+// `email` (adapter/nethttp loginRequest, registerRequest, forgotPasswordRequest,
+// magicLinkSendRequest and smsSendRequest; the anonymous body of admin.go
+// adminLogin), `mode` and `tempToken` (magicLinkSendRequest,
+// magicLinkVerifyRequest, smsSendRequest and smsVerifyRequest;
+// twoFactorVerifyRequest has `tempToken` alone) and `userId` (smsSendRequest and
+// smsVerifyRequest).
+//
+// It is only decoded under `keyBy: email`: with `keyBy: ip` the subject is the
+// client address on every route and no body is ever read.
+//
+// One struct serves every route because no member name in those handler types
+// folds onto another, so a body member lands on the same field here as in the
+// handler's own type; the fields a route's handler lacks are never consulted by
+// that route's subject function.
+type rateLimitFields struct {
+	Email     string `json:"email"`
+	Mode      string `json:"mode"`
+	TempToken string `json:"tempToken"`
+	UserID    string `json:"userId"`
 }
 
-// The subject chains. Every one of them ends, implicitly, at the client address;
-// see rateLimitSubject.
-var (
-	// subjectFromEmail: the routes whose body names the account being acted on.
-	subjectFromEmail = []rateLimitSubjectSource{{field: "email", address: true}}
+// rateLimitSubjectFunc names a route's subject from its decoded body, choosing
+// the member the route's handler acts on. "" means the handler acts on nothing
+// the function can name, and rateLimitSubject falls back to the client address.
+type rateLimitSubjectFunc func(rateLimitFields) string
 
-	// subjectFromEmailOrChallenge: /magic-link/send and /sms/send take an email
-	// in login mode and a tempToken in `mode: "2fa"`, where the address is
-	// derived from the token and the body's email is ignored outright
-	// (auth.router.ts:1087-1107, :1192-1203). One chain covers both modes
-	// without this file having to parse `mode`.
-	subjectFromEmailOrChallenge = []rateLimitSubjectSource{
-		{field: "email", address: true},
-		{field: "tempToken", hash: true},
+// The subject functions, one per handler shape. Each one follows its handler in
+// adapter/nethttp branch for branch; see the file header for why that, and not
+// a reading of the body's own, is the rule.
+
+// subjectFromEmail: the routes whose handler acts on the account the body's
+// `email` names — /login, /register, /forgot-password (nethttp.go Login and
+// Register, password_email.go ForgotPassword) and POST <admin>/login (core
+// admin.go adminLogin).
+func subjectFromEmail(f rateLimitFields) string { return emailSubject(f.Email) }
+
+// subjectOfMagicLinkSend: in `mode: "2fa"` the handler sends to the account the
+// tempToken belongs to and ignores the body's email outright; otherwise it
+// sends to the email (passwordless.go MagicLinkSend; auth.router.ts:1087-1107).
+func subjectOfMagicLinkSend(f rateLimitFields) string {
+	if auth.TwoFactorMode(f.Mode) {
+		return challengeSubject(f.TempToken)
 	}
+	return emailSubject(f.Email)
+}
 
-	// subjectFromChallenge: POST /2fa/verify carries a tempToken and a totpCode
-	// and no identity at all (auth.router.ts:859-877). Keying on the challenge
-	// is what makes this route's limit exact: an attacker brute-forcing the
-	// six-digit code holds one tempToken and presents it with every guess, so
-	// the counter is per challenge; one who rotates tokens has to log in again
-	// for each, which `login` limits.
-	subjectFromChallenge = []rateLimitSubjectSource{{field: "tempToken", hash: true}}
-
-	// subjectFromUserOrChallenge: POST /sms/verify carries `userId` in login
-	// mode and `tempToken` in 2FA mode (auth.router.ts:1244-1289). The user id
-	// is an identifier and not a credential, so it is keyed on as it stands.
-	subjectFromUserOrChallenge = []rateLimitSubjectSource{
-		{field: "userId", address: false},
-		{field: "tempToken", hash: true},
+// subjectOfMagicLinkVerify: in `mode: "2fa"` the link is spent for the
+// tempToken's account; otherwise the link token alone is the credential and the
+// body names no account, so the subject is the client address — a per-token
+// budget would give every guess at a token its own (passwordless.go
+// MagicLinkVerify).
+func subjectOfMagicLinkVerify(f rateLimitFields) string {
+	if auth.TwoFactorMode(f.Mode) {
+		return challengeSubject(f.TempToken)
 	}
-)
+	return ""
+}
+
+// subjectOfSMSSend: in `mode: "2fa"` the code goes to the tempToken's account;
+// otherwise to the account a non-blank email names, and failing that to the one
+// `userId` names — an email outranks a userId (passwordless.go SMSSend;
+// auth.router.ts:1192-1203).
+func subjectOfSMSSend(f rateLimitFields) string {
+	switch {
+	case auth.TwoFactorMode(f.Mode):
+		return challengeSubject(f.TempToken)
+	case strings.TrimSpace(f.Email) != "":
+		return emailSubject(f.Email)
+	default:
+		return userIDSubject(f.UserID)
+	}
+}
+
+// subjectOfSMSVerify: in `mode: "2fa"` the code is checked for the tempToken's
+// account; otherwise for the one `userId` names (passwordless.go SMSVerify;
+// auth.router.ts:1244-1289).
+func subjectOfSMSVerify(f rateLimitFields) string {
+	if auth.TwoFactorMode(f.Mode) {
+		return challengeSubject(f.TempToken)
+	}
+	return userIDSubject(f.UserID)
+}
+
+// subjectOfTwoFactorVerify: POST /2fa/verify carries a tempToken and a totpCode
+// and no identity at all, whatever else the body holds (passwordless.go
+// TwoFactorVerify; auth.router.ts:859-877). Keying on the challenge is what
+// makes this route's limit exact: whoever is guessing the six-digit code holds
+// one tempToken and presents it with every guess, so the counter is per
+// challenge; one who rotates tokens has to log in again for each, which `login`
+// limits.
+func subjectOfTwoFactorVerify(f rateLimitFields) string { return challengeSubject(f.TempToken) }
 
 // rateLimitRoute is one path the limiter watches, and how it names a subject on
 // it.
@@ -282,9 +354,9 @@ type rateLimitRoute struct {
 	// every one of them through a real mount and fails on a 404.
 	path string
 
-	// subjects is the ordered chain tried under `keyBy: email`. Nil means the
-	// route has no identity in its body and is keyed by the client address.
-	subjects []rateLimitSubjectSource
+	// subject names the subject under `keyBy: email`. Nil means the route has
+	// no identity in its body and is keyed by the client address.
+	subject rateLimitSubjectFunc
 }
 
 // rateLimitRoutes maps each name `rateLimit.scope` accepts onto the routes it
@@ -310,14 +382,14 @@ var rateLimitRoutes = map[string][]rateLimitRoute{
 	"forgot-password": {{http.MethodPost, "/forgot-password", subjectFromEmail}},
 
 	"magic-link": {
-		{http.MethodPost, "/magic-link/send", subjectFromEmailOrChallenge},
-		{http.MethodPost, "/magic-link/verify", subjectFromChallenge},
+		{http.MethodPost, "/magic-link/send", subjectOfMagicLinkSend},
+		{http.MethodPost, "/magic-link/verify", subjectOfMagicLinkVerify},
 	},
 	"sms-code": {
-		{http.MethodPost, "/sms/send", subjectFromEmailOrChallenge},
-		{http.MethodPost, "/sms/verify", subjectFromUserOrChallenge},
+		{http.MethodPost, "/sms/send", subjectOfSMSSend},
+		{http.MethodPost, "/sms/verify", subjectOfSMSVerify},
 	},
-	"2fa-verify": {{http.MethodPost, "/2fa/verify", subjectFromChallenge}},
+	"2fa-verify": {{http.MethodPost, "/2fa/verify", subjectOfTwoFactorVerify}},
 
 	// The four below carry a token and no identity, so under `keyBy: email` they
 	// key by the client address like everything else with nothing to key on. The
@@ -329,16 +401,6 @@ var rateLimitRoutes = map[string][]rateLimitRoute{
 	"verify-email":        {{http.MethodGet, "/verify-email", nil}},
 	"resend-verification": {{http.MethodPost, "/send-verification-email", nil}},
 }
-
-// maxRateLimitBodyPeek bounds what the limiter reads to find a subject.
-//
-// The bodies on these routes are small JSON objects; 8 KiB is far more than any
-// of them and far less than a body an attacker could use to make the limiter
-// itself the expensive part of a refused request. What is read is handed back to
-// the handler untouched — see rateLimitSubject — so a larger body still arrives
-// whole; only the search for a subject gives up, and a body whose first 8 KiB is
-// not parseable JSON simply falls through to the client address.
-const maxRateLimitBodyPeek = 8 << 10
 
 // rateLimitCounter is the shared counter, discovered structurally on whatever
 // the driver returned — the same way settingsStoreProvider finds the settings
@@ -454,15 +516,15 @@ type rateLimiterConfig struct {
 	keyBy  string
 
 	// routes is the resolved match table: "METHOD /prefix/path" to the scope
-	// name and subject chain. Resolved once, at mount time, because the prefix
-	// cannot change afterwards and a per-request join would be work done on
-	// every request to answer a question with a constant answer.
+	// name and subject function. Resolved once, at mount time, because the
+	// prefix cannot change afterwards and a per-request join would be work done
+	// on every request to answer a question with a constant answer.
 	routes map[string]resolvedRateLimitRoute
 }
 
 type resolvedRateLimitRoute struct {
-	scope    string
-	subjects []rateLimitSubjectSource
+	scope   string
+	subject rateLimitSubjectFunc
 }
 
 // resolveRateLimit turns the config block into the table the middleware matches
@@ -479,8 +541,8 @@ func resolveRateLimit(cfg *config.Config) rateLimiterConfig {
 	for _, scope := range cfg.RateLimit.Scope {
 		for _, rt := range rateLimitRoutes[scope] {
 			out.routes[rt.method+" "+prefix+rt.path] = resolvedRateLimitRoute{
-				scope:    scope,
-				subjects: rt.subjects,
+				scope:   scope,
+				subject: rt.subject,
 			}
 		}
 	}
@@ -518,7 +580,7 @@ func newRateLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logg
 				next.ServeHTTP(w, r)
 				return
 			}
-			tier.serve(w, r, route.scope, rateLimitSubject(r, rl.keyBy, route.subjects), next)
+			tier.serve(w, r, route.scope, rateLimitSubject(r, rl.keyBy, route.subject), next)
 		})
 	}
 }
@@ -720,11 +782,12 @@ const adminLoginScope = "admin-login"
 // subject rule: keyBy decides, exactly as it does for POST <prefix>/login —
 // the body's normalised email under `email`, the client address under `ip`,
 // and the address whenever the body names no subject, which is what the
-// bootstrap-secret arm's empty email falls to. The scope is its own, so a
-// caller who has spent the auth login's budget on an address has not spent
-// this one; the alternative, sharing `login`'s scope, would let the console's
-// login exhaust a user's budget on the auth router and the other way round,
-// and the two routes are not one surface.
+// bootstrap-secret arm's empty email falls to. The body is read the way the
+// login itself reads it (decodeRateLimitFields), down to discarding the decode
+// error. The scope is its own, so a caller who has spent the auth login's
+// budget on an address has not spent this one; the alternative, sharing
+// `login`'s scope, would let the console's login exhaust a user's budget on the
+// auth router and the other way round, and the two routes are not one surface.
 //
 // Identity — not nil — when the block is off or the login routes are not
 // mounted: assembleHandler always wraps, and a nil there would be a nil
@@ -767,107 +830,127 @@ func rateLimitRemaining(now time.Time, window time.Duration) time.Duration {
 // rateLimitSubject names the thing being limited.
 //
 // With `keyBy: ip` it is always the client address and the body is never read,
-// which is the cheap case. With `keyBy: email` the route's chain is walked in
-// order and the first usable value wins; a route with no chain, a body that does
-// not parse, and a chain that finds nothing all fall through to the address. "" is
-// returned only when there is no address either, which a client cannot arrange.
+// which is the cheap case. With `keyBy: email` the route's subject function is
+// applied to the body as the route's handler will decode it (see the file
+// header); a route with no function, a body that does not decode and a function
+// that names nothing all fall through to the address. "" is returned only when
+// there is no address either, which a client cannot arrange.
 //
-// The body is read at most once and at most maxRateLimitBodyPeek bytes, and is
-// handed back to the handler whole: what was read is put in front of what was
-// not, so the route below sees the same bytes it would have seen. That is a real
-// cost on a limited request — the limiter buffers up to 8 KiB before it can
-// decide — and it is the price of keying on an account rather than an address.
-// It is paid by refused requests too, which is unavoidable: the subject has to
-// be known before the budget can be checked.
-func rateLimitSubject(r *http.Request, keyBy string, sources []rateLimitSubjectSource) string {
-	if keyBy != config.RateLimitKeyByEmail || len(sources) == 0 {
+// The body is read once, to the end of its first JSON value, and is handed back
+// to the handler whole: what was read is put in front of what was not, so the
+// route below sees the same bytes it would have seen. That is a real cost on a
+// limited request — the limiter parses the body before it can decide — and it
+// is the price of keying on an account rather than an address. It is paid by
+// refused requests too, which is unavoidable: the subject has to be known before
+// the budget can be checked. It is bounded by the body the event carried, which
+// internal/lambdahttp already holds in memory and Lambda caps at its payload
+// limit, and it is one parse of what the handler parses anyway.
+func rateLimitSubject(r *http.Request, keyBy string, subject rateLimitSubjectFunc) string {
+	if keyBy != config.RateLimitKeyByEmail || subject == nil {
 		return clientAddress(r)
 	}
-
-	body := peekRateLimitBody(r)
-	if len(body) > 0 {
-		// A map rather than a struct: the members wanted differ per route and
-		// the reference's handlers read these bodies loosely too. Decoding
-		// failure is not an error here — it is a body that names no subject, and
-		// the address is the answer for those.
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(body, &fields); err == nil {
-			for _, src := range sources {
-				raw, present := fields[src.field]
-				if !present {
-					continue
-				}
-				var v string
-				if err := json.Unmarshal(raw, &v); err != nil {
-					// The member is present but is not a string. A client
-					// sending {"email": {...}} is either broken or probing; in
-					// both cases the next source, and finally the address, is
-					// the right answer rather than a key built from a number.
-					continue
-				}
-				if v = normalizeRateLimitSubject(v, src); v != "" {
-					return v
-				}
-			}
-		}
+	if s := subject(readRateLimitFields(r)); s != "" {
+		return s
 	}
 	return clientAddress(r)
 }
 
-// normalizeRateLimitSubject applies the source's rule and bounds the result.
+// readRateLimitFields decodes the request body the way the limited handlers do
+// and restores it, so the handler below reads exactly what the client sent.
 //
-// The length cap is the store's own (internal/store/dynamodb
-// maxRateLimitSubjectLen, 320 — RFC 5321's longest address). A value over it is
-// refused *here*, by returning "" and moving on to the next source, rather than
-// being truncated: two addresses sharing a 320-byte prefix would otherwise share
-// a budget, which is a way for one account to spend another's.
-func normalizeRateLimitSubject(v string, src rateLimitSubjectSource) string {
-	if src.address {
-		v = strings.ToLower(strings.TrimSpace(v))
-	} else {
-		v = strings.TrimSpace(v)
-	}
-	if v == "" {
-		return ""
-	}
-	if src.hash {
-		// Truncated to 128 bits, which is far past any collision worth
-		// worrying about for a name that lives one window, and keeps the
-		// partition key short.
-		sum := sha256.Sum256([]byte(v))
-		return hex.EncodeToString(sum[:16])
-	}
-	if len(v) > 320 || strings.ContainsAny(v, "\x00\n\r") {
-		return ""
-	}
-	return v
-}
-
-// peekRateLimitBody reads up to maxRateLimitBodyPeek bytes and restores the
-// request body so the handler below reads exactly what the client sent.
+// Everything the decoder consumed — which may run past the first value, since a
+// Decoder reads ahead — is put back in front of what it did not. The original
+// ReadCloser is kept as the Closer: wrapping it in io.NopCloser would leak
+// whatever the server closes at the end of the request.
 //
-// The original ReadCloser is kept as the Closer: wrapping it in io.NopCloser
-// would leak whatever the server closes at the end of the request.
-func peekRateLimitBody(r *http.Request) []byte {
+// A body that fails mid-read decodes to nothing, so the limiter keys on the
+// address instead of guessing from a fragment; what was read is still handed
+// on, and the failure is the handler's to report.
+func readRateLimitFields(r *http.Request) rateLimitFields {
+	var f rateLimitFields
 	if r.Body == nil || r.Body == http.NoBody {
-		return nil
-	}
-	peek, err := io.ReadAll(io.LimitReader(r.Body, maxRateLimitBodyPeek))
-	if len(peek) == 0 {
-		return nil
+		return f
 	}
 	rest := r.Body
+	var seen bytes.Buffer
+	decodeRateLimitFields(io.TeeReader(rest, &seen), &f)
 	r.Body = struct {
 		io.Reader
 		io.Closer
-	}{io.MultiReader(bytes.NewReader(peek), rest), rest}
-	if err != nil {
-		// A body that failed mid-read is the handler's problem to report, not
-		// the limiter's to pre-empt. What was read is still handed on, and the
-		// limiter keys on the address instead of guessing from a fragment.
-		return nil
+	}{io.MultiReader(&seen, rest), rest}
+	return f
+}
+
+// decodeRateLimitFields is the decode the limited handlers perform: one
+// json.Decoder over the body, one Decode of its first value into a struct
+// carrying their tags (core wire_password_email.go DecodeOptionalJSON, which
+// every auth route here decodes with, and admin.go adminLogin).
+//
+// The error is deliberately dropped, and not because it does not matter. A
+// syntax error — a body that is not JSON, or one truncated mid-value — leaves
+// the struct untouched, because Decode reads the whole value before it fills
+// anything, so the subject falls to the address; the auth routes refuse such a
+// body with 400 INVALID_BODY and act on no one. A type error is different:
+// decoding carries on past it, so a member of the wrong type leaves in place
+// whatever an earlier spelling of it set. The auth routes refuse that body too,
+// and counting a refused request against what it named costs nobody anything;
+// POST <admin>/login discards the same error and acts on what was decoded, so
+// the limiter has to count exactly that.
+func decodeRateLimitFields(body io.Reader, f *rateLimitFields) {
+	_ = json.NewDecoder(body).Decode(f)
+}
+
+// emailSubject normalises an address the way the core and the store do —
+// strings.ToLower(strings.TrimSpace(…)), core service.go normalizeEmail and
+// internal/store/dynamodb keys.go normalizeEmail — so that Alice@Example.com and
+// alice@example.com are one budget rather than two. Without it, case is a free
+// reset.
+func emailSubject(v string) string {
+	return boundedRateLimitSubject(strings.ToLower(strings.TrimSpace(v)))
+}
+
+// userIDSubject is a user id as the handlers read it, trimmed (passwordless.go
+// SMSSend and SMSVerify). An id is an identifier and not a credential, so it is
+// keyed on as it stands.
+func userIDSubject(v string) string {
+	return boundedRateLimitSubject(strings.TrimSpace(v))
+}
+
+// challengeSubject names the challenge a tempToken belongs to by a truncated
+// sha256 of the token. The token names exactly the subject wanted, but it is
+// also a bearer credential and must not become a partition key in the clear; the
+// hash is a stable name for the same challenge and reveals nothing about it.
+//
+// The core accepts one spelling of a token — its signature segment is compared
+// as a string (core token.go parseToken) — so the hash of what was presented is
+// the hash of the challenge. Surrounding whitespace is trimmed first, which
+// makes a padded token, one the core refuses, count against the token rather
+// than against a name of its own. Truncated to 128 bits, which is far past any
+// collision worth worrying about for a name that lives one window, and keeps
+// the partition key short.
+func challengeSubject(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
 	}
-	return peek
+	sum := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(sum[:16])
+}
+
+// boundedRateLimitSubject refuses a value the shared counter cannot key on, by
+// returning "" so the subject falls back to the client address.
+//
+// The length cap is the store's own (internal/store/dynamodb
+// maxRateLimitSubjectLen, 320 — RFC 5321's longest address). A value over it is
+// refused *here* rather than truncated: two addresses sharing a 320-byte prefix
+// would otherwise share a budget, which is a way for one account to spend
+// another's. The DynamoDB store refuses the same values as email keys (keys.go
+// checkEmail), so it holds no account whose address the limiter cannot name.
+func boundedRateLimitSubject(v string) string {
+	if v == "" || len(v) > 320 || strings.ContainsAny(v, "\x00\n\r") {
+		return ""
+	}
+	return v
 }
 
 // clientAddress is the host half of RemoteAddr, and it is deliberately **not**

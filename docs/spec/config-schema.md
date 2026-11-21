@@ -315,12 +315,15 @@ one has run. No `RateLimit-*` headers, on this response or on a successful one:
 else's traffic. This is the registered wire deviation
 `rate-limited-routes-answer-429` ([deviations.md](../deviations.md)).
 
-**Under `keyBy: email`, a route whose body carries no address** resolves its
-subject through a per-route chain ending at the client address — body `email` or
-`userId`, else `sha256(tempToken)`, else the address the Lambda event reported
-(never `X-Forwarded-For`, which the client writes). One shared sentinel subject
-was rejected as a self-inflicted outage, and skipping the limiter was rejected
-because it would leave `POST /2fa/verify`, a six-digit code, unlimited.
+**Under `keyBy: email`, the subject is what the route's handler acts on**, read
+the way the handler reads the body — the same JSON decoder into the same member
+names, and the same `mode` branch: the body `email`; the `userId` on
+`/sms/verify`, and on `/sms/send` when the email is blank; `sha256(tempToken)`
+on `/2fa/verify` and in `mode: "2fa"`; and the address the Lambda event reported
+(never `X-Forwarded-For`, which the client writes) when the handler would act on
+none of them. One shared sentinel subject was rejected as a self-inflicted
+outage, and skipping the limiter was rejected because it would leave
+`POST /2fa/verify`, a six-digit code, unlimited.
 
 **Storage and failure.** One conditional `UpdateItem` per limited request,
 allowed or refused ([data-model.md](data-model.md) §1.5 row #61). When that store

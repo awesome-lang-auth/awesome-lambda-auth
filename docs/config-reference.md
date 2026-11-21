@@ -1205,13 +1205,17 @@ validates the vocabulary; `cmd/auth/ratelimit.go` holds the table below, and
 | `login` | `POST <prefix>/login` | body `email` |
 | `register` | `POST <prefix>/register` | body `email` |
 | `forgot-password` | `POST <prefix>/forgot-password` | body `email` |
-| `magic-link` | `POST <prefix>/magic-link/send`, `POST <prefix>/magic-link/verify` | body `email`, else `sha256(tempToken)`, else the client address |
-| `sms-code` | `POST <prefix>/sms/send`, `POST <prefix>/sms/verify` | body `email` or `userId`, else `sha256(tempToken)`, else the client address |
-| `2fa-verify` | `POST <prefix>/2fa/verify` | `sha256(tempToken)`, else the client address |
+| `magic-link` | `POST <prefix>/magic-link/send`, `POST <prefix>/magic-link/verify` | in `mode: "2fa"`, `sha256(tempToken)`; otherwise body `email` on `/send` and the client address on `/verify` |
+| `sms-code` | `POST <prefix>/sms/send`, `POST <prefix>/sms/verify` | in `mode: "2fa"`, `sha256(tempToken)`; otherwise, on `/send`, body `email` when it is not blank and `userId` when it is, and on `/verify`, body `userId` |
+| `2fa-verify` | `POST <prefix>/2fa/verify` | `sha256(tempToken)` |
 | `refresh` | `POST <prefix>/refresh` | the client address |
 | `reset-password` | `POST <prefix>/reset-password` | the client address |
 | `verify-email` | `GET <prefix>/verify-email` | the client address |
 | `resend-verification` | `POST <prefix>/send-verification-email` | the client address |
+
+The subject column is what each route's handler acts on, and §14.2 says how it is
+read. On every row, a body that names none of it falls back to the client
+address.
 
 The default scope is the five flows `docs/spec/data-model.md` §1.5 row #61 names
 — the ones where a guess costs an attacker nothing and where there is no session
@@ -1259,21 +1263,47 @@ a limiter at all.
 #### When `keyBy: email` meets a route with no email
 
 Three of the ten scopes carry no address in the body, and `POST /2fa/verify`
-carries no identity at all. Each route declares an ordered chain (the table in
-§14.1) and every chain ends at the client address. Two alternatives were
-rejected: one shared sentinel subject would put every such request in the
-deployment into a single budget and a single partition — a self-inflicted outage
-an attacker triggers by sending an empty body — and skipping the limiter would
-leave a six-digit TOTP code unlimited, which is the single route a limiter is
-most obviously for.
+carries no identity at all. Each route's subject is what its handler acts on (the
+table in §14.1), and a body that names none of it falls back to the client
+address. Two alternatives were rejected: one shared sentinel subject would put
+every such request in the deployment into a single budget and a single
+partition — a self-inflicted outage an attacker triggers by sending an empty
+body — and skipping the limiter would leave a six-digit TOTP code unlimited,
+which is the single route a limiter is most obviously for.
 
-Where a `tempToken` is present it is preferred over the address, because it names
-the challenge: an attacker brute-forcing the six digits holds one token and
-presents it with every guess, so the counter is exactly per challenge, and one
-who rotates tokens has to log in again for each, which `login` limits. It is
-hashed because it is a bearer credential and must not become a partition key in
-the clear. Nothing in the chain verifies anything or reads a store — a hash is
-not a check — so a refusal still costs nothing downstream.
+Where the handler acts on a challenge — always on `/2fa/verify`, and in
+`mode: "2fa"` on the passwordless routes — the subject is the `tempToken` that
+names it: whoever is guessing the six digits holds one token and presents it
+with every guess, so the counter is exactly per challenge, and one who rotates
+tokens has to log in again for each, which `login` limits. It is hashed because
+it is a bearer credential and must not become a partition key in the clear.
+Nothing here verifies anything or reads a store — a hash is not a check — so a
+refusal still costs nothing downstream.
+
+#### The subject is read the way the route reads it
+
+A subject is a limit only if it is the subject the route then acts on, so the
+limiter keeps no reading of the body of its own. It decodes the body with the
+decoder the core's handlers use — `encoding/json`, the first JSON value, into
+the handlers' own member names — and picks the member the way the handler does,
+`mode` included:
+
+* member names match as they match for the handler: case-insensitively, by
+  Unicode case folding rather than ASCII case alone;
+* a member that appears more than once counts at its last appearance, and a
+  `null` leaves the value before it in place;
+* only the first JSON value counts; anything after it is ignored, not an error;
+* a member the handler ignores in the request's `mode` is ignored here too — the
+  `email` and the `userId` of a `mode: "2fa"` request, the `tempToken` of any
+  other;
+* the body is read to the end of that first value however long it is, because
+  the handler reads it that far. The body is already in memory — the Lambda
+  event carried it, within Lambda's payload limit — so the cost is one parse of
+  what the handler parses anyway, and a refused request pays it once.
+
+A body that does not decode names nothing and falls back to the client address;
+the routes refuse such a body with `400` and act on no account. `keyBy: ip`
+reads no body at all. `POST <admin>/login` is read the same way (§16.7).
 
 ### 14.3 What a refused request looks like
 
@@ -2036,7 +2066,9 @@ wraps the handler the adapter mounts, and a middleware matching one route adds
 no route — on the same `rateLimit.max` and `rateLimit.windowSeconds`, the same
 switch, the same counter and the same `keyBy` rule as `POST <prefix>/login`: the
 body's normalised email under `email`, the client address under `ip` and
-whenever the body names none (the bootstrap arm's empty email). Its counter
+whenever the body names none (the bootstrap arm's empty email). The email is
+read the way the login reads it (§14.2), including where the login carries on
+past a member of the wrong type. Its counter
 scope is its own, so the console's login cannot spend a user's budget on the
 auth router or the other way round. §16.2 says why the route needed one.
 The reference's default for the promote slot is nil — an empty middleware list — and this product
