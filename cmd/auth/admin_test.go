@@ -1093,6 +1093,39 @@ func TestAdminUserDetailSpansTenants(t *testing.T) {
 	}
 }
 
+// TestAdminUserWritesReachTheTenantTheListingShows: since the v0.14.0 pin the
+// two console writes that address a user by id — POST <admin>/users/{id}/promote
+// with method=flag and DELETE <admin>/api/users/{id} — resolve the tenant
+// through auth.UserLookupStore before they write, as the detail route already
+// did. Through v0.13.0 both passed the empty tenant, found no row for a user
+// stored under one and answered 500. It widens what an administrator can write
+// (docs/deviations.md, admin-user-detail-spans-tenants-only-through-a-lookup-store),
+// which is why it is pinned here rather than taken on trust from the pin.
+func TestAdminUserWritesReachTheTenantTheListingShows(t *testing.T) {
+	t.Parallel()
+	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin)), Options{}, nil)
+	cookie := s.rootLogin(t)
+	ctx := context.Background()
+	const tenantedID = "usr_0000000000000000000000000writes"
+	if _, err := s.stores.CreateUser(ctx, auth.User{ID: tenantedID, Email: "writes@acme.test", TenantID: "acme"}); err != nil {
+		t.Fatalf("create a tenanted user: %v", err)
+	}
+
+	if rec := s.call(t, http.MethodPost, "/admin/users/"+tenantedID+"/promote", map[string]string{"method": "flag"}, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Fatalf("promote with method=flag of a user under tenant acme answered %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if u, err := s.stores.GetUserByID(ctx, tenantedID, "acme"); err != nil || !u.IsAdmin {
+		t.Fatalf("after the promote the row under tenant acme reads isAdmin=%v (err %v), want true", u.IsAdmin, err)
+	}
+
+	if rec := s.call(t, http.MethodDelete, "/admin/api/users/"+tenantedID, nil, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE of a user under tenant acme answered %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.stores.GetUserByID(ctx, tenantedID, "acme"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Errorf("after the DELETE the row under tenant acme is still readable (err %v), want auth.ErrUserNotFound", err)
+	}
+}
+
 // ── the CORS layer stops at the mount ────────────────────────────────────────
 
 // TestAdminMountIsOutsideTheCORSLayer: the reference mounts its CORS layer

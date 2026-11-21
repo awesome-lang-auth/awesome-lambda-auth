@@ -1883,13 +1883,21 @@ user `migrate cognito --tenant` imported under another, which is what it did
 before. The product register's `admin-user-detail-is-single-tenant` is retired
 (`docs/deviations.md` §1.1).
 
-What the core still does with the empty tenant is the core's, recorded upstream
-as `admin-user-detail-spans-tenants-only-through-a-lookup-store`, and no store
-closes it: `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
-with `{"method":"flag"}` both pass `""` whatever the store implements, so on a
-table with users under a tenant neither reaches them: on this store both find
-no row under `""` and answer `500 {"error":"Internal server error"}`. `GET
-<admin>/api/users/{id}/roles` reads the empty tenant too, on purpose: there the
+Since the `v0.14.0` pin the two console writes that address a user by id
+resolve the tenant the same way, which is the core's
+`admin-user-detail-spans-tenants-only-through-a-lookup-store`: `DELETE
+<admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` with
+`{"method":"flag"}` look the id up through `auth.UserLookupStore` first and
+write the row in whichever tenant holds it. Through the `v0.13.0` pin both
+passed `""`, found no row for a user stored under a tenant and answered `500
+{"error":"Internal server error"}`. **This widens what an administrator can
+write**: a policy that admits per-tenant administrators — `is-admin-flag` set on
+a tenant's own row, or an `rbac:<role>` held in one tenant — now lets them
+delete and promote users in every tenant, as it already let them read every
+tenant's users. Check that this is what your policy means before upgrading. An
+id no tenant holds is written under `""` as before, so an unknown id answers
+what it always answered. The other user-scoped writes still pass `""`, and `GET
+<admin>/api/users/{id}/roles` reads the empty tenant on purpose: there the
 tenant is the scope of a role *assignment*, and the console assigns in the empty
 scope. And an id the store holds under two tenants — possible only on a table
 written before the pin — is a `404` rather than either account once `migrate
