@@ -397,13 +397,15 @@ rather than advertising admin routes whose every write goes nowhere:
 
 Set `email.deliveryWebhook.url` and it becomes **the** sender for all five
 credential seams: magic link, password reset, email verification, email change
-and SMS code. Each one is POSTed to that receiver and nothing goes through SES
-or SNS for those routes, even when the mailer and sms blocks are also
+and SMS code. With `invitations.enabled` it also takes a sixth, the staff
+invitation (§21.2). Each one is POSTed to that receiver and nothing goes through
+SES or SNS for those routes, even when the mailer and sms blocks are also
 configured. It is what a deployment whose transport is neither mail nor SMS — or
 is not reachable from a Lambda — wires, and it replaces the reference's
 in-process send-callback functions, which a configuration document cannot
 express. Under `twoFactor.required` it is handed three of the five: the magic
-link and the SMS code are not sender seams there (§7.1, §5.2).
+link and the SMS code are not sender seams there (§7.1, §5.2). The invitation is
+not withheld under the policy.
 
 The request:
 
@@ -419,11 +421,16 @@ X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the exact body>
 ```
 
 `<kind>` is one of `magic-link`, `password-reset`, `email-verification`,
-`email-change`, `sms-code`. `delivery` carries the recipient, the token or code,
-its expiry, and `linkBase` — the base this request resolved (§5.1), which the
-receiver should build the link on. Any 2xx is a delivery; anything else, a
-transport failure or the timeout is an error, which each route handles under its
-existing contract (`/forgot-password` still answers 200 whatever happens).
+`email-change`, `sms-code`, and `invitation` with `invitations.enabled`.
+`delivery` carries the recipient, the token or code, its expiry, and `linkBase`
+— the base this request resolved (§5.1), which the receiver should build the
+link on. §21.2 lists the invitation's body field by field. On the mail kinds,
+`lang` is the request's `emailLang` when the caller sent one. Otherwise it is
+left out and the receiver picks the language: `email.mailer.defaultLang` belongs
+to the mailer and is not applied to webhook deliveries. Any 2xx is a delivery;
+anything else, a transport failure or the timeout is an error, which each route
+handles under its existing contract (`/forgot-password` still answers 200
+whatever happens; an invitation answers `502` and is undone, §21.2).
 
 **`email.deliveryWebhook.secret` is required when the url is set.** The body of
 every request is a credential, so a receiver that cannot verify
@@ -3843,7 +3850,69 @@ the delivery webhook (`kind: "invitation"`, the `InvitationDelivery` body) when
 reference's `invitation` template (a template store's override wins) with the
 link `<base>/invitations/accept?token=…`. **No page ships for that path**: the
 front end that owns the accept form serves `GET` on it and posts
-`{token, password}` to the route, as it does for `/reset-password`.
+`{token, password}` to the route, as it does for `/reset-password`. Neither
+transport is withheld under `twoFactor.required`.
+
+**What the delivery webhook receives.** Each invitation is one `POST` with the
+§5.4 envelope: `X-Webhook-Event: delivery.invitation`, a fresh
+`X-Webhook-Delivery` UUID, `X-Webhook-Timestamp`, and `X-Webhook-Signature:
+sha256=<hex HMAC-SHA256 of the exact body>` keyed by
+`email.deliveryWebhook.secret`. The body below is shown indented. On the wire it
+is compact, and the signature covers those exact bytes.
+
+```json
+{
+  "kind": "invitation",
+  "delivery": {
+    "invitationId": "inv_a0f396d7daee2d62e9a4ab864007656a",
+    "userId": "usr_10e90e943ef4fe8559d3074dcbb957be",
+    "tenantId": "",
+    "email": "new.staff@example.test",
+    "role": "staff",
+    "metadata": {"team": "ops"},
+    "token": "mKNd-8u6Y7hpOy67Z6lEbY5QGX5d7AULMDyQDir2_AY",
+    "expiresAt": "2026-11-23T14:55:22.902722Z",
+    "linkBase": "https://auth.example.test/auth",
+    "lang": "it"
+  }
+}
+```
+
+| Field | What it carries |
+|---|---|
+| `invitationId`, `userId` | the invitation and the pending account it reserves, as the invite answer names them; `invitationId` is what `DELETE <admin>/api/users/invitations/{id}` revokes |
+| `tenantId` | the account's tenant, `""` when there is none; always present |
+| `email` | **the recipient**: the invited address as the core stores it, trimmed and lower-cased |
+| `role`, `metadata` | what the invitation was created with, for a message that mentions them; each is left out when empty |
+| `token` | the single-use credential `POST <prefix>/invitations/accept` takes, in plaintext, 43 base64url characters. The store keeps only its SHA-256, so this request is the only place the token exists. A receiver must not log it |
+| `expiresAt` | when the token stops being honoured: `invitations.ttl` after the invitation was created, and the same instant as the invite answer's `expiresAt`. RFC 3339 with fractional seconds, in the function's zone, which is UTC on Lambda. The token is honoured strictly before it |
+| `linkBase` | the base the link is built on, resolved as every emailed link is (§5.1). A machine caller sends no `Origin`, so for one it is the first `email.siteUrls` entry, or `deployment.publicUrl` without one, followed by `http.apiPrefix` (and `/ui` under `ui.enabled`). It is left out when no site URL is known |
+| `lang` | the invite body's `emailLang` exactly as sent, left out when the call sent none. `email.mailer.defaultLang` belongs to the mailer and is not applied here, so the receiver picks the default language |
+
+**There is no link field.** The link the mailer would send is
+`<linkBase>/invitations/accept?token=<token>` (`auth.InvitationURL`). That path
+is the accept route itself, which takes only `POST`. A receiver that writes its
+own mail therefore points the link at the page of its front end that owns the
+accept form, carrying the token. That page then posts `{token, password}` to
+`POST <prefix>/invitations/accept`.
+
+**The answer is the delivery.** Any 2xx answer means the invitation was
+delivered. Anything else fails it: another status, a transport failure, or no
+answer within `email.deliveryWebhook.timeoutMs`. The invite route then answers
+`502 "Invitation could not be delivered"`, revokes the invitation and removes the
+account the call created, so the call can simply be repeated. A failed
+re-invitation keeps its account and leaves the earlier tokens working. If the
+invitee accepted in between, the account is kept. Nothing is retried. A
+receiver should therefore answer 2xx only once it owns the message, for example
+when it has queued it or handed it to its relay, and it should answer within
+the timeout. Each request is a distinct invitation with its own token. A
+re-invitation (`invitations.reinvite`) is a new request, and it retires the
+earlier tokens once it is delivered.
+
+`TestInvitationTravelsByTheDeliveryWebhook` and
+`TestInvitationWebhookFailureUndoesTheInvitation` (`cmd/auth/invitations_test.go`)
+pin this payload and this contract. The first fails if a later core adds a key
+to the body before this table describes it.
 
 ### 21.3 `admin.revealInvitationToken` — the risk
 
