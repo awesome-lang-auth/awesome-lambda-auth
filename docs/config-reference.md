@@ -111,6 +111,36 @@ to anyone who can describe the function.
 A plaintext secret written straight into the document refuses to start, with the
 knob's dotted path.
 
+### 3.1 The refresh token is signed with its own key
+
+`security.jwt.refreshTokenSecret` signs and verifies every refresh token, as the
+reference's `refreshTokenSecret` does (`token.service.ts:25-29`, `:154`), and
+`security.jwt.accessTokenSecret` signs everything else: the access token, the
+2FA step-up and enrolment tokens and the admin session. RS-1 requires both — at
+least 32 characters each, and never equal — on every deployment that mints
+refresh tokens, which is every one but a resource server.
+
+**Upgrading to the release that wired this signs every session out once.**
+Before it the imported core fell back to the access secret for refresh tokens
+(the core deviation `refresh-secret-falls-back-to-secret`) and the refresh
+secret signed nothing; the cold-start log said so on every start. Every refresh
+token outstanding when the new release starts serving was signed with the
+access secret, and is refused with `401`. Access tokens already handed out keep
+working until they expire — 15 minutes by default — and each client then signs
+in again. There is no switch to phase it in, because a core that also accepted
+the access secret for refresh tokens would keep accepting exactly the tokens
+the separation exists to refuse; and **rolling back is a second sign-out** the
+other way, since the old release cannot verify a refresh token signed with the
+refresh secret. Deploy it at a quiet hour, and say so to the people it signs
+out.
+
+What it buys afterwards: a component that holds the access secret to verify
+sessions — an authorizer in front of another API, say — can no longer mint a
+refresh token, and rotating the refresh secret alone ends every session at its
+next refresh while the access tokens in flight run to their expiry. On the SAM
+quickstart both keys are two members of one secret document;
+`infra/sam/README.md`, *Rotating*, says what rotating one of them takes.
+
 ## 4. Domains this build does not act on yet
 
 A domain the schema accepts but the binary does not wire is **refused at start**
@@ -538,11 +568,17 @@ the reference's callback can — so point this only at a receiver you own.
   "secret": {"secretsManager": "awesome-auth/prod/claims-webhook"}}}}}
 ```
 
-## 7. `twoFactor.appName` — the TOTP issuer
+## 7. `twoFactor.*` — the TOTP issuer, and the second-factor policy
 
-| Path | Type | Default | Env var |
-|---|---|---|---|
-| `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` |
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` | `TotpIssuer` |
+| `twoFactor.required` | boolean | `false` | `AWESOME_AUTH_2FA_REQUIRED` | `TwoFactorRequired` |
+| `twoFactor.enrolOnLogin` | boolean | `false` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | `TwoFactorEnrolOnLogin` |
+
+The SAM template sets the two policy variables only when their parameter is
+`"true"`: the environment layer wins over the document, so a `"false"` written
+there would silently override a `ConfigFile` that asks for the policy.
 
 The name an authenticator app prints above the six digits. It is the issuer in
 the `otpauth://` URI `POST /2fa/setup` returns, in both places the URI carries
@@ -554,6 +590,80 @@ It is passed unconditionally, so the core's fallback to its own issuer never
 applies and a deployment that configures nothing gets the reference's own
 default. The `iss` claim is a different thing and is not this knob: it is not
 configurable in this build, and it becomes one with the identity-provider block.
+
+### 7.1 `twoFactor.required` — a password login has to prove a second factor
+
+The core's `Config.Require2FA`, enforced at login since `awesome-go-auth`
+`v0.14.0`. With it on, `POST <prefix>/login` opens no session on a password
+alone:
+
+- An account with a factor it can present gets the reference's challenge,
+  `200 {"requiresTwoFactor":true,"tempToken":…,"available2faMethods":[…]}`, and
+  completes it at `POST <prefix>/2fa/verify` (or the magic-link and SMS routes in
+  `mode: "2fa"`). An enrolled TOTP is a factor; so, where a mail or SMS
+  transport is wired, are the emailed link and the texted code — the core lists
+  only the methods the deployment can deliver (`advertised-2fa-methods-require-store-support`).
+- An account with none gets the reference's
+  `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` and no
+  session. Its `tempToken` completes nothing unless `twoFactor.enrolOnLogin` is
+  on (§7.2); otherwise the account has to be enrolled out of band before it can
+  sign in — by whoever provisions it, through its own first session or a seeding
+  tool.
+- `POST <prefix>/2fa/disable` answers
+  `403 {"error":"Cannot disable 2FA: required by system policy","code":"2FA_REQUIRED"}`
+  to everyone, with or without a settings store.
+
+**It is not `runtimeSettings.require2fa`** (§11). That key is the reference's
+own: a seed for the settings store an administrator flips at run time, read by
+`POST <prefix>/2fa/disable` and by nothing else — it never makes a login ask for
+anything. `twoFactor.required` is the deployment's policy, has no reference
+counterpart (the core's `config-require2fa-is-a-system-policy-term`), and is the
+one to set for "every account signs in with two factors". Setting both is
+harmless: the disable is refused on either.
+
+**What it does not reach**, each said by the loader at start and pinned by a
+test:
+
+- the OAuth callback, which issues a session with no second factor whatever the
+  account (`oauth-callback-skips-the-second-factor`);
+- the console's own `POST <admin>/login`, which mints a 24-hour admin token on a
+  password alone (`admin-login-skips-the-second-factor`) — point
+  `admin.loginPath` at the hosted login and keep `<admin>/login` off the
+  internet;
+- the passwordless logins: `POST <prefix>/magic-link/verify` and
+  `POST <prefix>/sms/verify` in their login mode open a session on the one
+  factor they delivered, as the reference's do. They exist only where a mail or
+  SMS transport is wired.
+
+### 7.2 `twoFactor.enrolOnLogin` — enrolling at the first login, and what that trusts
+
+The core's `Config.EnrolOnLogin` (the core deviation
+`forced-enrolment-opens-a-session`). An account that must present a second
+factor and has none — under `twoFactor.required`, or under its own `require2FA`
+flag — enrols one at login: the `tempToken` of its `2FA_SETUP_REQUIRED` answer is
+an **enrolment token**, which `POST <prefix>/2fa/setup` and
+`POST <prefix>/2fa/verify-setup` accept (in the body as `tempToken`, or as
+`Authorization: Bearer`, which is how a reference client sends it) and every
+other route refuses. `/2fa/setup` answers a secret the server derives from the
+token; `verify-setup` with that secret and a live code stores the factor and
+**opens the session** exactly as `POST <prefix>/2fa/verify` does — cookies, or
+`accessToken`/`refreshToken` under `X-Auth-Strategy: bearer`. The token is bound
+to the password that minted it, lives the temp-token TTL (five minutes), and
+dies the moment the account has a factor: a replay is
+`401 INVALID_TEMP_TOKEN` (body form) or the access refusal (bearer form).
+
+**It is trust on first use, which is why it is off by default.** Whoever holds an
+unenrolled account's password — a leaked invitation or initial password, or the
+password of an account whose factor an administrator has just reset — binds a
+factor of their choosing and gets a full session, and the owner's next login is
+a challenge they cannot answer. Turn it on where the first sign-in with the
+password is the owner's by construction, and reset the password together with
+the factor; a realm that hands out initial passwords it does not control, or
+that can reset a factor without resetting the password, enrols out of band and
+leaves it off. The loader warns at every start while it is on.
+
+It is not refused without `twoFactor.required`: an account whose own
+`require2FA` flag is set is held to a factor too, and enrols the same way.
 
 ## 8. `oauth.*`, knob by knob
 
@@ -941,7 +1051,9 @@ One key, on one route. `require2fa` is consulted by
 `POST <prefix>/2fa/disable`, which answers `403` `2FA_REQUIRED` when it is true —
 the reference's behaviour at `auth.router.ts:890-896`. It is a *system policy*
 term, so it refuses the disable regardless of whether that account has a second
-factor enabled.
+factor enabled. **It does not make a login ask for a second factor** — in the
+reference or here. That is `twoFactor.required` (§7.1), which also refuses the
+disable, with or without this store.
 
 The other two are stored and handed back, and nothing in this build acts on
 them. Both are named, with their paths, in the cold-start log:
@@ -2117,6 +2229,77 @@ values the reference hard-codes — and their defaults are those values, so a
 document that leaves them alone reports nothing. `ui.uploadDir` in its
 filesystem spelling is the third report (§15.4).
 
+### 16.9 Machine access: `admin.machineAccess.iam.principals`
+
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `admin.machineAccess.iam.principals` | IAM role or user ARNs | none | `AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS` (comma separated) | `AdminMachinePrincipalArns` |
+
+A back-office service — an identity service that invites operators, deletes
+users, revokes sessions — reaches the console's JSON API on an IAM-signed
+request, instead of on a person's password and second factor kept in a vault.
+The reference offers a service nothing better than the shared `adminSecret`;
+the core's `AdminOptions.MachineAccess` (`admin-machine-access-is-a-host-seam`)
+is the seam, and this block fills it with IAM.
+
+**Who verifies the caller: API Gateway.** On a route with `AWS_IAM`
+authorization it checks the SigV4 signature and the caller's
+`execute-api:Invoke` permission before the function runs, and writes the
+caller into `requestContext.authorizer.iam` of the payload 2.0 event — a place
+no request header can reach. The function reads `userArn` from there and admits
+the caller when its role or user is listed:
+
+- `arn:<partition>:iam::<account>:role/[<path>/]<name>` admits **every session of
+  that role**. API Gateway reports a role's caller as
+  `arn:<partition>:sts::<account>:assumed-role/<name>/<session>` — the role's path
+  dropped, and a session name chosen by whoever assumed the role — so the match is
+  partition, account and role name, which name one role whatever its path.
+- `arn:<partition>:iam::<account>:user/[<path>/]<name>` admits that user, path
+  included.
+
+Refused at start: a role-session ARN (its session name identifies nothing), the
+root user, a wildcard, anything that is not a role or user ARN, a principal
+named twice — a role with and without its path is one principal — and the whole
+block while `admin.enabled` is off.
+
+**What a match gets.** Every route behind the guard — the users listing and
+detail, `DELETE <admin>/api/users/{id}`, the session routes, promote — with no
+token, cookie, CSRF pair, user-store read or policy evaluation; the core's
+contract for the seam. Each grant raises `identity.admin.machine.access` with
+the caller's own ARN (session name included), the method and the path: with
+`tools.enabled` it is fanned out like any event (a telemetry row, a matching
+webhook), and without an event bus it is a line of this log. A request a
+browser originated — an `Origin` header, or `Sec-Fetch-Site` other than
+`none` — is never offered to the match, and meets the session policy. An
+unlisted caller, and every request with no IAM block — every request on the
+public API — is left to the guard exactly as before.
+
+**Where the route is.** The SAM template creates an internal API for it,
+`AdminMachineApi` — a second HTTP API whose one route is
+`ANY /admin/{proxy+}` with `AWS_IAM`, invoking the same function — whenever
+`AdminMachinePrincipalArns` is set beside `EnableAdminConsole`. It is an origin
+of nothing: the stack's distribution sends every path to the public API, which
+carries no IAM route, so CloudFront never routes a request to the internal one.
+The caller signs for service `execute-api` against the `AdminMachineApiEndpoint`
+output, and its **own** IAM policy has to allow `execute-api:Invoke` on the
+`AdminMachineApiInvokeArn` output — an HTTP API has no resource policy, so the
+stack cannot grant it. The route is the template's mount, `/admin`; a
+`ConfigFile` that moves `admin.basePath` leaves every machine call a `404`.
+
+**The front door still applies.** Machine access does not lift
+`http.originVerify` (§19): with the check on, the machine caller sends the front
+door's header too, read from the same secret, or is refused with the bare `403`
+before the guard. That is the combination as built and pinned
+(`TestAdminMachineAccessMeetsTheOriginCheck`); exempting the IAM door from the
+check is a change to the check, and is not this block's to make.
+
+**A console for machines only.** `AdminMounted` still needs an access policy.
+Under `is-admin-flag` with no root user and nobody flagged, no person can enter
+the console and the machine principal is its only caller; it can flag a person
+later through promote. The cold start names the principals, what they are
+admitted to, and whether the front-door header is required (`admin machine
+access`).
+
 ## 17. `tools.*`, knob by knob
 
 The tools surface: `POST <tools>/track/{eventName}`, `POST <tools>/notify/{target}`,
@@ -2835,8 +3018,9 @@ host's middleware; this product is that host (`cmd/auth/tools.go`,
 loader warns about that combination.
 
 **`session` is not the ordinary posture, and it is not the template's default,
-because of who holds a session.** `POST <prefix>/register` is always mounted
-(upstream `register-route-is-always-mounted`), so under `session`
+because of who holds a session.** `POST <prefix>/register` is mounted unless
+`registration.closed` says otherwise (§20; upstream
+`register-route-is-always-mounted`), so on an open realm under `session`
 "authenticated" means any self-registered user, and what such a user can do is
 the reference's own shape, reproduced rather than narrowed:
 
@@ -3244,3 +3428,53 @@ waiting on it; the next successful read resets the count.
 `previousAccepted: false` means the secret has never been rotated, or that its
 previous value is not usable — in which case a warning line says why. Neither
 the ARN nor any value is ever written.
+
+### 19.6 Machine callers on the internal admin API
+
+The check runs on every request the function receives, whichever API delivered
+it, so a machine caller on `AdminMachineApi` (§16.9) is held to it too: with
+`http.originVerify.secretArn` set, it sends the header holding the secret's
+current value — reading it with `secretsmanager:GetSecretValue`, granted by its
+own role — and is refused with the bare `403` otherwise, before the guard ever
+sees its IAM identity. The cold start's `admin machine access` line says when
+that is so.
+
+## 20. `registration.closed` — an invite-only realm
+
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `registration.closed` | boolean | `false` | `AWESOME_AUTH_REGISTRATION_CLOSED` | `ClosedRegistration` |
+
+The reference mounts `POST <prefix>/register` only when its host passes an
+`onRegister` hook (`auth.router.ts:712-715`); this product ships registration,
+so the hookless deployment is this switch — the core's
+`HTTPConfig.ClosedRegistration` since `awesome-go-auth` `v0.14.0`. With it on:
+
+- `POST <prefix>/register` is not mounted and answers the router's `404`, in
+  both delivery modes, with no session and no account;
+- `GET <prefix>/ui/config` answers `features.register: false`, so the hosted
+  login page hides its sign-up link (the `<prefix>/ui/register` page itself is
+  still served, as the reference serves it without a hook, and its form posts to
+  the route that is gone);
+- the served OpenAPI document leaves the path out.
+
+Nothing else closes. Accounts are created by a hand the deployment controls —
+the admin console, `cmd/migrate`, an invitation flow of the operator's own
+calling the console as a machine (§16.9) — and every other route answers as it
+did.
+
+**The OAuth callback is the other sign-up door.** It creates an account for any
+provider identity no account holds whenever `oauth.provisioning.autoCreate` is
+on, which is its default (§8.2). So a closed realm with a provider configured is
+**refused at start (RS-19)** unless the callback is closed too —
+`oauth.provisioning.autoCreate: false`, which signs in only accounts that already
+exist or match — or narrowed with `oauth.provisioning.allowedEmailDomains`, the
+"sign in with your company account" realm, which loads with a warning naming the
+domains it lets in. With no provider configured `autoCreate` is a default nothing
+reads, and nothing is refused. The SAM template refuses the same combination at
+changeset time when no `ConfigFile` is supplied (Rule
+`ClosedRegistrationRefusesOAuthSignUp`), since nothing in it can turn
+`autoCreate` off.
+
+A front door that blocks `POST <prefix>/register` at the edge is still worth
+keeping as a second layer, and before this switch it was the only one.

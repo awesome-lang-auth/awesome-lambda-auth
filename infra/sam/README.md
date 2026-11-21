@@ -32,6 +32,7 @@ Inside the stack:
 | `IdpSigningKey` + `IdpSigningKeyAlias` | **Only when `EnableIdp=true` and `IdpKmsKeyId` is empty.** An `AWS::KMS::Key`, `KeySpec: RSA_2048`, `KeyUsage: SIGN_VERIFY`, plus `alias/<stack>-idp`. The private half never leaves KMS; the function is granted `kms:Sign` and `kms:GetPublicKey` on this one ARN, and `kms:GetPublicKey` on any ARN in `IdpPreviousKmsKeyArns` — nothing else in the account. **USD 1.00 per month** — see [Cost at rest](#cost-at-rest). |
 | `AdminUploadsBucket` | **Only when `EnableAdminUploads=true`.** A private `AWS::S3::Bucket` for the logos and backgrounds the admin console uploads: every public-access block on, ACLs disabled (`BucketOwnerEnforced`), SSE-S3 at rest, no website configuration. The function is granted `s3:GetObject`/`PutObject`/`DeleteObject` under `uploads/*` and `s3:ListBucket` on the bucket — unconditioned, because S3 answers a missing key 404 only to a caller that may list, and 403 to everyone else — and nothing else in S3; a bucket policy refuses every request that is not over TLS; it serves the objects itself under `<ApiPrefix>/ui/assets/uploads`. **Storage only** — cents — see [Admin console](#admin-console). |
 | `WebhookQueue` + `WebhookDLQ` + `WebhookWorkerFunction` + `WebhookWorkerRole` + its log group + `WebhookDeadLetterAlarm` | **Only when `EnableWebhookQueue=true` and `EnableTools=true`** (D9b). Two SSE-SQS queues (the DLQ keeps 14 days) and a 128 MB arm64 worker on the queue's event source (batch 10, `ReportBatchItemFailures`, at most `WebhookWorkerMaxConcurrency` environments). The auth function gains `sqs:SendMessage` on the queue and the queue URL in its environment, and waits for each enqueue before answering; the worker runs under its own explicit role, `WebhookWorkerRole` — a role SAM generated for an SQS event source would also get the managed `AWSLambdaSQSQueueExecutionRole`, receive and delete on every queue in the account — which holds receive/delete/change-visibility on the queue, `sqs:SendMessage` on the DLQ, `dynamodb:UpdateItem` on the table **only for partition keys starting `IDEM#webhook#`**, and writes to its own log group, and nothing else. **No standing charge** — see [docs/cost-model.md](../../docs/cost-model.md) §3.3 and [docs/config-reference.md](../../docs/config-reference.md) §17.4. |
+| `AdminMachineApi` + its integration, route, `$default` stage and `AdminMachineInvokePermission` | **Only when `AdminMachinePrincipalArns` is set and `EnableAdminConsole=true`.** A second, internal HTTP API for IAM-signed machine callers of the admin console: one route, `ANY /admin/{proxy+}` with `AWS_IAM` authorization, invoking the auth function; the stage throttles to 10 rps (burst 20); the permission lets API Gateway invoke the function for that API's `/admin/*` only. It is an origin of nothing — CloudFront never routes to it. **No fixed monthly charge** (USD 1.00 per million requests). See [Machine access to the admin API](#machine-access-to-the-admin-api). |
 | `ScriptRunnerFunction` + `ScriptRunnerRole` + `ScriptRunnerLogGroup` | **Only when `EnableTools=true` and `EnableInboundWebhooks=true`** (D9d). The inbound-webhook script runner: arm64, 256 MB, `ScriptRunnerTimeout` (6 s), `ScriptRunnerReservedConcurrency` (5) reserved, no events, no Function URL. Its role writes its own log group and **nothing else** — that role is the sandbox scripts run in. The auth function's role gains one statement, `lambda:InvokeFunction` on this one function ARN (`Sid: InvokeScriptRunner`). The inbound route is unauthenticated, so the reservation is what caps what a caller can spend. **USD 0.00 at rest** — see [inbound-webhooks.md](../../docs/inbound-webhooks.md) and cost-model §3.3. |
 
 Both secret resources are skipped when you supply both of `JwtAccessSecretArn` and
@@ -153,6 +154,14 @@ value is one JSON document, so `put-secret-value` replaces *both* keys at once:
   so every session ends, rather than only the half you meant to rotate. If a
   staged rotation matters to you, keep two secrets: set `JwtAccessSecretArn` and
   `JwtRefreshSecretArn` to two of your own ARNs and accept the second fetch.
+  Since the release that wired `security.jwt.refreshTokenSecret` into the core,
+  the two halves really are independent: the refresh key signs refresh tokens
+  and nothing else, so rotating it alone ends every session at its next
+  refresh while the access tokens in flight run to their expiry, and rotating
+  the access key alone invalidates access tokens (and admin sessions) while the
+  refresh tokens still mint new ones. Upgrading to that release is itself a
+  one-time sign-out: every refresh token outstanding then was signed with the
+  access key ([config-reference.md §3.1](../../docs/config-reference.md)).
 - `JwtRefreshSecretSeed` is *not* what you rotate. After stack creation nothing
   reads it; a rotation that updates the seed changes nothing and a rotation that
   updates `JwtSigningSecrets` leaves the seed stale on purpose.
@@ -358,6 +367,24 @@ template deploys nothing else. Turning the switch on refuses the cold start by
 name, so the failure is loud rather than silent, but there is no parameter here
 that makes it work — the built-in `en`/`it` templates render until the DynamoDB
 template store lands. `docs/config-reference.md` §5.3 has the whole picture.
+
+## Realm policy: registration and the second factor
+
+Three switches for an invite-only realm, all `"false"` by default, each setting
+its variable only when `"true"` — the environment wins over the configuration
+document, so a `"false"` there would silently override a `ConfigFile` that
+closed the realm.
+
+| Parameter | Variable | Effect |
+|---|---|---|
+| `ClosedRegistration` | `AWESOME_AUTH_REGISTRATION_CLOSED` | `POST <ApiPrefix>/register` is not mounted (`404`), the hosted UI hides its sign-up link and the OpenAPI document drops the path. Accounts are created by the admin console, `cmd/migrate` or a machine caller (below). The OAuth callback still creates accounts by default, so with an OAuth client id and no `ConfigFile` the Rule `ClosedRegistrationRefusesOAuthSignUp` refuses the changeset, and with a `ConfigFile` the function refuses to start (RS-19) unless it sets `oauth.provisioning.autoCreate: false` or narrows it with `allowedEmailDomains`. [config-reference.md §20](../../docs/config-reference.md) |
+| `TwoFactorRequired` | `AWESOME_AUTH_2FA_REQUIRED` | A password login opens no session without a second factor: the challenge for an account with one, `403 2FA_SETUP_REQUIRED` for an account with none, and `POST /2fa/disable` refused. **Not** `runtimeSettings.require2fa`, which only blocks `/2fa/disable`. The OAuth callback, `POST /admin/login` and the magic-link and SMS logins do not ask for it; the function says so at start. [§7.1](../../docs/config-reference.md) |
+| `TwoFactorEnrolOnLogin` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | An account with no factor enrols one at login with the `tempToken` of its `2FA_SETUP_REQUIRED` answer, and gets its session when it does. **Trust on first use** — whoever holds the password binds the factor — so leave it off unless initial passwords reach their owners and nobody else, and enrol out of band otherwise. [§7.2](../../docs/config-reference.md) |
+
+An invite-only staff realm sets the first two. Verify it with the contract
+suite's realm mode (`test/contract/README.md`, *Realm modes*):
+`AWESOME_AUTH_CONTRACT_REGISTRATION=closed`, `AWESOME_AUTH_CONTRACT_2FA=required`
+and an enrolled account the suite signs in.
 
 ## Second factor and token claims
 
@@ -702,6 +729,41 @@ are served **unguarded**, as the reference registers them: an anonymous caller
 reads the whole documented admin surface. Both carry the same
 `Content-Security-Policy` as the auth router's pair. Set `docs.swagger: false`
 in `ConfigFile` for a stack that should not publish it.
+
+### Machine access to the admin API
+
+`AdminMachinePrincipalArns` (comma-separated IAM role or user ARNs, beside
+`EnableAdminConsole=true`) lets a back-office service — one that invites
+operators, deletes users, revokes sessions — call the console's JSON API with a
+SigV4-signed request instead of a person's password and second factor. It
+creates `AdminMachineApi`, an internal HTTP API whose only route is
+`ANY /admin/{proxy+}` with `AWS_IAM`; API Gateway verifies the signature and the
+caller's `execute-api:Invoke`, and the function admits the caller when its role
+(every session of it, matched by account and name) or user is listed. The
+public API carries no IAM route and CloudFront never routes to the internal one.
+[config-reference.md §16.9](../../docs/config-reference.md) has the whole
+contract; what you do to use it:
+
+1. Deploy with `EnableAdminConsole=true` and
+   `AdminMachinePrincipalArns=arn:aws:iam::<account>:role/<service-role>`.
+   `AdminAccessPolicy=is-admin-flag` with no root user and nobody flagged is a
+   console no person can enter.
+2. Give the service's **own** role `execute-api:Invoke` on the
+   `AdminMachineApiInvokeArn` output — an HTTP API has no resource policy, so
+   this stack cannot grant it.
+3. Sign requests for service `execute-api` in the stack's region against the
+   `AdminMachineApiEndpoint` output, e.g. `GET <endpoint>/admin/api/users` or
+   `DELETE <endpoint>/admin/api/users/<id>`. No cookie, token or CSRF header; no
+   `Origin` header either — a request that looks browser-originated is left to
+   the session policy.
+4. With `OriginVerifySecretArn` set, send that header too, from the same secret
+   (`secretsmanager:GetSecretValue` on it, granted by the service's role):
+   the origin check runs before the guard on every request this function
+   receives.
+
+Every admitted call is audited as `identity.admin.machine.access` with the
+caller's ARN: a telemetry row and any matching webhook with `EnableTools`, a
+log line otherwise.
 
 ## Observability
 
