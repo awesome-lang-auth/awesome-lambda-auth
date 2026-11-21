@@ -163,7 +163,8 @@ func checkRS20TwoFactorRequiredSignIn(c *Config, d *diagnostics) {
 		d.errf(RuleTwoFactorRequiredSignIn, "admin.rootUser.email",
 			"twoFactor.required is on, and the admin root user signs in at POST <admin>/login with a password alone -- a route this deployment does not serve under the policy, "+
 				"so the root user could never sign in",
-			"remove admin.rootUser and enter the console with a session from POST <prefix>/login, which asks for the factor, as an account admin.accessPolicy admits")
+			"remove admin.rootUser and enter the console with a session from POST <prefix>/login, which asks for the factor, as an account admin.accessPolicy admits -- "+
+				"flag the first one through a machine principal's promote (admin.machineAccess), in the store, or with the root user on a deploy before the policy is on")
 	}
 	// Written by any source: a store reference in the document or its
 	// variable (configured), or a value through AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET,
@@ -172,7 +173,8 @@ func checkRS20TwoFactorRequiredSignIn(c *Config, d *diagnostics) {
 		d.errf(RuleTwoFactorRequiredSignIn, "admin.bootstrapSecret",
 			"twoFactor.required is on, and the admin bootstrap secret is a shared password: beside an access policy POST <admin>/login accepts it, and this deployment does not serve that route under the policy; "+
 				"without one it is the console's whole guard, a credential a person presents with no second factor",
-			"remove admin.bootstrapSecret, set admin.accessPolicy, and enter the console with a session from POST <prefix>/login, which asks for the factor")
+			"remove admin.bootstrapSecret, set admin.accessPolicy, and enter the console with a session from POST <prefix>/login, which asks for the factor -- "+
+				"flag the first administrator through a machine principal's promote (admin.machineAccess), in the store, or on a deploy before the policy is on")
 	}
 }
 

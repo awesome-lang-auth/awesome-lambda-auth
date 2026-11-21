@@ -2186,7 +2186,10 @@ Rules:
           function does not serve under the policy, so it could never sign in
           and the function would refuse to start (RS-20). Remove AdminRootEmail
           and AdminRootPasswordHashArn, and enter the console with a two-factor
-          session from the auth login as an account AdminAccessPolicy admits.
+          session from the auth login as an account AdminAccessPolicy admits;
+          flag the first one with a promote through AdminMachinePrincipalArns,
+          in the table, or with the root user on a deploy before
+          TwoFactorRequired is turned on.
 
 Resources:
 

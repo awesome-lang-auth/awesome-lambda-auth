@@ -639,7 +639,7 @@ session there before (`cmd/auth/secondfactor_test.go`):
 | `POST <prefix>/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify` in **login mode** | `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}`, before anything is minted, sent or consumed | the emailed link or texted code alone is one factor. The **step-up mode** — `mode: "2fa"` with the login's `tempToken` — is the second factor itself and works as before |
 | `POST <prefix>/link-verify` with `loginAfterLinking` | the same `403`, before the link token is read; linking without it works as before | the core opens a session on the emailed link token alone, and `/link-request` mints one for any access token, mailed wherever its body says |
 | `POST <admin>/login` | the router's `404`, as wherever the route is not mounted | it mints a 24-hour console token on a password alone (`admin-login-skips-the-second-factor`). The console admits the access token of a session from `POST <prefix>/login` and its factor — point `admin.loginPath` at the hosted login so a browser goes there — and machine access (§16.9), which is IAM and not a sign-in |
-| `admin.rootUser`, `admin.bootstrapSecret` | **refused at start** (RS-20) while the console is mounted | their one door is `POST <admin>/login`; without an access policy the bootstrap secret is the console's whole guard, a shared password with no second factor |
+| `admin.rootUser`, `admin.bootstrapSecret` | **refused at start** (RS-20) while the console is mounted | their one door is `POST <admin>/login`; without an access policy the bootstrap secret is the console's whole guard, a shared password with no second factor. The first administrator is then flagged another way (§16.2) |
 | `POST <prefix>/authorize` (identity provider) | `401 invalid credentials` for every account; the loader warns | it signs in through the core's password login, which has no second-factor step there and refuses everyone under the policy: no authorization code is issued, so no OIDC sign-in can complete. Run the identity provider on a realm without the policy |
 
 The four passwordless refusals and the console's `404` are the product
@@ -657,7 +657,25 @@ until they expire or are revoked — `POST <prefix>/refresh` continues a session
 and asks nothing. Turn it on together with a sign-out of everyone: rotate the
 refresh-token secret (§3.1) in the same deploy, so every outstanding refresh
 token stops verifying and each client signs in again, through the factor, when
-its access token expires.
+its access token expires. A console token `POST <admin>/login` minted before
+the switch is signed with the access secret and the guard accepts it for its
+24 hours whatever the policy, so if anyone entered the console that way, rotate
+the access-token secret too — on the SAM quickstart both keys live in one
+secret document and rotate together (`infra/sam/README.md`, *Rotating*).
+
+**Where both steps rest on one mailbox — an open decision.** With a mail
+transport wired (a mailer, or the delivery webhook), the core offers the emailed link as the second step to every
+account, a TOTP-enrolled one included, as the reference does
+(`advertised-2fa-methods-require-store-support`), and the same mailbox receives
+the password-reset link. So whoever controls the mailbox alone can reset the
+password and then answer the challenge with the emailed link: two steps, one
+factor. Every session still passes the password login's challenge, so nothing
+above refuses it; narrowing what counts as a second factor — not offering the
+emailed step-up to an account that enrolled TOTP, or asking for the factor
+before a reset — is a change to the core's method list that this build does
+not make. Until it is decided, a realm that cannot accept the mailbox as both
+steps runs with neither a mailer nor the delivery webhook, and resets passwords
+out of band.
 
 ### 7.2 `twoFactor.enrolOnLogin` — enrolling at the first login, and what that trusts
 
@@ -1902,6 +1920,16 @@ stops existing, and the console admits the first alone — a session from
 root user and the bootstrap secret, which sign in nowhere else, are refused at
 start beside the policy (RS-20), and so is a bootstrap secret standing as the
 console's whole guard without an access policy. §7.1 has the whole table.
+
+That leaves the first administrator of an `is-admin-flag` console to be flagged
+without the root user, and there are three ways: a machine principal (§16.9)
+calls `POST <admin>/users/{id}/promote` with `{"method":"flag"}` — the org
+realm's own path; a provisioning tool writes the flag through the store, as it
+writes the account and its factor; or the realm is bootstrapped before the
+policy — deployed once with the root user and without `twoFactor.required`,
+the first administrator flagged and enrolled, then redeployed with the policy
+and without the root user, rotating the access-token secret so the root user's
+console token dies with it.
 
 **Neither credential is revocable through the session store.** The guard
 verifies signature, `typ`, issuer and expiry and never consults the store, so
