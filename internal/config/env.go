@@ -215,6 +215,8 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_2FA_APP_NAME", "twoFactor.appName", func(c *Config, v string) { c.TwoFactor.AppName = v }),
 		envBool("AWESOME_AUTH_2FA_REQUIRED", "twoFactor.required", func(c *Config, v bool) { c.TwoFactor.Required = v }),
 		envBool("AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "twoFactor.enrolOnLogin", func(c *Config, v bool) { c.TwoFactor.EnrolOnLogin = v }),
+		envInt("AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES", "twoFactor.lockout.maxFailures", func(c *Config, v int) { c.TwoFactor.Lockout.MaxFailures = v }),
+		envInt("AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS", "twoFactor.lockout.windowSeconds", func(c *Config, v int) { c.TwoFactor.Lockout.WindowSeconds = v }),
 
 		// §1.10 identity provider
 		envBool("AWESOME_AUTH_IDP_ENABLED", "idProvider.enabled", func(c *Config, v bool) { c.IDProvider.Enabled = v }),

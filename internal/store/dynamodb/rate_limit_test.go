@@ -146,6 +146,53 @@ func TestAllowRequestStartsFreshInTheNextWindow(t *testing.T) {
 	}
 }
 
+// TestResetRateLimitClearsOnlyThatCounter: a reset puts (scope, subject) back
+// at zero for the current window — a spent budget is whole again — and touches
+// no other subject's counter and no other scope's. Resetting a counter nothing
+// has written is not an error. cmd/auth's per-account cap on failed
+// second-factor checks is the caller (secondfactor_cap.go).
+func TestResetRateLimitClearsOnlyThatCounter(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	ctx := context.Background()
+	const max = 2
+	spend := func(scope, subject string) {
+		t.Helper()
+		for i := 0; i < max; i++ {
+			if allowed, _, err := store.AllowRequest(ctx, scope, subject, max, time.Hour); err != nil || !allowed {
+				t.Fatalf("priming %s/%s request %d: allowed=%v err=%v", scope, subject, i, allowed, err)
+			}
+		}
+		if allowed, _, err := store.AllowRequest(ctx, scope, subject, max, time.Hour); err != nil || allowed {
+			t.Fatalf("%s/%s not exhausted: allowed=%v err=%v", scope, subject, allowed, err)
+		}
+	}
+	spend("2fa-account", "acct-a")
+	spend("2fa-account", "acct-b")
+	spend("login", "acct-a")
+
+	if err := store.ResetRateLimit(ctx, "2fa-account", "acct-a", time.Hour); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	for i := 0; i < max; i++ {
+		if allowed, _, err := store.AllowRequest(ctx, "2fa-account", "acct-a", max, time.Hour); err != nil || !allowed {
+			t.Fatalf("after the reset, request %d: allowed=%v err=%v; the budget is whole again", i, allowed, err)
+		}
+	}
+	if allowed, _, err := store.AllowRequest(ctx, "2fa-account", "acct-b", max, time.Hour); err != nil || allowed {
+		t.Errorf("another subject's counter was cleared: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, _, err := store.AllowRequest(ctx, "login", "acct-a", max, time.Hour); err != nil || allowed {
+		t.Errorf("the same subject's counter in another scope was cleared: allowed=%v err=%v", allowed, err)
+	}
+	if err := store.ResetRateLimit(ctx, "2fa-account", "never-counted", time.Hour); err != nil {
+		t.Errorf("resetting a counter nothing wrote: %v", err)
+	}
+	if err := store.ResetRateLimit(ctx, "2fa-account", "", time.Hour); err == nil {
+		t.Error("an empty subject was accepted")
+	}
+}
+
 // TestAllowRequestKeepsScopesAndSubjectsApart: the budget is per (scope,
 // subject, window), so neither a second scope nor a second subject may spend the
 // first one's.

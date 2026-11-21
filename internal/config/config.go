@@ -459,6 +459,33 @@ type TwoFactor struct {
 	// applies under Required and to accounts whose own require2FA flag is
 	// set, so it is not inert without Required, and is not refused there.
 	EnrolOnLogin bool `json:"enrolOnLogin"`
+
+	// Lockout caps the failed second-factor checks an account may make,
+	// whatever challenge, login or address they come through (cmd/auth
+	// secondfactor_cap.go). [new] — the reference counts nothing.
+	Lockout TwoFactorLockout `json:"lockout"`
+}
+
+// TwoFactorLockout covers twoFactor.lockout.*: the per-account cap on failed
+// second-factor checks.
+//
+// The rateLimit block's budgets are per subject per scope, and the subject of
+// POST <prefix>/2fa/verify is the challenge, so they bound the guesses made at
+// one tempToken; a caller who can log in again gets a fresh challenge, and a
+// fresh budget, every time. This cap is counted against the account the
+// challenge belongs to, read from a token whose signature has been verified,
+// across every challenge, login and source address: once an account has made
+// MaxFailures checks without one succeeding in a fixed, epoch-aligned window
+// of WindowSeconds, every further check for it answers rateLimit's 429 until
+// the window ends, and a check that succeeds clears the count.
+//
+// It is a block of its own rather than part of rateLimit, and rateLimit.enabled
+// does not switch it: a front door that limits by address — a WAF, an API
+// Gateway throttle — cannot do this, because the account is only known once
+// the token is verified. MaxFailures 0 turns it off.
+type TwoFactorLockout struct {
+	MaxFailures   int `json:"maxFailures"`
+	WindowSeconds int `json:"windowSeconds"`
 }
 
 // IDProvider covers idProvider.* (spec §1.10).
@@ -1086,8 +1113,20 @@ func Defaults() *Config {
 				OnEmailMatch: OAuthEmailMatchLink,
 			},
 		},
+		// The lockout's default is ten failed checks per account per UTC day:
+		// at most 20 in any 24 hours (the fixed window's seam) and about 310 in
+		// 31 days, which against a six-digit code the core accepts at three
+		// steps (TOTPSkew 1) is a chance of about 3 in 10 000 a month for a
+		// caller who already holds the password. Ten is more than a person
+		// mistypes before one code goes through, and a success clears the
+		// count; what an exhausted budget costs the owner is a wait until the
+		// window ends, and only a caller past the first factor can cause it.
 		TwoFactor: TwoFactor{
 			AppName: "awesome-node-auth",
+			Lockout: TwoFactorLockout{
+				MaxFailures:   10,
+				WindowSeconds: 86_400,
+			},
 		},
 		IDProvider: IDProvider{
 			JWKSPath:        "/.well-known/jwks.json",

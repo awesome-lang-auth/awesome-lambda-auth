@@ -318,6 +318,12 @@ func validateTwoFactor(c *Config, d *diagnostics) {
 			"the TOTP issuer name is empty, which produces an otpauth URI no authenticator app can label",
 			"set twoFactor.appName to the name users should see in their authenticator")
 	}
+	// 0 is off, and the one way to say it; a negative count is a typo, not a
+	// lockout.
+	atLeast(d, "twoFactor.lockout.maxFailures", c.TwoFactor.Lockout.MaxFailures, 0)
+	if c.TwoFactor.Lockout.MaxFailures > 0 {
+		positive(d, "twoFactor.lockout.windowSeconds", c.TwoFactor.Lockout.WindowSeconds)
+	}
 }
 
 func validateIDProvider(c *Config, d *diagnostics) {

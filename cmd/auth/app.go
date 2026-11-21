@@ -439,7 +439,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 			return nil, err
 		}
 	}
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
+	// The auth router's slot holds the rate limiter and, inside it, the
+	// per-account cap on failed second-factor checks (secondfactor_cap.go):
+	// the cap counts what the limiter let through, and it is filled even when
+	// the limiter is off, because twoFactor.lockout is its own switch.
+	logSecondFactorCapSurface(cfg, users, log)
+	authRL := chainLimiters(newRateLimiter(cfg, counter, log), newSecondFactorCap(cfg, users, core, log))
+	if err := mountAuthSurface(mux, core, cfg, authRL, newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)

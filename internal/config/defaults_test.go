@@ -68,6 +68,8 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		{"twoFactor.appName", c.TwoFactor.AppName, "awesome-node-auth"},
 		{"twoFactor.required", c.TwoFactor.Required, false},
 		{"twoFactor.enrolOnLogin", c.TwoFactor.EnrolOnLogin, false},
+		{"twoFactor.lockout.maxFailures", c.TwoFactor.Lockout.MaxFailures, 10},
+		{"twoFactor.lockout.windowSeconds", c.TwoFactor.Lockout.WindowSeconds, 86400},
 
 		// registration.* is product-only: open, as the route has always been.
 		{"registration.closed", c.Registration.Closed, false},
