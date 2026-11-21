@@ -422,7 +422,9 @@ Parameters:
       every mode, the second step (mode "2fa") included, and neither is
       minted or sent, so a phone alone never opens a session, and a mailbox
       opens one only through TwoFactorEnrolOnLogin, for an account that has
-      not enrolled yet. The password reset still works and opens no
+      not enrolled yet, or by guessing an enrolled account's TOTP code, which
+      the function caps at 10 wrong codes per account per day
+      (twoFactor.lockout). The password reset still works and opens no
       session. /link-verify
       refuses loginAfterLinking, and POST /admin/login answers 404 — the
       console admits a session from the auth login and its TOTP code, and

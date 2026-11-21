@@ -592,6 +592,8 @@ the reference's callback can — so point this only at a receiver you own.
 | `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` | `TotpIssuer` |
 | `twoFactor.required` | boolean | `false` | `AWESOME_AUTH_2FA_REQUIRED` | `TwoFactorRequired` |
 | `twoFactor.enrolOnLogin` | boolean | `false` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | `TwoFactorEnrolOnLogin` |
+| `twoFactor.lockout.maxFailures` | integer ≥ 0 (`0` is off) | `10` | `AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES` | — |
+| `twoFactor.lockout.windowSeconds` | integer > 0 | `86400` | `AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS` | — |
 
 The SAM template sets the two policy variables only when their parameter is
 `"true"`: the environment layer wins over the document, so a `"false"` written
@@ -705,10 +707,18 @@ policy neither counts:
 The loader warns when the policy meets a mailer, the delivery webhook or an SMS
 transport, saying what is refused and what the transport still carries, and
 the cold start's `credential delivery wired` line carries
-`"magicLinkAndSMSCode":"withheld under twoFactor.required: …"`. The one way a mailbox still reaches a session is forced enrolment
-(§7.2): an account that has not enrolled TOTP yet can have its password reset
-and its factor bound by whoever reads its mail — trust on first use, which is
-why that knob is off by default and warned about.
+`"magicLinkAndSMSCode":"withheld under twoFactor.required: …"`. A mailbox
+still reaches a session two ways. Forced enrolment (§7.2): an account that has
+not enrolled TOTP yet can have its password reset and its factor bound by
+whoever reads its mail — trust on first use, which is why that knob is off by
+default and warned about. And guessing: whoever resets the password of a
+TOTP-enrolled account gets the login's challenge and may guess at its six-digit
+code. The `rateLimit` budget of `/2fa/verify` is per challenge and every login
+mints a new one, so it is `twoFactor.lockout` (§7.3) that bounds the guesses,
+per account: by default 10 wrong codes a UTC day, about 310 a month, a chance
+of about 1 in 1 000 a month against a code the core accepts at three time
+steps. With `twoFactor.lockout.maxFailures: 0` nothing bounds them per account
+and a sweep of the code takes hours.
 
 ### 7.2 `twoFactor.enrolOnLogin` — enrolling at the first login, and what that trusts
 
@@ -734,9 +744,9 @@ factor of their choosing and gets a full session, and the owner's next login is
 a challenge they cannot answer. **With the reset mail wired** (a mailer or the
 delivery webhook) the mailbox alone is enough: `POST <prefix>/forgot-password`
 and `/reset-password` hand the password to whoever reads it, and forced
-enrolment then binds their factor — the one way a mailbox still opens a
-session under `twoFactor.required`, and only for an account that has not
-enrolled yet. Turn it on where the first sign-in with the password is the
+enrolment then binds their factor — the one way a mailbox opens a session
+under `twoFactor.required` without guessing a TOTP code (§7.3), and only for
+an account that has not enrolled yet. Turn it on where the first sign-in with the password is the
 owner's by construction, and reset the password together with the factor; a
 realm that hands out initial passwords it does not control, that can reset a
 factor without resetting the password, or that cannot vouch for its users'
@@ -755,6 +765,83 @@ browser's cookies and no enrolment token, which the route refuses. A realm that
 turns `enrolOnLogin` on needs a client of its own that sends the `tempToken`
 through `/2fa/setup` and `/2fa/verify-setup` — or enrols out of band and leaves
 it off.
+
+### 7.3 `twoFactor.lockout` — failed second-factor checks, counted per account
+
+`rateLimit` counts per subject, and the subject of `POST <prefix>/2fa/verify` is
+the challenge it carries (§14.2): it bounds the guesses at one `tempToken`.
+Every login mints a new one, so on its own it bounds nothing per account — a
+caller who can log in again and again (the password, or under
+`twoFactor.required` with the reset mail wired, the mailbox) gets a fresh budget
+each time, and a six-digit code falls in hours. This block counts the checks
+against the **account** instead, whichever challenge, login or source address
+they come through.
+
+What is counted — each request that checks a second factor for an account:
+
+- `POST <prefix>/2fa/verify` (the TOTP code);
+- `POST <prefix>/magic-link/verify` and `/sms/verify` in `mode: "2fa"`, the
+  second-step link and code (refused outright under `twoFactor.required`, §7.1);
+- `POST <prefix>/2fa/verify-setup` with an enrolment token, under
+  `twoFactor.enrolOnLogin` (§7.2). A guess there buys nothing — the token's
+  holder is handed the secret — but it is the same account checking a code.
+
+Not counted: the login branches of the magic-link and SMS routes, which check a
+first factor and are keyed by `rateLimit`; a voluntary enrolment, made with an
+access token by a signed-in user.
+
+**The account is read from a verified token.** The core's own verifiers —
+`StepUpSubject` for a step-up `tempToken`, `TOTPEnrolmentCaller` for an
+enrolment token — check the token's signature, type and lifetime before its
+subject is used, exactly as the handler does. A token that does not verify names
+no account: the handler refuses it and nothing is counted. So no one can spend
+an account's budget without a token the deployment minted for that account,
+which takes its first factor; a forged token, an unsigned one or a real one with
+another account written into it locks no one out.
+
+**The rule.** Each check is counted before it runs, with the shared counter's
+conditional increment, and a check that succeeds (`2xx`) clears the count. Once
+an account has made `maxFailures` checks in the current window without one
+succeeding, every further check for it answers the `429` of §14.3 — same body,
+`Retry-After` to the end of the window — until the window ends. Counting before
+the check is what keeps concurrent guesses from slipping under the cap: however
+many arrive at once, at most `maxFailures` are evaluated per account per window.
+A request that does not reach the code (a malformed body, a CSRF refusal) keeps
+its count too; only a holder of a valid token for the account can send one.
+
+**The default, and what it buys.** Ten failed checks per account per window of
+a day (86400 s, epoch-aligned like every window here, so it turns at 00:00 UTC):
+at most 20 in any 24 hours across the boundary and about 310 in a month. The
+core accepts a TOTP code at three time steps (`TOTPSkew` 1), so each guess wins
+with a chance of about 3 in 10⁶ and a month of guessing at the cap about 1 in
+1 000. What an exhausted budget costs the owner is a wait until the window
+ends — `Retry-After` says how long — and only a caller who is already past the
+first factor can exhaust it. A deployment that wants shorter lockouts shortens
+the window and pays for it in guesses: 10 an hour is about 7 200 a month, a
+chance of about 2%. A lock lifts by itself when the window ends, since the
+next window is a key nothing has written; to lift one early, delete the counter
+item `RL#2fa-account#<subject>#<window index>`, where the subject is the first
+16 bytes, in hex, of `sha256("awesome-lambda-auth/2fa-account/v1" NUL tenantId
+NUL userId)` and the index is the Unix time divided by `windowSeconds`. There is
+no console action for it.
+
+**Off.** `maxFailures: 0`. The cold start then warns that second-factor checks are
+bounded per challenge and per address only, and under `twoFactor.required` with
+the reset mail wired the loader's warning says the mailbox is then bounded by
+nothing per account.
+
+**Where it runs, and on which store.** In the auth router's limiter slot,
+inside `rateLimit`: a request the per-challenge or per-address budget refuses
+never reaches the cap and spends nothing there. It is its own switch, so it
+runs with `rateLimit.enabled: false` or an empty `rateLimit.scope`, and with
+either `keyBy`. On DynamoDB the counter is the rate limiter's table (one
+conditional write per check, one delete per success), shared by every execution
+environment and not routed through the rate limiter's in-process pre-filter,
+which cannot follow a count that goes down. On the memory driver it counts in
+process, per execution environment, like every limiter there. When the shared
+counter cannot be reached it fails open, as `rateLimit` does (§14.5), and says
+so once per cold start: the check reads the same table and would have failed
+behind it.
 
 ## 8. `oauth.*`, knob by knob
 
@@ -1494,9 +1581,14 @@ which is the single route a limiter is most obviously for.
 Where the handler acts on a challenge — always on `/2fa/verify`, and in
 `mode: "2fa"` on the passwordless routes — the subject is the `tempToken` that
 names it: whoever is guessing the six digits holds one token and presents it
-with every guess, so the counter is exactly per challenge, and one who rotates
-tokens has to log in again for each, which `login` limits. It is hashed because
-it is a bearer credential and must not become a partition key in the clear.
+with every guess, so the counter is exactly per challenge. It is not a bound
+per account: one who rotates tokens logs in again for each, and `login` allows
+`max` logins a window, each minting a challenge good for five minutes
+(`TempTokenTTL`), so this budget alone lets an account be asked about
+`login.max × 5 min / window × max` codes a window — about 500 a minute at the
+defaults. The bound per account is `twoFactor.lockout` (§7.3), which counts the
+checks against the account a verified token names. It is hashed because it is a
+bearer credential and must not become a partition key in the clear.
 Nothing here verifies anything or reads a store — a hash is not a check — so a
 refusal still costs nothing downstream.
 

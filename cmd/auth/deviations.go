@@ -206,7 +206,14 @@ func WireDeviations() []WireDeviation {
 				"The promote route shares the budget, the window " +
 				"and the switch, runs its limiter ahead of the admin guard, and is keyed by the client address under either " +
 				"keyBy: its body names how to promote and its path names the person being promoted, and neither is a subject " +
-				"a caller should be able to mint budgets with. The admin login is deliberately not limited, on either line. " +
+				"a caller should be able to mint budgets with. POST <admin>/login is limited under its own scope, admin-login, " +
+				"with the same budget, window and keyBy rule as POST <prefix>/login: the body's email read the way the login " +
+				"reads it, and the client address for the bootstrap arm's empty email. " +
+				"The checks of a second factor -- POST <prefix>/2fa/verify, /magic-link/verify and /sms/verify in mode \"2fa\", " +
+				"and /2fa/verify-setup with an enrolment token -- are also counted against the account a verified token names, " +
+				"across every challenge, login and address (twoFactor.lockout, by default 10 failed checks per account per " +
+				"86400-second window, its own switch), and over that count answer this same 429 until the window ends; a " +
+				"successful check clears it. " +
 				// D9d
 				"The inbound-webhook route shares the budget, the window and the switch, runs its limiter before the core looks the " +
 				"provider up, and is keyed by the client address and a hash of the provider under either keyBy, because every request " +

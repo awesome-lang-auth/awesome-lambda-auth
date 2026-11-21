@@ -430,7 +430,9 @@ type TwoFactor struct {
 	// /link-verify's loginAfterLinking and POST <admin>/login at request time.
 	// A phone number alone therefore never opens a session, and a mailbox opens
 	// one only through EnrolOnLogin, for an account that has not enrolled TOTP
-	// yet: the password reset hands it the password (trust on first use).
+	// yet — the password reset hands it the password (trust on first use) — or
+	// by guessing the TOTP code of an account that has, which Lockout holds to
+	// MaxFailures wrong codes per account per window.
 	//
 	// [new] — the reference has no deployment-level require2FA: the name lives
 	// on the settings store and on the user record only, and its login demands
@@ -1116,7 +1118,7 @@ func Defaults() *Config {
 		// The lockout's default is ten failed checks per account per UTC day:
 		// at most 20 in any 24 hours (the fixed window's seam) and about 310 in
 		// 31 days, which against a six-digit code the core accepts at three
-		// steps (TOTPSkew 1) is a chance of about 3 in 10 000 a month for a
+		// steps (TOTPSkew 1) is a chance of about 1 in 1 000 a month for a
 		// caller who already holds the password. Ten is more than a person
 		// mistypes before one code goes through, and a success clears the
 		// count; what an exhausted budget costs the owner is a wait until the

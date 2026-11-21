@@ -45,7 +45,9 @@ under [Unreleased].
   `403 2FA_REQUIRED` in every mode, the step-up (`mode: "2fa"`) included — so a
   phone number never opens a session on its own, and a mailbox, which also
   receives the reset link, opens one only under `twoFactor.enrolOnLogin`, for an
-  account that has not enrolled TOTP yet (trust on first use, warned). The
+  account that has not enrolled TOTP yet (trust on first use, warned), or by
+  guessing the TOTP code of one that has, which `twoFactor.lockout` holds to 10
+  wrong codes per account per day by default (below). The
   password reset still works and opens no session; the next login still asks
   for TOTP. `/link-verify` with `loginAfterLinking`
   answers the same `403` (linking alone works as before), and `POST <admin>/login`
@@ -177,3 +179,26 @@ under [Unreleased].
   whatever else its body holds. `keyBy: ip`, the address fallback and the
   response are unchanged. Deployments on the default `keyBy` should redeploy;
   no configuration change is needed. `docs/config-reference.md` §14.1–14.2.
+- **Failed second-factor checks are capped per account** (`twoFactor.lockout`,
+  on by default; `AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES`,
+  `AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS`). The `rateLimit` budget of
+  `POST <prefix>/2fa/verify` is per challenge, and every login mints a new
+  challenge with a new budget, so an account's TOTP code could be guessed at
+  some 500 times a minute by logging in again and again — under
+  `twoFactor.required` with the reset mail wired, from the mailbox alone. The
+  checks are now also counted against the account the token names, read only
+  after the core has verified the token's signature, type and lifetime, across
+  every challenge, login and source address: `POST <prefix>/2fa/verify`,
+  `/magic-link/verify` and `/sms/verify` in `mode: "2fa"`, and
+  `/2fa/verify-setup` with an enrolment token. Each check is reserved on the
+  shared counter before it runs, so concurrent guesses cannot slip under the
+  cap, and a success clears the count. Past `maxFailures` (default `10`) in a
+  window of `windowSeconds` (default `86400`, turning at 00:00 UTC) the check
+  answers the rate limiter's `429` with `Retry-After` until the window ends:
+  about 310 wrong codes a month at most, a chance of about 1 in 1 000 against
+  a code the core accepts at three time steps. A token that does not verify is
+  counted against nobody, so a forged one cannot lock anyone out. Its own
+  switch, independent of `rateLimit.enabled`; `maxFailures: 0` turns it off,
+  and the cold start warns when it is off. The DynamoDB store gains
+  `ResetRateLimit` (one `DeleteItem`, already granted). `docs/config-reference.md`
+  §7.3.

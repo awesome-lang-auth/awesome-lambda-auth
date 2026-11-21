@@ -361,7 +361,7 @@ func TestClosedRegistrationBesideDualRead(t *testing.T) {
 						t.Errorf("RS-21 refused a block with no source: %v", d)
 					}
 				}
-				requireRule(t, err, tc.otherRule, "stores.migration.source")
+				_ = requireRule(t, err, tc.otherRule, "stores.migration.source")
 				return
 			}
 			if err != nil {
@@ -485,7 +485,7 @@ func TestTwoFactorPolicyWarnings(t *testing.T) {
 		names     string
 		carries   []string
 	}{
-		{"a mailer", mailer, baseEnv, "a mailer (email.mailer)", []string{"password-reset", "opens no session", "a mailbox or a phone number alone never opens one"}},
+		{"a mailer", mailer, baseEnv, "a mailer (email.mailer)", []string{"password-reset", "opens no session", "a phone number alone never opens one", "a mailbox alone only by guessing", "twoFactor.lockout holds to 10 wrong codes per account per 86400 seconds"}},
 		{"the delivery webhook", webhook, webhookEnv, "the delivery webhook (email.deliveryWebhook)", []string{"password-reset", "opens no session"}},
 		{"an SMS transport", sms, baseEnv, "an SMS transport (sms)", []string{"carries no credential", "a phone number alone never opens a session"}},
 	} {

@@ -437,6 +437,15 @@ func TestSecondFactorLockoutCountsTheForcedEnrolment(t *testing.T) {
 	}
 }
 
+// TestSecondFactorLockoutIsItsOwnSwitch: the cap is not the rate limiter's —
+// with rateLimit off altogether the sweep is still stopped at the account's
+// cap.
+func TestSecondFactorLockoutIsItsOwnSwitch(t *testing.T) {
+	t.Parallel()
+	rig, _, _ := lockoutMemoryRig(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false"))
+	sweepIsStoppedAtTheAccountCap(t, rig)
+}
+
 // TestSecondFactorLockoutCanBeTurnedOff: maxFailures 0 is off, and the
 // rateLimit budgets are then the only bound — every check up to them reaches
 // the handler.

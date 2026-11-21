@@ -337,8 +337,12 @@ func subjectOfSMSVerify(f rateLimitFields) string {
 // TwoFactorVerify; auth.router.ts:859-877). Keying on the challenge is what
 // makes this route's limit exact: whoever is guessing the six-digit code holds
 // one tempToken and presents it with every guess, so the counter is per
-// challenge; one who rotates tokens has to log in again for each, which `login`
-// limits.
+// challenge. It is not a bound per account — one who rotates tokens logs in
+// again for each, and every login mints a challenge with a budget of its own,
+// login.max × (TempTokenTTL / window) × max codes a window — so the account's
+// bound is the other occupant of this slot, twoFactor.lockout
+// (secondfactor_cap.go), which counts against the account a verified token
+// names.
 func subjectOfTwoFactorVerify(f rateLimitFields) string { return challengeSubject(f.TempToken) }
 
 // rateLimitRoute is one path the limiter watches, and how it names a subject on

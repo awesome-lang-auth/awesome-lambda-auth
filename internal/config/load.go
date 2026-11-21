@@ -636,7 +636,13 @@ func collectRealmWarnings(cfg *Config) {
 		carries := "the SMS transport carries no credential at all: its one credential seam is the texted code, so a phone number alone never opens a session"
 		if resetMail {
 			carries = "the transport still carries the password-reset, email-verification and email-change mails, " +
-				"and a reset changes the password and opens no session -- the next login still asks for TOTP -- so a mailbox or a phone number alone never opens one"
+				"and a reset changes the password and opens no session -- the next login still asks for TOTP -- so a phone number alone never opens one, " +
+				"and a mailbox alone only by guessing the account's TOTP code"
+			if lockout := cfg.TwoFactor.Lockout; lockout.MaxFailures > 0 {
+				carries += fmt.Sprintf(", which twoFactor.lockout holds to %d wrong codes per account per %d seconds", lockout.MaxFailures, lockout.WindowSeconds)
+			} else {
+				carries += ", which nothing holds per account while twoFactor.lockout.maxFailures is 0: every login mints a new challenge, and the rateLimit budgets count per challenge"
+			}
 		}
 		if resetMail && cfg.TwoFactor.EnrolOnLogin {
 			carries += ", except for an account that has not enrolled yet, which twoFactor.enrolOnLogin lets whoever resets its password claim (see that warning)"
