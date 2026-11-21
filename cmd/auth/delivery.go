@@ -113,7 +113,9 @@ import (
 // sees them, which also covers a link or a code minted before the policy was
 // switched on. The other three seams — reset, verification, email change —
 // and the email-changed notice are wired as ever: a reset changes a password
-// and opens no session, so the next login is the TOTP challenge.
+// and opens no session, so the next login still asks for TOTP — except that
+// under twoFactor.enrolOnLogin an account that has not enrolled yet then
+// enrols one of the resetter's choosing (trust on first use, warned).
 
 // delivery holds the transports a cold start could build, plus everything the
 // upstream mailers need to render with. A nil transport means "this deployment

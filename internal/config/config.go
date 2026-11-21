@@ -285,10 +285,12 @@ type Registration struct {
 	// the reference's admin router nor the core's has one. Accounts come from
 	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains
 	// and to verified addresses, or a provisioning tool of the operator's own
-	// on the store; a deployment
-	// that must create accounts over HTTP closes the route in front of the
-	// function instead (config-reference §20). Off by default, which mounts
-	// the route as every earlier release did.
+	// on the store. Creating them over HTTP needs an invitation route the
+	// core does not have yet; keeping the route open behind an AWS_IAM route
+	// in front of the function is not advised, because the router serves
+	// percent-encoded spellings of the path and API Gateway was never shown
+	// to route them the same way (config-reference §20). Off by default,
+	// which mounts the route as every earlier release did.
 	//
 	// It closes one of two self-registration doors. An OAuth callback creates
 	// an account for an identity nothing here knows whenever
@@ -426,7 +428,9 @@ type TwoFactor struct {
 	// core, so the challenge offers neither; and its secondFactorGate refuses
 	// the four passwordless routes in every mode — login and step-up alike —
 	// /link-verify's loginAfterLinking and POST <admin>/login at request time.
-	// A mailbox or a phone number alone therefore never opens a session.
+	// A phone number alone therefore never opens a session, and a mailbox opens
+	// one only through EnrolOnLogin, for an account that has not enrolled TOTP
+	// yet: the password reset hands it the password (trust on first use).
 	//
 	// [new] — the reference has no deployment-level require2FA: the name lives
 	// on the settings store and on the user record only, and its login demands

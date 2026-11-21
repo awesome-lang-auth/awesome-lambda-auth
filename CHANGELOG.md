@@ -38,9 +38,11 @@ under [Unreleased].
   SMS-code senders are not handed to the core (`GET <prefix>/ui/config` reports
   both off), and `/magic-link/{send,verify}` and `/sms/{send,verify}` answer
   `403 2FA_REQUIRED` in every mode, the step-up (`mode: "2fa"`) included — so a
-  mailbox, which also receives the reset link, or a phone number never opens a
-  session on its own. The password reset still works and opens no session; the
-  next login is the TOTP challenge. `/link-verify` with `loginAfterLinking`
+  phone number never opens a session on its own, and a mailbox, which also
+  receives the reset link, opens one only under `twoFactor.enrolOnLogin`, for an
+  account that has not enrolled TOTP yet (trust on first use, warned). The
+  password reset still works and opens no session; the next login still asks
+  for TOTP. `/link-verify` with `loginAfterLinking`
   answers the same `403` (linking alone works as before), and `POST <admin>/login`
   answers `404` — the console admits a session from `POST <prefix>/login` and its
   TOTP code, and machine access (product deviation

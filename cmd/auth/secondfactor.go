@@ -62,7 +62,7 @@ import (
 //
 //   - Everything else was already held: /register opens a session only when
 //     /login would (core registerIssuesSession), /reset-password changes a
-//     password and opens nothing — the next login is the TOTP challenge —
+//     password and opens nothing — the next login still asks for TOTP —
 //     the forced enrolment of twoFactor.enrolOnLogin opens a session only on
 //     the TOTP factor it has just bound, the identity provider's /authorize
 //     calls the core's Service.Login, which refuses every account under the
@@ -210,7 +210,7 @@ func logSecondFactorSurface(cfg *config.Config, log *slog.Logger) {
 		slog.String("adminLogin", admin),
 	}
 	if cfg.MailerConfigured() || cfg.DeliveryWebhookConfigured() {
-		reset := "POST " + prefix + "/forgot-password delivers the reset link and /reset-password changes the password and opens no session: the next login is the TOTP challenge"
+		reset := "POST " + prefix + "/forgot-password delivers the reset link and /reset-password changes the password and opens no session: the next login still asks for TOTP"
 		if cfg.TwoFactor.EnrolOnLogin {
 			reset += "; an account that has not enrolled TOTP yet is claimed by whoever resets its password, through forced enrolment"
 		}

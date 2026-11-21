@@ -355,16 +355,20 @@ func TestTwoFactorRequiredOffersTOTPAlone(t *testing.T) {
 						t.Errorf("GET /auth/ui/config features = %v, want magicLink and sms false: the hosted page must not offer what the policy refuses", features)
 					}
 					log := d.log.String()
+					// The log is JSON (newLogger), so the fields are matched as
+					// JSON members.
 					for _, want := range []string{
-						"twoFactor.required: every session proves a TOTP code", "totp alone", "in every mode",
-						"magicLinkAndSMSCode", "withheld under twoFactor.required",
+						`"msg":"twoFactor.required: every session proves a TOTP code"`, `"secondFactor":"totp alone`, "in every mode",
+						`"magicLinkAndSMSCode":"withheld under twoFactor.required`,
 					} {
 						if !strings.Contains(log, want) {
-							t.Errorf("the cold start does not say %q:\n%s", want, log)
+							t.Errorf("the cold start does not say %s:\n%s", want, log)
 						}
 					}
-					if strings.Contains(log, "one-factor sign-ins refused") || strings.Contains(log, `smsTransport=sns`) || strings.Contains(log, `smsTransport=webhook`) {
-						t.Errorf("the cold start still reads as if the texted code or the old gate were in force:\n%s", log)
+					for _, stale := range []string{"one-factor sign-ins refused", `"smsTransport":"sns"`, `"smsTransport":"webhook"`} {
+						if strings.Contains(log, stale) {
+							t.Errorf("the cold start says %s, as if the texted code or the old gate were in force:\n%s", stale, log)
+						}
 					}
 					continue
 				}
@@ -397,6 +401,79 @@ func TestTwoFactorRequiredEnrolsBesideAMailer(t *testing.T) {
 	)))
 	t.Cleanup(d.app.Close)
 	forcedEnrolment(t, d.app, "forced-mailer@example.test")
+}
+
+// TestTwoFactorRequiredEnrolOnLoginLetsTheMailboxClaimAnUnenrolledAccount
+// pins the one way a mailbox still reaches a session under the policy, so that
+// it stays exactly what the warnings say and nothing wider. With forced
+// enrolment on and the reset mail wired, an account that has not enrolled TOTP
+// yet is claimed through its mailbox: forgot-password, reset-password, the
+// login's 2FA_SETUP_REQUIRED, then /2fa/setup and /2fa/verify-setup with a
+// factor of the resetter's choosing — trust on first use, which is why
+// twoFactor.enrolOnLogin is off by default and warned about. The control is a
+// TOTP-enrolled account on the same deployment: the same walk reaches the TOTP
+// challenge and no further — its tempToken enrols nothing, the emailed step-up
+// is refused, and only its own code completes the challenge.
+func TestTwoFactorRequiredEnrolOnLoginLetsTheMailboxClaimAnUnenrolledAccount(t *testing.T) {
+	t.Parallel()
+	users := newMemoryStoreBundle()
+	d := newDeliveryAppWith(t, mailerEnv(with(baseEnv(),
+		"AWESOME_AUTH_2FA_REQUIRED", "true",
+		"AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "true",
+	)), func(o *Options) { o.Stores = storeFactory(users, auth.NewMemorySessionStore()) })
+	t.Cleanup(d.app.Close)
+	bearerJSON := jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+	const chosen = "the-mailbox-holders-password-0123"
+	// The mailbox walk: forgot-password, reset-password to a password of the
+	// mailbox holder's choosing, and the login with it.
+	throughTheMailbox := func(t *testing.T, email string) events.APIGatewayV2HTTPResponse {
+		t.Helper()
+		d.mail.reset()
+		if forgot := invoke(t, d.app, http.MethodPost, "/auth/forgot-password", jsonHeaders(), nil, fmt.Sprintf(`{"email":%q}`, email)); forgot.StatusCode != http.StatusOK {
+			t.Fatalf("forgot-password for %s answered %d %s", email, forgot.StatusCode, forgot.Body)
+		}
+		token := tokenIn(t, linkIn(t, d.mail.only(t).Body))
+		reset := invoke(t, d.app, http.MethodPost, "/auth/reset-password", bearerJSON, nil, fmt.Sprintf(`{"token":%q,"password":%q}`, token, chosen))
+		if reset.StatusCode != http.StatusOK {
+			t.Fatalf("reset-password for %s answered %d %s", email, reset.StatusCode, reset.Body)
+		}
+		requireNoSession(t, "reset-password", reset)
+		return invoke(t, d.app, http.MethodPost, "/auth/login", bearerJSON, nil, loginBody(email, chosen))
+	}
+
+	// The residual: an account with no factor yet is claimed.
+	const unenrolled = "not-yet-enrolled@example.test"
+	seedAccount(t, users, "usr_00000000000000000notenrolled1", unenrolled)
+	login := throughTheMailbox(t, unenrolled)
+	requireSetupRequired(t, "the unenrolled account's login with the reset password", login)
+	temp, _ := decodeBody(t, login)["tempToken"].(string)
+	withTemp := jsonHeaders("authorization", "Bearer "+temp, auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+	setup := invoke(t, d.app, http.MethodPost, "/auth/2fa/setup", withTemp, nil, "{}")
+	secret, _ := decodeBody(t, setup)["secret"].(string)
+	if setup.StatusCode != http.StatusOK || secret == "" {
+		t.Fatalf("POST /auth/2fa/setup with the enrolment token answered %d %s", setup.StatusCode, setup.Body)
+	}
+	claimed := invoke(t, d.app, http.MethodPost, "/auth/2fa/verify-setup", withTemp, nil,
+		fmt.Sprintf(`{"secret":%q,"token":%q}`, secret, totpCodeNow(t, secret)))
+	if claimed.StatusCode != http.StatusOK || decodeBody(t, claimed)["accessToken"] == nil {
+		t.Fatalf("verify-setup answered %d %s, want the session forced enrolment opens: the residual the warnings disclose is this, and the test pins it as it is", claimed.StatusCode, claimed.Body)
+	}
+
+	// The control: an enrolled account, the same walk, and no further.
+	const enrolled, ownSecret = "enrolled-owner@example.test", "JBSWY3DPEHPK3PXP"
+	seedTOTPAccount(t, users, "usr_0000000000000000enrolledown1", enrolled, ownSecret)
+	stepUp := requireTOTPChallenge(t, "the enrolled account's login with the reset password", throughTheMailbox(t, enrolled))
+	stepUpBearer := jsonHeaders("authorization", "Bearer "+stepUp, auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+	if s := invoke(t, d.app, http.MethodPost, "/auth/2fa/setup", stepUpBearer, nil, "{}"); s.StatusCode == http.StatusOK {
+		t.Errorf("the enrolled account's step-up token started an enrolment of the resetter's choosing: %s", s.Body)
+	}
+	requireTwoFactorRequired(t, "the emailed step-up for the enrolled account",
+		invoke(t, d.app, http.MethodPost, "/auth/magic-link/send", jsonHeaders(), nil, fmt.Sprintf(`{"mode":"2fa","tempToken":%q}`, stepUp)))
+	done := invoke(t, d.app, http.MethodPost, "/auth/2fa/verify", bearerJSON, nil,
+		fmt.Sprintf(`{"tempToken":%q,"totpCode":%q}`, stepUp, totpCodeNow(t, ownSecret)))
+	if done.StatusCode != http.StatusOK || decodeBody(t, done)["accessToken"] == nil {
+		t.Fatalf("the enrolled account's own code answered %d %s, want the session", done.StatusCode, done.Body)
+	}
 }
 
 // TestTwoFactorRequiredRefusesLoginAfterLinking: POST <prefix>/link-verify

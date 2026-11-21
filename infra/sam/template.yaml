@@ -418,8 +418,10 @@ Parameters:
       POST /2fa/disable is refused. The emailed link and the texted code are
       not factors: the magic-link and SMS routes answer 403 2FA_REQUIRED in
       every mode, the second step (mode "2fa") included, and neither is
-      minted or sent, so a mailbox or a phone alone never opens a session.
-      The password reset still works and opens no session. /link-verify
+      minted or sent, so a phone alone never opens a session, and a mailbox
+      opens one only through TwoFactorEnrolOnLogin, for an account that has
+      not enrolled yet. The password reset still works and opens no
+      session. /link-verify
       refuses loginAfterLinking, and POST /admin/login answers 404 — the
       console admits a session from the auth login and its TOTP code, and
       machine access. An OAuth client id (Rule

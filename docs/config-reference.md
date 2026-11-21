@@ -698,13 +698,14 @@ policy neither counts:
   switched on;
 - the transport **keeps everything else**: the password-reset,
   email-verification and email-change mails, and the email-changed notice. A
-  reset changes the password and opens no session, so whoever resets it meets
-  the TOTP challenge at the next login.
+  reset changes the password and opens no session, so the next login still
+  asks whoever reset it for TOTP — the challenge for an enrolled account,
+  `2FA_SETUP_REQUIRED` for one without.
 
 The loader warns when the policy meets a mailer, the delivery webhook or an SMS
 transport, saying what is refused and what the transport still carries, and
 the cold start's `credential delivery wired` line carries
-`magicLinkAndSMSCode="withheld under twoFactor.required: …"`. The one way a mailbox still reaches a session is forced enrolment
+`"magicLinkAndSMSCode":"withheld under twoFactor.required: …"`. The one way a mailbox still reaches a session is forced enrolment
 (§7.2): an account that has not enrolled TOTP yet can have its password reset
 and its factor bound by whoever reads its mail — trust on first use, which is
 why that knob is off by default and warned about.
