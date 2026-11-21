@@ -395,7 +395,7 @@ var rateLimitRoutes = map[string][]rateLimitRoute{
 	},
 	"2fa-verify": {{http.MethodPost, "/2fa/verify", subjectOfTwoFactorVerify}},
 
-	// The four below carry a token and no identity, so under `keyBy: email` they
+	// The five below carry a token and no identity, so under `keyBy: email` they
 	// key by the client address like everything else with nothing to key on. The
 	// token itself is deliberately not used: the threat on these routes is
 	// guessing *a* token, not exhausting a known one, so a per-token budget
@@ -404,6 +404,12 @@ var rateLimitRoutes = map[string][]rateLimitRoute{
 	"reset-password":      {{http.MethodPost, "/reset-password", nil}},
 	"verify-email":        {{http.MethodGet, "/verify-email", nil}},
 	"resend-verification": {{http.MethodPost, "/send-verification-email", nil}},
+	// The staff invitation's public half, mounted only with
+	// invitations.enabled and under registration.closed too. Its 256-bit
+	// token is not guessable, but each call costs a consistent read of the
+	// table before the token is known to be bad, so the budget bounds a
+	// flood from one address.
+	"accept-invitation": {{http.MethodPost, "/invitations/accept", nil}},
 }
 
 // rateLimitCounter is the shared counter, discovered structurally on whatever

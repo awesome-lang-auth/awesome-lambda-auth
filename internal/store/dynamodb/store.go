@@ -161,6 +161,13 @@ type Options struct {
 	// Defaults to DefaultTelemetryRetention.
 	TelemetryRetention time.Duration
 
+	// InvitationRetention is how long an accepted or revoked invitation's
+	// record is kept — past its expiry or its end, whichever is later — before
+	// DynamoDB TTL may delete it. A pending invitation, expired or not, is never
+	// given a ttl (invitations.go, retention). Defaults to
+	// DefaultInvitationRetention.
+	InvitationRetention time.Duration
+
 	// Logger receives the once-per-process warnings this store emits. Defaults
 	// to slog.Default().
 	Logger *slog.Logger
@@ -217,6 +224,8 @@ type Store struct {
 	maxMetadataKeys   int
 	telemetryTTL      time.Duration
 
+	invitationRetention time.Duration
+
 	log                  *slog.Logger
 	degradedOnce         sync.Once
 	unknownNamespaceOnce sync.Once
@@ -249,6 +258,8 @@ func New(api API, opts Options) (*Store, error) {
 		maxMetadataKeys:   opts.MaxMetadataKeysPerUser,
 		telemetryTTL:      opts.TelemetryRetention,
 		log:               opts.Logger,
+
+		invitationRetention: opts.InvitationRetention,
 	}
 	if s.index == "" {
 		s.index = DefaultIndexName
@@ -279,6 +290,9 @@ func New(api API, opts Options) (*Store, error) {
 	}
 	if s.telemetryTTL == 0 {
 		s.telemetryTTL = DefaultTelemetryRetention
+	}
+	if s.invitationRetention == 0 {
+		s.invitationRetention = DefaultInvitationRetention
 	}
 	if s.log == nil {
 		s.log = slog.Default()

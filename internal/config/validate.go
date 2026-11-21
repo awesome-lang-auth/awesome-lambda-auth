@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // validate checks types, ranges and enumerations. It is separate from checkRules
@@ -583,6 +584,7 @@ func validateAdmin(c *Config, d *diagnostics) {
 				"about 4.4 MiB, because a multipart body arrives base64-encoded inside a 6 MB invocation event (config-reference.md §16.5)")
 	}
 	validateAdminMachineAccess(c, d)
+	validateInvitations(c, d)
 }
 
 // iamPrincipalARN is an IAM role or user ARN: a partition, a twelve-digit
@@ -852,10 +854,13 @@ func validateRateLimit(c *Config, d *diagnostics) {
 
 // rateLimitEndpoints is the set of endpoints the built-in limiter can be pointed
 // at. They are the unauthenticated, credential-guessable ones — a limiter on
-// anything else would be theatre.
+// anything else would be theatre. accept-invitation names a route that exists
+// only with invitations.enabled; naming it without them watches a path nothing
+// serves, which costs nothing.
 var rateLimitEndpoints = []string{
 	"login", "register", "refresh", "forgot-password", "reset-password",
 	"magic-link", "sms-code", "2fa-verify", "verify-email", "resend-verification",
+	"accept-invitation",
 }
 
 // RateLimitEndpoints returns the vocabulary rateLimit.scope accepts.
@@ -1286,5 +1291,87 @@ func emailAddress(d *diagnostics, path, got string) {
 		d.errf("", path,
 			fmt.Sprintf("%q is not an email address", got),
 			"use a single address such as no-reply@example.com")
+	}
+}
+
+// maxInvitationTTL is the ceiling on invitations.ttl. An unredeemed invitation
+// is a credential for an account with no password, so it is bounded the way a
+// counting window is: generous, and not indefinite.
+const maxInvitationTTL = 30 * 24 * time.Hour
+
+// validateInvitations checks invitations.* and admin.revealInvitationToken.
+//
+// Each refusal is a configuration that validates and then does nothing, or
+// does something other than the operator believes:
+//
+//   - invitations.enabled without admin.enabled: the invite route is on the
+//     admin router, so nothing could ever create an invitation.
+//   - invitations.enabled behind admin.accessPolicy: open: the invite route is
+//     behind the console's guard, and that guard admits everyone. An anonymous
+//     caller would invite a mailbox of their own with the role they name,
+//     accept and sign in: self-registration with a chosen role, on a realm whose
+//     registration.closed says there is none. It is refused for the reason
+//     RS-19 refuses an OAuth callback that still signs anyone up to a closed
+//     realm. The open console is the reference's default, and it is only
+//     warned about elsewhere (collectWarnings). This refusal is narrower: it
+//     covers the one route through which that console creates accounts.
+//   - invitations.enabled in resource-server mode: the accept route is never
+//     mounted there (the core gates every credential route).
+//   - invitations.enabled with no way to deliver a token — no mailer, no
+//     delivery webhook, no admin.revealInvitationToken: the invite route
+//     answers 501 to every call.
+//   - admin.revealInvitationToken beside a mailer or the delivery webhook: the
+//     core ignores the flag when it has a sender, so tokens would be mailed
+//     while the operator believes the caller receives them — and a deployment
+//     that has a sender must never hand a token to an HTTP caller.
+//   - admin.revealInvitationToken or invitations.reinvite without
+//     invitations.enabled: knobs of a feature that is off.
+func validateInvitations(c *Config, d *diagnostics) {
+	inv := c.Invitations
+	sender := c.MailerConfigured() || c.DeliveryWebhookConfigured()
+	if inv.Enabled {
+		ttl(d, "invitations.ttl", inv.TTL, true)
+		if inv.TTL.parseErr() == nil && inv.TTL.Duration() > maxInvitationTTL {
+			d.errf("", "invitations.ttl",
+				fmt.Sprintf("%q is longer than %s: an unredeemed invitation is a credential for an account with no password", inv.TTL.String(), "30d"),
+				`use at most "30d"; revoke and invite again to extend an offer`)
+		}
+		if !c.Admin.Enabled {
+			d.errf("", "invitations.enabled",
+				"is on while admin.enabled is off: POST <admin>/api/users/invitations is the only route that creates an invitation, and no console is mounted",
+				"set admin.enabled: true with an access policy (admin.machineAccess for a back office), or turn invitations off")
+		}
+		if c.Admin.Enabled && c.Admin.AccessPolicy == AdminAccessPolicyOpen {
+			d.errf("", "invitations.enabled",
+				"is on while admin.accessPolicy is open: the console admits every request with no credential, so anyone can invite an address of their own with the role of their choosing, accept it and sign in -- "+
+					"an account-creating route open to the internet, which registration.closed then does not close",
+				"set admin.accessPolicy to is-admin-flag, rbac:<role> or permission:<perm> (admin.machineAccess for a back office), or turn invitations off")
+		}
+		if c.ResourceServer.Enabled {
+			d.errf("", "invitations.enabled",
+				"is on in resource-server mode, which mounts no credential route: POST <prefix>/invitations/accept would answer 404",
+				"turn invitations on in the issuing deployment, not in the resource server")
+		}
+		if !sender && !c.Admin.RevealInvitationToken {
+			d.errf("", "invitations.enabled",
+				"is on with no way to deliver a token: neither email.mailer nor email.deliveryWebhook is configured, and admin.revealInvitationToken is off, so POST <admin>/api/users/invitations answers 501 to every call",
+				"configure email.mailer (the invitation template) or email.deliveryWebhook (kind \"invitation\"); or, for a back office that delivers the token itself, set admin.revealInvitationToken: true")
+		}
+	} else {
+		if inv.Reinvite {
+			d.errf("", "invitations.reinvite",
+				"is on while invitations.enabled is off, so no invitation route is mounted",
+				"set invitations.enabled: true, or remove this key")
+		}
+		if c.Admin.RevealInvitationToken {
+			d.errf("", "admin.revealInvitationToken",
+				"is on while invitations.enabled is off, so no invitation route is mounted",
+				"set invitations.enabled: true, or remove this key")
+		}
+	}
+	if c.Admin.RevealInvitationToken && sender {
+		d.errf("", "admin.revealInvitationToken",
+			"is on beside a configured sender (email.mailer or email.deliveryWebhook): the core mails the token and ignores the flag, and a deployment that mails tokens must not also hand them to an HTTP caller",
+			"remove admin.revealInvitationToken; it is for a deployment with no sender, whose back office delivers the token itself")
 	}
 }

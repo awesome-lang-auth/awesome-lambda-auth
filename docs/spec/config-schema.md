@@ -296,8 +296,9 @@ decided here, implemented in `cmd/auth/ratelimit.go` and
 
 The accepted names are `login`, `register`, `refresh`, `forgot-password`,
 `reset-password`, `magic-link`, `sms-code`, `2fa-verify`, `verify-email`,
-`resend-verification` (`internal/config` `RateLimitEndpoints()`). A name is a
-**flow**, not a path: `magic-link` covers `/magic-link/send` and
+`resend-verification`, `accept-invitation` (`internal/config`
+`RateLimitEndpoints()`; the last is the route `invitations.enabled` mounts). A
+name is a **flow**, not a path: `magic-link` covers `/magic-link/send` and
 `/magic-link/verify`, `sms-code` covers `/sms/send` and `/sms/verify`. The
 name-to-route table is in `cmd/auth/ratelimit.go` and
 `TestEveryScopeNameMapsToRoutes` fails if the two halves disagree.

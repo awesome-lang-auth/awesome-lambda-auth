@@ -145,6 +145,17 @@ func (s *Store) pageWindow(limit, offset int) (int, int, bool, error) {
 // shares its partition (sessionIndexItem) and an API key by service through its
 // id pointer. canonicalKeyOfEntry is the identity case.
 func (s *Store) pagedIndexQuery(ctx context.Context, in *awsddb.QueryInput, limit, offset int, canonicalKey canonicalKeyFunc) ([]map[string]types.AttributeValue, error) {
+	return s.pagedIndexQueryKeeping(ctx, in, limit, offset, canonicalKey, nil)
+}
+
+// pagedIndexQueryKeeping is pagedIndexQuery with one more way for an entry to
+// fail to resolve: a canonical item that keep refuses is dropped as if it had
+// gone, and the page is still filled. It exists for a sparse index whose
+// membership is a state of the record — the pending-invitation directory
+// (invitations.go) — where the index can lag a write that took the record out
+// of the state, and a resolved record that is no longer in it must neither be
+// answered nor shorten the page. A nil keep keeps everything.
+func (s *Store) pagedIndexQueryKeeping(ctx context.Context, in *awsddb.QueryInput, limit, offset int, canonicalKey canonicalKeyFunc, keep func(map[string]types.AttributeValue) bool) ([]map[string]types.AttributeValue, error) {
 	limit, offset, work, err := s.pageWindow(limit, offset)
 	if err != nil || !work {
 		return nil, err
@@ -179,6 +190,9 @@ func (s *Store) pagedIndexQuery(ctx context.Context, in *awsddb.QueryInput, limi
 				return nil, err
 			}
 			for _, it := range items {
+				if keep != nil && !keep(it) {
+					continue
+				}
 				out = append(out, it)
 				if len(out) == limit {
 					return out, nil
