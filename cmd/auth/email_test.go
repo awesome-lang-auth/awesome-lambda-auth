@@ -710,6 +710,8 @@ type webhookReceiver struct {
 	mu      sync.Mutex
 	got     []webhookDelivery
 	hangFor time.Duration
+	// status is what the handler answers; zero is 204, a delivery.
+	status int
 }
 
 func newWebhookReceiver(t *testing.T) *webhookReceiver {
@@ -729,7 +731,7 @@ func newWebhookReceiver(t *testing.T) *webhookReceiver {
 		_ = json.Unmarshal(body, &decoded)
 
 		r.mu.Lock()
-		hang := r.hangFor
+		hang, status := r.hangFor, r.status
 		r.got = append(r.got, webhookDelivery{body: body, headers: req.Header.Clone(), request: decoded})
 		r.mu.Unlock()
 
@@ -741,7 +743,10 @@ func newWebhookReceiver(t *testing.T) *webhookReceiver {
 				return
 			}
 		}
-		w.WriteHeader(http.StatusNoContent)
+		if status == 0 {
+			status = http.StatusNoContent
+		}
+		w.WriteHeader(status)
 	}))
 	t.Cleanup(r.srv.Close)
 	return r
@@ -755,6 +760,14 @@ func (r *webhookReceiver) setHang(d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.hangFor = d
+}
+
+// setStatus makes the handler answer every later request with code; zero puts
+// back the 204 of a delivered message. Under the mutex, as setHang is.
+func (r *webhookReceiver) setStatus(code int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status = code
 }
 
 func (r *webhookReceiver) deliveries() []webhookDelivery {

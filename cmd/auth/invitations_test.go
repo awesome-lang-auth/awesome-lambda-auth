@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -385,5 +391,207 @@ func TestInvitationTravelsByTheMailer(t *testing.T) {
 	}
 	if strings.Contains(d.log.String(), match[1]) {
 		t.Fatal("the invitation token reached the log")
+	}
+}
+
+// webhookStaffRealmEnv is the staff realm with no mailer: the delivery webhook
+// at url is the sender, and nothing is revealed to the admin caller.
+// email.mailer.defaultLang is set, as a stack may carry it with no mailer
+// block: it belongs to the mailer, and the webhook test shows it never reaches
+// the webhook.
+func webhookStaffRealmEnv(url string) map[string]string {
+	return webhookEnv(staffRealmEnv(
+		"AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN", "false",
+		"AWESOME_AUTH_MAILER_DEFAULT_LANG", "it",
+	), url)
+}
+
+// invitationDeliveries returns what reached the receiver, failing unless every
+// request is one invitation, each decoded into the type the core sent and
+// with the keys of its delivery object.
+func invitationDeliveries(t *testing.T, rec *webhookReceiver) ([]auth.InvitationDelivery, []map[string]json.RawMessage, []webhookDelivery) {
+	t.Helper()
+	var (
+		typed []auth.InvitationDelivery
+		raw   []map[string]json.RawMessage
+	)
+	got := rec.deliveries()
+	for _, d := range got {
+		if d.request.Kind != auth.DeliveryKindInvitation {
+			t.Fatalf("the receiver got kind %q, want %q: %s", d.request.Kind, auth.DeliveryKindInvitation, d.body)
+		}
+		var one auth.InvitationDelivery
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(d.request.Delivery, &one); err != nil {
+			t.Fatalf("decode the invitation delivery: %v", err)
+		}
+		if err := json.Unmarshal(d.request.Delivery, &keys); err != nil {
+			t.Fatalf("decode the invitation delivery's keys: %v", err)
+		}
+		typed, raw = append(typed, one), append(raw, keys)
+	}
+	return typed, raw, got
+}
+
+// TestInvitationTravelsByTheDeliveryWebhook covers the staff realm when it runs
+// with no mailer. The delivery webhook is the sender, twoFactor.required is on
+// with enrolOnLogin, and nothing is revealed. Each invitation leaves as one
+// signed POST of kind "invitation", and its body has everything a receiver
+// needs to write the mail: the recipient, the token, the link base, the
+// language and the expiry. None of it reaches the admin caller, a mailer or the
+// log. config-reference §21.2 documents this payload, field by field.
+func TestInvitationTravelsByTheDeliveryWebhook(t *testing.T) {
+	t.Parallel()
+	rec := newWebhookReceiver(t)
+	d := newDeliveryAppWith(t, webhookStaffRealmEnv(rec.srv.URL), func(o *Options) { o.HTTPClient = rec.srv.Client() })
+	t.Cleanup(d.app.Close)
+
+	before := time.Now()
+	invite := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller,
+		`{"email":" New.Staff@Example.test ","role":"staff","metadata":{"team":"ops"},"emailLang":"it"}`)
+	if invite.StatusCode != http.StatusCreated {
+		t.Fatalf("invite answered %d %s, want 201", invite.StatusCode, invite.Body)
+	}
+	if strings.Contains(invite.Body, `"token"`) || strings.Contains(invite.Body, "acceptUrl") {
+		t.Fatalf("a deployment with a delivery webhook handed the token to the admin caller: %s", invite.Body)
+	}
+	answer := decodeBody(t, invite)
+
+	typed, raw, got := invitationDeliveries(t, rec)
+	if len(typed) != 1 {
+		t.Fatalf("the receiver got %d requests, want exactly one invitation", len(typed))
+	}
+	delivery, keys, request := typed[0], raw[0], got[0]
+
+	// The envelope: the event, and a signature a receiver can check on its
+	// own, over the exact bytes, with the shared secret.
+	if event := request.headers.Get("X-Webhook-Event"); event != "delivery."+auth.DeliveryKindInvitation {
+		t.Errorf("X-Webhook-Event = %q, want delivery.invitation", event)
+	}
+	if request.headers.Get("X-Webhook-Delivery") == "" {
+		t.Error("X-Webhook-Delivery is empty, so a receiver cannot deduplicate")
+	}
+	mac := hmac.New(sha256.New, []byte(testWebhookSecret))
+	mac.Write(request.body)
+	if sig, want := request.headers.Get("X-Webhook-Signature"), "sha256="+hex.EncodeToString(mac.Sum(nil)); sig != want {
+		t.Errorf("X-Webhook-Signature = %q, want %q, an independent HMAC over the body", sig, want)
+	}
+
+	// The payload. These are exactly the keys §21.2 documents. A new field
+	// in a later core fails here until the docs say what it carries.
+	want := []string{"email", "expiresAt", "invitationId", "lang", "linkBase", "metadata", "role", "tenantId", "token", "userId"}
+	var have []string
+	for k := range keys {
+		have = append(have, k)
+	}
+	sort.Strings(have)
+	if strings.Join(have, ",") != strings.Join(want, ",") {
+		t.Errorf("the delivery's keys are %v, want %v (docs/config-reference.md §21.2)", have, want)
+	}
+	if delivery.InvitationID != answer["invitationId"] || delivery.UserID != answer["userId"] {
+		t.Errorf("the delivery names invitation %q of user %q, the answer %v of %v",
+			delivery.InvitationID, delivery.UserID, answer["invitationId"], answer["userId"])
+	}
+	if delivery.Email != "new.staff@example.test" || delivery.Email != answer["email"] {
+		t.Errorf("the recipient is %q, want the normalised address the answer names (%v)", delivery.Email, answer["email"])
+	}
+	if delivery.Role != "staff" || delivery.Metadata["team"] != "ops" || delivery.TenantID != "" {
+		t.Errorf("role %q, metadata %v, tenant %q: want what the invitation was created with", delivery.Role, delivery.Metadata, delivery.TenantID)
+	}
+	if delivery.Lang != "it" {
+		t.Errorf("lang = %q, want the invite body's emailLang", delivery.Lang)
+	}
+	answered, err := time.Parse(time.RFC3339Nano, fmt.Sprint(answer["expiresAt"]))
+	if err != nil || !delivery.ExpiresAt.Equal(answered) {
+		t.Errorf("expiresAt = %v, want the answer's %v (%v)", delivery.ExpiresAt, answer["expiresAt"], err)
+	}
+	if ttl := delivery.ExpiresAt.Sub(before); ttl < 48*time.Hour || ttl > 48*time.Hour+time.Minute {
+		t.Errorf("expiresAt is %v after the call, want invitations.ttl (48h)", ttl)
+	}
+	// There is no link field. The receiver builds the link on linkBase, the
+	// site URL a machine caller resolves to (no Origin) plus the API prefix,
+	// and the path is the POST-only accept route. That is why a receiver
+	// points the mail at its own accept form, as §21.2 says.
+	if delivery.LinkBase != testLinkBase {
+		t.Errorf("linkBase = %q, want %q", delivery.LinkBase, testLinkBase)
+	}
+	if link := auth.InvitationURL(delivery.LinkBase, delivery.Token); link != testLinkBase+"/invitations/accept?token="+delivery.Token {
+		t.Errorf("the mailer's link would be %q", link)
+	}
+
+	// Nothing went anywhere else.
+	if msgs := d.mail.messages(); len(msgs) != 0 {
+		t.Errorf("%d mail(s) were sent beside the webhook", len(msgs))
+	}
+	if strings.Contains(d.log.String(), delivery.Token) {
+		t.Error("the invitation token reached the log")
+	}
+
+	// The delivered token is the one the accept route honours, and the
+	// realm's next step follows it: enrolment, no session yet.
+	accept := invoke(t, d.app, http.MethodPost, "/auth/invitations/accept", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil,
+		fmt.Sprintf(`{"token":%q,"password":%q}`, delivery.Token, testPassword))
+	if accept.StatusCode != http.StatusForbidden || decodeBody(t, accept)["code"] != "2FA_SETUP_REQUIRED" || decodeBody(t, accept)["tempToken"] == nil {
+		t.Fatalf("the delivered token answered %d %s, want 403 2FA_SETUP_REQUIRED with an enrolment token", accept.StatusCode, accept.Body)
+	}
+
+	// With no emailLang, lang is left out. The receiver picks the language,
+	// and email.mailer.defaultLang ("it" here) belongs to the mailer and does
+	// not travel with the webhook.
+	if second := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller,
+		`{"email":"no-lang@example.test"}`); second.StatusCode != http.StatusCreated {
+		t.Fatalf("the second invite answered %d %s, want 201", second.StatusCode, second.Body)
+	}
+	typed, raw, _ = invitationDeliveries(t, rec)
+	if len(typed) != 2 {
+		t.Fatalf("the receiver got %d requests, want two invitations", len(typed))
+	}
+	if _, has := raw[1]["lang"]; has || typed[1].Lang != "" {
+		t.Errorf("an invitation sent with no emailLang carries lang %q, want the key left out", typed[1].Lang)
+	}
+	if _, has := raw[1]["role"]; has {
+		t.Error("an invitation with no role carries a role key, want it left out")
+	}
+}
+
+// TestInvitationWebhookFailureUndoesTheInvitation: the receiver's answer is the
+// delivery, so anything but a 2xx fails the invitation with a 502 and leaves
+// nothing behind. The invitation is revoked, so the token the receiver saw is
+// dead. The account it created is removed, so the same call works again. The
+// log carries no token.
+func TestInvitationWebhookFailureUndoesTheInvitation(t *testing.T) {
+	t.Parallel()
+	rec := newWebhookReceiver(t)
+	rec.setStatus(http.StatusServiceUnavailable)
+	d := newDeliveryAppWith(t, webhookStaffRealmEnv(rec.srv.URL), func(o *Options) { o.HTTPClient = rec.srv.Client() })
+	t.Cleanup(d.app.Close)
+
+	const body = `{"email":"bounced@example.test","role":"staff"}`
+	failed := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, body)
+	if failed.StatusCode != http.StatusBadGateway {
+		t.Fatalf("an invitation the receiver refused answered %d %s, want 502", failed.StatusCode, failed.Body)
+	}
+	typed, _, _ := invitationDeliveries(t, rec)
+	if len(typed) != 1 || typed[0].Token == "" {
+		t.Fatalf("the receiver got %d requests, want the one it refused", len(typed))
+	}
+	refused := typed[0]
+
+	list := invokeIAM(t, d.app, http.MethodGet, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, "")
+	if list.StatusCode != http.StatusOK || strings.Contains(list.Body, refused.InvitationID) || strings.Contains(list.Body, "bounced@") {
+		t.Fatalf("the undelivered invitation is still listed: %d %s", list.StatusCode, list.Body)
+	}
+	if late := invoke(t, d.app, http.MethodPost, "/auth/invitations/accept", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil,
+		fmt.Sprintf(`{"token":%q,"password":%q}`, refused.Token, testPassword)); late.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the undelivered token answered %d %s, want 401", late.StatusCode, late.Body)
+	}
+	if strings.Contains(d.log.String(), refused.Token) {
+		t.Error("the undelivered token reached the log")
+	}
+
+	// Without reinvite, an account left behind would make this a 409.
+	rec.setStatus(0)
+	if again := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, body); again.StatusCode != http.StatusCreated {
+		t.Fatalf("repeating the call once the receiver answers 2xx answered %d %s, want 201", again.StatusCode, again.Body)
 	}
 }
