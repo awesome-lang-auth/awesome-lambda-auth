@@ -286,8 +286,8 @@ type Registration struct {
 	// the reference's admin router nor the core's has one. Accounts come from
 	// cmd/migrate's import, an OAuth callback narrowed to allowedEmailDomains
 	// and to verified addresses, or a provisioning tool of the operator's own
-	// on the store. Creating them over HTTP needs an invitation route the
-	// core does not have yet; keeping the route open behind an AWS_IAM route
+	// on the store, or — since core v0.15.0 — an invitation (invitations.*,
+	// config-reference §21); keeping the route open behind an AWS_IAM route
 	// in front of the function is not advised, because the router serves
 	// percent-encoded spellings of the path and API Gateway was never shown
 	// to route them the same way (config-reference §20). Off by default,

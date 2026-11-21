@@ -3807,3 +3807,69 @@ skipping disabled or unconfirmed pool users there is a separate change.
 
 A front door that blocks `POST <prefix>/register` at the edge is still worth
 keeping as a second layer, and before this switch it was the only one.
+
+## 21. `invitations.*` and `admin.revealInvitationToken` — staff invitations
+
+awesome-go-auth v0.15.0 adds the invitation flow (core deviation
+`invitations-are-an-addition`); this block switches it on. Off by default, and
+off mounts nothing.
+
+| Key | Env | SAM parameter | Default | Effect |
+|---|---|---|---|---|
+| `invitations.enabled` | `AWESOME_AUTH_INVITATIONS_ENABLED` | `InvitationsEnabled` | `false` | hands the core the driver's `InvitationStore`: `POST`/`GET <admin>/api/users/invitations`, `DELETE <admin>/api/users/invitations/{id}`, and the public `POST <prefix>/invitations/accept` |
+| `invitations.ttl` | `AWESOME_AUTH_INVITATIONS_TTL` | `InvitationsTtl` | `72h` | how long a token is honoured (`WithInvitationTTL`); at most `30d` |
+| `invitations.reinvite` | `AWESOME_AUTH_INVITATIONS_REINVITE` | `InvitationsReinvite` | `false` | a still-pending address may be invited again: `200`, a fresh token, the earlier ones retired (`WithInvitationReinvite`) |
+| `admin.revealInvitationToken` | `AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN` | `AdminRevealInvitationToken` | `false` | the invite answer carries `token` and `acceptUrl` (`AdminOptions.RevealInvitationToken`) |
+
+### 21.1 Refusals
+
+The loader refuses, at cold start:
+
+- `invitations.enabled` without `admin.enabled` — the invite route is on the console;
+- `invitations.enabled` with `resourceServer.enabled` — no credential route is mounted there;
+- `invitations.enabled` with no `email.mailer`, no `email.deliveryWebhook` and no `admin.revealInvitationToken` — the invite route would answer `501` to every call;
+- `admin.revealInvitationToken` beside `email.mailer` or `email.deliveryWebhook` — the core mails the token and ignores the flag, and a deployment that mails tokens must never hand them to an HTTP caller;
+- `admin.revealInvitationToken` or `invitations.reinvite` while `invitations.enabled` is off;
+- `invitations.ttl` above `30d`.
+
+The first-user console policy is already refused on every driver (RS-17), which is
+the one policy the core's invite route also refuses.
+
+### 21.2 Delivery
+
+The invitation travels by the transport the other credential mails take:
+the delivery webhook (`kind: "invitation"`, the `InvitationDelivery` body) when
+`email.deliveryWebhook.url` is set, otherwise the mailer, rendering the
+reference's `invitation` template (a template store's override wins) with the
+link `<base>/invitations/accept?token=…`. **No page ships for that path**: the
+front end that owns the accept form serves `GET` on it and posts
+`{token, password}` to the route, as it does for `/reset-password`.
+
+### 21.3 `admin.revealInvitationToken` — the risk
+
+Accepting an invitation marks the address verified on the strength of the token
+having reached that mailbox. With the flag on, the token reaches whoever called
+the admin API instead — a machine principal, its logs, the channel it forwards the
+link through — and that caller can activate the account. Use it only for a back
+office that delivers the token to the invited mailbox itself and keeps it out of
+logs; the loader warns whenever it is on.
+
+### 21.4 The staff realm
+
+`registration.closed` + `twoFactor.required` + `twoFactor.enrolOnLogin` +
+`invitations.enabled` + `admin.machineAccess.iam.principals`: the back office
+invites on an IAM-signed request, the invitee accepts and receives
+`403 2FA_SETUP_REQUIRED` with an enrolment token, enrols TOTP through
+`/2fa/setup` and `/2fa/verify-setup`, and only then holds a session.
+`cmd/auth/invitations_test.go` drives exactly this on both drivers.
+
+### 21.5 Storage (DynamoDB)
+
+`internal/store/dynamodb/invitations.go`: `INV#<id>`/`INV` (the record; the
+token's SHA-256, never the token), `INVTOKEN#<hash>`/`INVTOKEN` (pointer),
+`INVUSER#<userId>`/`INV#<id>` (one item per pending invitation, read with
+`ConsistentRead`), and the sparse GSI1 partition `INVITATION` for the listing.
+Every item carries `ttl` = expiry + 30 days (`Options.InvitationRetention`); until
+then an expired, unrevoked invitation stays listed and keeps reserving its
+account. No new IAM action is needed.
+
