@@ -3853,6 +3853,11 @@ The loader refuses, at cold start:
 The first-user console policy is already refused on every driver (RS-17), which is
 the one policy the core's invite route also refuses.
 
+It warns, without refusing, about `invitations.enabled` under
+`twoFactor.required` without `twoFactor.enrolOnLogin`. No invitee can reach a
+session alone there (§21.4), but an operator can still enrol each one out of
+band after it has accepted.
+
 ### 21.2 Delivery
 
 The invitation travels by the transport the other credential mails take:
@@ -3941,7 +3946,20 @@ logs; the loader warns whenever it is on.
 invites on an IAM-signed request, the invitee accepts and receives
 `403 2FA_SETUP_REQUIRED` with an enrolment token, enrols TOTP through
 `/2fa/setup` and `/2fa/verify-setup`, and only then holds a session.
-`cmd/auth/invitations_test.go` drives exactly this on both drivers.
+`cmd/auth/invitations_test.go` drives exactly this on both drivers. With the
+delivery webhook as the sender, `TestInvitationTravelsByTheDeliveryWebhook`
+drives it on the memory driver.
+
+**`twoFactor.enrolOnLogin` is the part that cannot be dropped.** Without it the
+acceptance still spends the token, sets the password and answers
+`403 2FA_SETUP_REQUIRED`, but no route accepts that `tempToken`, and every later
+login answers the same. Each invitee then waits for an operator to enrol a
+factor out of band. Enrolling one *before* acceptance does not help: the core
+activates only an account with no password and no factor, so the acceptance
+spends the token and answers `401 INVALID_INVITATION`. The loader warns about
+this combination (§21.1). With `enrolOnLogin` the first enrolment is trust on
+first use, as §7.2 describes. Here, holding that trust means holding the
+single-use token that was sent to the invited mailbox.
 
 ### 21.5 Storage (DynamoDB)
 

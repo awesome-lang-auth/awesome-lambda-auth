@@ -602,6 +602,22 @@ func collectRealmWarnings(cfg *Config) {
 			"deliver the token only to the invited mailbox, keep it out of logs, and prefer email.mailer or email.deliveryWebhook, which keep the token off the admin API entirely")
 	}
 
+	// Invitations under twoFactor.required without forced enrolment. Nothing
+	// is refused: an operator can still enrol each invitee out of band once it
+	// has accepted, which is the posture the realm without enrolOnLogin
+	// already asks of every account. But no invitee can get there alone, and
+	// the obvious workaround of enrolling the account first defeats itself,
+	// because the core activates only a pending account: no password and no
+	// factor (invitation.go, pendingAccount).
+	if cfg.Invitations.Enabled && cfg.TwoFactor.Required && !cfg.TwoFactor.EnrolOnLogin {
+		cfg.warn("invitations.enabled",
+			"invitations are on under twoFactor.required without twoFactor.enrolOnLogin, so no invitee reaches a session alone: accepting spends the token, sets the password and answers 403 2FA_SETUP_REQUIRED "+
+				"with a tempToken no route accepts, and every later login answers the same until the account is enrolled out of band; enrolling a factor before the acceptance does not help, "+
+				"because the acceptance then spends the token and refuses it -- the core activates only an account with no password and no factor",
+			"set twoFactor.enrolOnLogin: true, so the acceptance's tempToken enrols TOTP and opens the session (trust on first use, bounded here by the single-use token in the invited mailbox), "+
+				"or enrol each invitee out of band after it has accepted")
+	}
+
 	if cfg.TwoFactor.EnrolOnLogin {
 		scope := "an account under twoFactor.required"
 		if !cfg.TwoFactor.Required {

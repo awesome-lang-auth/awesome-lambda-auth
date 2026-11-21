@@ -470,7 +470,10 @@ Parameters:
       invitee accepts once at POST <ApiPrefix>/invitations/accept, setting a
       password; under TwoFactorRequired the answer is 2FA_SETUP_REQUIRED and,
       with TwoFactorEnrolOnLogin, the invitee enrols TOTP before any session
-      opens. Needs EnableAdminConsole and a sender or
+      opens. Without TwoFactorEnrolOnLogin no invitee can enrol alone: each
+      waits for an out-of-band enrolment after accepting, and enrolling
+      before acceptance makes the acceptance spend and refuse the token. The
+      function warns about this. Needs EnableAdminConsole and a sender or
       AdminRevealInvitationToken. The accept route is outside the default
       rate-limit scope: name accept-invitation in rateLimit.scope (ConfigFile)
       to limit it per client address. "false" — the default — mounts none of

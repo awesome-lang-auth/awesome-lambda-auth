@@ -64,6 +64,36 @@ func TestInvitationsLoadFromTheEnvironment(t *testing.T) {
 	}
 }
 
+// Under twoFactor.required without twoFactor.enrolOnLogin, no invitee can reach
+// a session alone. The acceptance spends the token and answers
+// 2FA_SETUP_REQUIRED with a tempToken that no route accepts, and every later
+// login answers the same. Enrolling before acceptance is no way out: the
+// acceptance then spends the token and refuses it, because the account is no
+// longer pending. The realm loads, since an operator can still enrol each
+// invitee out of band after acceptance, but the loader says so. With
+// enrolOnLogin there is nothing to say.
+func TestInvitationsUnderRequiredTwoFactorWarnWithoutEnrolment(t *testing.T) {
+	for _, enrol := range []bool{false, true} {
+		doc, env := invitationsDoc(), baseEnv()
+		withMailer(doc)
+		set(doc, "twoFactor.required", true)
+		set(doc, "twoFactor.enrolOnLogin", enrol)
+		cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env), AllowUnimplemented: true})
+		if err != nil {
+			t.Fatalf("enrolOnLogin=%v: load: %v", enrol, err)
+		}
+		warned := false
+		for _, w := range cfg.Warnings() {
+			if w.Path == "invitations.enabled" && strings.Contains(w.Problem, "twoFactor.enrolOnLogin") {
+				warned = true
+			}
+		}
+		if warned == enrol {
+			t.Errorf("enrolOnLogin=%v: warned about invitees who cannot enrol = %v, want %v; warnings: %v", enrol, warned, !enrol, cfg.Warnings())
+		}
+	}
+}
+
 func TestInvitationsRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

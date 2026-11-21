@@ -30,7 +30,10 @@ under [Unreleased].
   `admin.revealInvitationToken` hands it to the admin caller (see Security).
   The loader refuses invitations without the console, behind an open console
   (`admin.accessPolicy: open`), in resource-server mode, or with no way to
-  deliver a token.
+  deliver a token. It warns about invitations under `twoFactor.required`
+  without `twoFactor.enrolOnLogin`. That realm loads, but no invitee can
+  enrol alone: each waits for an out-of-band enrolment after accepting, and
+  enrolling before the acceptance makes it spend and refuse the token.
 - **DynamoDB `InvitationStore`** (`internal/store/dynamodb/invitations.go`) in
   the single table: `INV#<id>` (the record; the token's SHA-256 only),
   `INVTOKEN#<hash>` (the pointer the consume finds it by) and
