@@ -3869,7 +3869,21 @@ invites on an IAM-signed request, the invitee accepts and receives
 token's SHA-256, never the token), `INVTOKEN#<hash>`/`INVTOKEN` (pointer),
 `INVUSER#<userId>`/`INV#<id>` (one item per pending invitation, read with
 `ConsistentRead`), and the sparse GSI1 partition `INVITATION` for the listing.
-Every item carries `ttl` = expiry + 30 days (`Options.InvitationRetention`); until
-then an expired, unrevoked invitation stays listed and keeps reserving its
-account. No new IAM action is needed.
+No new IAM action is needed.
+
+**A pending invitation carries no `ttl`**, expired or not: DynamoDB TTL never
+reaps one. It stays listed (as expired), revocable and reserving its account —
+passwordless, unverified, out of `/forgot-password`'s reach — until it is
+revoked, which is the core's contract. Reaping it would leave that account with
+nothing that lists, revokes or re-invites it. The transaction that ends an
+invitation — the acceptance or the revocation — deletes the pointer and the
+membership item and gives the record a `ttl` 30 days
+(`Options.InvitationRetention`) past its expiry or its end, whichever is later;
+after that sweep a second revocation answers `404` instead of `409`, as the
+core's memory store does a day after an invitation ends.
+
+Abandoned invitations are therefore bounded by revoking them, never by waiting:
+a back office that wants offers to lapse sweeps the listing and calls
+`DELETE <admin>/api/users/invitations/{id}` for the expired ones, which removes
+each untouched account with its invitation.
 

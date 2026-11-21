@@ -37,8 +37,11 @@ under [Unreleased].
   consistent per-user read a re-invitation, a revocation and `/forgot-password`
   depend on), with the pending listing on the sparse GSI1 partition `INVITATION`.
   Consume, revoke and release are each one transaction whose condition carries the
-  whole state, so of any number of concurrent accepts exactly one wins. Every item
-  carries `ttl` = expiry + 30 days. No new IAM action: the existing
+  whole state, so of any number of concurrent accepts exactly one wins. A pending
+  invitation carries no `ttl`, expired or not, so DynamoDB TTL never reaps one:
+  only the transaction that ends it (accept or revoke) gives the record a `ttl`,
+  30 days past its expiry or its end, whichever is later, and deletes the token
+  pointer and the membership item. No new IAM action: the existing
   `AuthTableItems` and `AuthTableIndexQuery` grants cover every call. The user
   store reads the acceptance depends on (`GetUserByID`, `GetUserByEmail`) were
   already `ConsistentRead`.
@@ -201,9 +204,9 @@ under [Unreleased].
   `invitations.enabled`, and the loader warns whenever it is on.
 - **An expired invitation nobody revoked keeps reserving its account** — listed
   as `expired`, revocable, its account passwordless and unverified, reachable by
-  magic link — until it is revoked or, on DynamoDB, until TTL deletes it 30 days
-  after expiry (a store note in `docs/deviations.md`). An offer that is meant to
-  lapse is revoked, not left to expire.
+  magic link — until it is revoked; no store lets it lapse by itself. An offer
+  that is meant to lapse is revoked (`DELETE <admin>/api/users/invitations/{id}`,
+  which also removes the untouched account), not left to expire.
 
 - **Counting windows have a one-year ceiling.** `twoFactor.lockout.windowSeconds` and `rateLimit.windowSeconds` above 31,536,000 seconds are refused at start: a window is multiplied by `time.Second`, and a value above ~292 years overflowed and turned the cap into a sub-second window.
 - **Rate-limit subject canonicalisation** (`rateLimit.keyBy: email`, the
