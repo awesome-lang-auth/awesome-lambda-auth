@@ -77,7 +77,9 @@ Three kinds of line, all JSON, all on the deployment's log group:
   posture off: which transport each seam uses, the canonical site URL, how many
   origins are allowlisted, what the templates directory seeded, and which
   providers, provisioning policy and linking stores the OAuth block came up
-  with.
+  with. Under `twoFactor.required` the delivery line carries
+  `magicLinkAndSMSCode` — both seams withheld from the core (§7.1) — and its
+  `smsTransport` never reads as a carrier.
 
 ## 3. Secrets
 
@@ -203,7 +205,8 @@ the gate used to pre-empt: RS-6 for a console enabled with neither a policy nor
 a bootstrap secret, or with a bootstrap secret too short to be one; RS-17 for
 `first-user` on every driver, and RS-10 for it on a driver that cannot list
 users at all; RS-18 for a session console beside `cookies.sameSite: none`;
-RS-20 for a root user or a bootstrap secret beside `twoFactor.required`; and
+RS-20 for a root user, a bootstrap secret or the `open` policy beside
+`twoFactor.required`; and
 the `stores.enable.rbac` requirement behind `rbac:<role>` and
 `permission:<perm>`. Two of its knobs are reported rather than honoured (§16.8),
 which is the other mechanism and not this one.
@@ -324,6 +327,14 @@ at cold start as knobs this build cannot honour rather than quietly dropped.
 `email.mailer.defaultLang` is the default only: a request that carries an
 `emailLang` body field of `en` or `it` renders in that language instead.
 
+**Under `twoFactor.required` the mailer carries three seams, not four.** The
+magic link is not handed to the core, because the emailed link would stand in
+for the TOTP code as the second step, and the mailbox also receives the reset
+link (§7.1); `POST <prefix>/magic-link/*` answer `403 2FA_REQUIRED`. The reset,
+verification and email-change mails, and the email-changed notice, go out as
+ever. The same holds for SNS, whose one credential seam — the texted code — is
+withheld, and for the delivery webhook below. The loader says so in a warning.
+
 ### 5.3 `email.templatesDir` — shipped templates
 
 A directory of JSON files baked into the artifact, read once at cold start and
@@ -391,7 +402,8 @@ or SNS for those routes, even when the mailer and sms blocks are also
 configured. It is what a deployment whose transport is neither mail nor SMS — or
 is not reachable from a Lambda — wires, and it replaces the reference's
 in-process send-callback functions, which a configuration document cannot
-express.
+express. Under `twoFactor.required` it is handed three of the five: the magic
+link and the SMS code are not sender seams there (§7.1, §5.2).
 
 The request:
 
@@ -596,21 +608,22 @@ applies and a deployment that configures nothing gets the reference's own
 default. The `iss` claim is a different thing and is not this knob: it is not
 configurable in this build, and it becomes one with the identity-provider block.
 
-### 7.1 `twoFactor.required` — a password login has to prove a second factor
+### 7.1 `twoFactor.required` — every session proves a TOTP code
 
 The core's `Config.Require2FA`, enforced at login since `awesome-go-auth`
-`v0.14.0`. With it on, `POST <prefix>/login` opens no session on a password
-alone:
+`v0.14.0`, with **TOTP as the only second factor**. With it on,
+`POST <prefix>/login` opens no session on a password alone:
 
-- An account with a factor it can present gets the reference's challenge,
-  `200 {"requiresTwoFactor":true,"tempToken":…,"available2faMethods":[…]}`, and
-  completes it at `POST <prefix>/2fa/verify` (or the magic-link and SMS routes in
-  `mode: "2fa"`). An enrolled TOTP is a factor; so, where a mail or SMS
-  transport is wired, are the emailed link and the texted code — the core lists
-  only the methods the deployment can deliver (`advertised-2fa-methods-require-store-support`).
-- An account with none gets the reference's
+- An account with TOTP enrolled gets the reference's challenge,
+  `200 {"requiresTwoFactor":true,"tempToken":…,"available2faMethods":["totp"]}`,
+  and completes it at `POST <prefix>/2fa/verify` with a code. Nothing else is
+  offered and nothing else completes it — not the emailed link, not the texted
+  code, whatever transports are wired (see *A mailbox or a phone is not a second
+  factor*, below).
+- An account without TOTP gets the reference's
   `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` and no
-  session. Its `tempToken` completes nothing unless `twoFactor.enrolOnLogin` is
+  session — with a mail or SMS transport wired too, and with a phone number on
+  file. Its `tempToken` completes nothing unless `twoFactor.enrolOnLogin` is
   on (§7.2); otherwise the account has to be enrolled out of band before it can
   sign in — by whatever provisions it, writing the factor through the store —
   because under the policy it can never get the session that `/2fa/setup` on
@@ -636,20 +649,21 @@ session there before (`cmd/auth/secondfactor_test.go`):
 | Door | Under `twoFactor.required` | Why this answer |
 |---|---|---|
 | `GET <prefix>/oauth/{provider}/callback` | **refused at start** (RS-20) while any `oauth.providers` entry is configured | the core completes the callback with a session and no second-factor step (`oauth-callback-skips-the-second-factor`), and nothing in front of it can make it ask |
-| `POST <prefix>/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify` in **login mode** | `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}`, before anything is minted, sent or consumed | the emailed link or texted code alone is one factor. The **step-up mode** — `mode: "2fa"` with the login's `tempToken` — is the second factor itself and works as before |
+| `POST <prefix>/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`, in **every mode** | `403 {"error":"Two-factor authentication required","code":"2FA_REQUIRED"}`, before anything is minted, sent or consumed — the **login mode** and the **step-up mode** (`mode: "2fa"` with the login's `tempToken`) alike | in login mode the emailed link or texted code alone is one factor; as the step-up it would make the mailbox or the phone the second, and the mailbox also receives the reset link. The core is not handed the two senders either, so its challenge never offers them (below) |
 | `POST <prefix>/link-verify` with `loginAfterLinking` | the same `403`, before the link token is read; linking without it works as before | the core opens a session on the emailed link token alone, and `/link-request` mints one for any access token, mailed wherever its body says |
 | `POST <admin>/login` | the router's `404`, as wherever the route is not mounted | it mints a 24-hour console token on a password alone (`admin-login-skips-the-second-factor`). The console admits the access token of a session from `POST <prefix>/login` and its factor — point `admin.loginPath` at the hosted login so a browser goes there — and machine access (§16.9), which is IAM and not a sign-in |
 | `admin.rootUser`, `admin.bootstrapSecret` | **refused at start** (RS-20) while the console is mounted | their one door is `POST <admin>/login`; without an access policy the bootstrap secret is the console's whole guard, a shared password with no second factor. The first administrator is then flagged another way (§16.2) |
+| `admin.accessPolicy: open` | **refused at start** (RS-20) while the console is mounted | the open console admits every request with no credential at all — the user listing, promote, API keys and webhook secrets included — so its power needs no factor, not even one. Set `is-admin-flag`, `rbac:<role>` or `permission:<perm>` |
 | `POST <prefix>/authorize` (identity provider) | `401 invalid credentials` for every account; the loader warns | it signs in through the core's password login, which has no second-factor step there and refuses everyone under the policy: no authorization code is issued, so no OIDC sign-in can complete. Run the identity provider on a realm without the policy |
 
-The four passwordless refusals and the console's `404` are the product
-deviation `two-factor-required-refuses-one-factor-sign-ins`, written at start
-on the `twoFactor.required: one-factor sign-ins refused` line. Nothing else
+The passwordless refusals, the withheld senders, the `loginAfterLinking`
+refusal and the console's `404` are the product deviation
+`two-factor-required-refuses-one-factor-sign-ins`, written at start on the
+`twoFactor.required: every session proves a TOTP code` line. Nothing else
 changes: `POST <prefix>/register` opens no session under the policy (the core
-opens one only when the login would), forced enrolment opens one only on the
-factor it has just bound (§7.2), and the hosted UI still offers its magic-link
-and SMS sign-in buttons where a transport is wired (they answer the `403`; the
-same transports deliver the step-up factor).
+opens one only when the login would), `POST <prefix>/reset-password` changes a
+password and opens none, and forced enrolment opens one only on the TOTP factor
+it has just bound (§7.2).
 
 **It is not retroactive.** Switching the policy on stops new one-factor
 sign-ins; it does not end the sessions already open, which go on refreshing
@@ -663,19 +677,37 @@ the switch is signed with the access secret and the guard accepts it for its
 the access-token secret too — on the SAM quickstart both keys live in one
 secret document and rotate together (`infra/sam/README.md`, *Rotating*).
 
-**Where both steps rest on one mailbox — an open decision.** With a mail
-transport wired (a mailer, or the delivery webhook), the core offers the emailed link as the second step to every
-account, a TOTP-enrolled one included, as the reference does
-(`advertised-2fa-methods-require-store-support`), and the same mailbox receives
-the password-reset link. So whoever controls the mailbox alone can reset the
-password and then answer the challenge with the emailed link: two steps, one
-factor. Every session still passes the password login's challenge, so nothing
-above refuses it; narrowing what counts as a second factor — not offering the
-emailed step-up to an account that enrolled TOTP, or asking for the factor
-before a reset — is a change to the core's method list that this build does
-not make. Until it is decided, a realm that cannot accept the mailbox as both
-steps runs with neither a mailer nor the delivery webhook, and resets passwords
-out of band.
+**A mailbox or a phone is not a second factor.** Left to itself the core
+offers the emailed link as the second step to every challenged account
+wherever mail can be sent, and the texted code to every account with a number
+on file wherever SMS can be (`advertised-2fa-methods-require-store-support`,
+as the reference does) — and the mailbox that receives the link also receives
+the password-reset link. Whoever controlled the mailbox alone could therefore
+reset the password and answer the challenge with the emailed link: two steps,
+one factor, and a TOTP-enrolled account opened without its code. Under the
+policy neither counts:
+
+- the magic-link and SMS-code senders are **not handed to the core**, whatever
+  transport is wired — a mailer, SNS or the delivery webhook. The challenge
+  lists `totp` alone; an account without TOTP is answered `2FA_SETUP_REQUIRED`
+  (and enrols, under §7.2) instead of being challenged for a link or a code;
+  and `GET <prefix>/ui/config` reports `features.magicLink` and `features.sms`
+  false, so the hosted page offers neither;
+- the four routes **answer `403 2FA_REQUIRED` in every mode**, the step-up
+  included — which also refuses a link or a code minted before the policy was
+  switched on;
+- the transport **keeps everything else**: the password-reset,
+  email-verification and email-change mails, and the email-changed notice. A
+  reset changes the password and opens no session, so whoever resets it meets
+  the TOTP challenge at the next login.
+
+The loader warns when the policy meets a mailer, the delivery webhook or an SMS
+transport, saying what is refused and what the transport still carries, and
+the cold start's `credential delivery wired` line carries
+`magicLinkAndSMSCode="withheld under twoFactor.required: …"`. The one way a mailbox still reaches a session is forced enrolment
+(§7.2): an account that has not enrolled TOTP yet can have its password reset
+and its factor bound by whoever reads its mail — trust on first use, which is
+why that knob is off by default and warned about.
 
 ### 7.2 `twoFactor.enrolOnLogin` — enrolling at the first login, and what that trusts
 
@@ -698,11 +730,18 @@ dies the moment the account has a factor: a replay is
 unenrolled account's password — a leaked invitation or initial password, or the
 password of an account whose factor an administrator has just reset — binds a
 factor of their choosing and gets a full session, and the owner's next login is
-a challenge they cannot answer. Turn it on where the first sign-in with the
-password is the owner's by construction, and reset the password together with
-the factor; a realm that hands out initial passwords it does not control, or
-that can reset a factor without resetting the password, enrols out of band and
-leaves it off. The loader warns at every start while it is on.
+a challenge they cannot answer. **With the reset mail wired** (a mailer or the
+delivery webhook) the mailbox alone is enough: `POST <prefix>/forgot-password`
+and `/reset-password` hand the password to whoever reads it, and forced
+enrolment then binds their factor — the one way a mailbox still opens a
+session under `twoFactor.required`, and only for an account that has not
+enrolled yet. Turn it on where the first sign-in with the password is the
+owner's by construction, and reset the password together with the factor; a
+realm that hands out initial passwords it does not control, that can reset a
+factor without resetting the password, or that cannot vouch for its users'
+mailboxes before they enrol, enrols out of band and leaves it off. The loader
+warns at every start while it is on, naming the mailbox when the reset mail is
+wired.
 
 It is not refused without `twoFactor.required`: an account whose own
 `require2FA` flag is set is held to a factor too, and enrols the same way.
@@ -1836,7 +1875,9 @@ by the very next request, exactly as in the reference.
   principal is established. It is the reference's own default and its own
   advice for it — "use only behind a VPN or IP allow-list" (`admin.router.ts:29`).
   The contract suite reports a console that answers a bare `GET <admin>/api/ping`
-  with 200 as a fault, in as many words.
+  with 200 as a fault, in as many words. **Refused at start beside
+  `twoFactor.required`** (RS-20): a console that asks for no credential cannot
+  be one that asks for a second factor.
 - **`first-user`** is **refused at start on every driver** (RS-17), and the
   schema keeps the spelling only so a document written for another port parses
   here and meets the refusal rather than a schema error. The reference grants
@@ -1918,8 +1959,9 @@ above, and the guard judges it. A deployment that requires 2FA sets it.
 stops existing, and the console admits the first alone — a session from
 `POST <prefix>/login` that proved the factor — plus machine access (§16.9). The
 root user and the bootstrap secret, which sign in nowhere else, are refused at
-start beside the policy (RS-20), and so is a bootstrap secret standing as the
-console's whole guard without an access policy. §7.1 has the whole table.
+start beside the policy (RS-20), and so are a bootstrap secret standing as the
+console's whole guard without an access policy and the `open` policy, which
+asks for no credential at all. §7.1 has the whole table.
 
 That leaves the first administrator of an `is-admin-flag` console to be flagged
 without the root user, and there are three ways: a machine principal (§16.9)
@@ -3603,12 +3645,25 @@ realm with `twoFactor.required`, where providers are refused); or a provisioning
 tool of your own writes them through the store
 (`internal/store/dynamodb`, the way `cmd/migrate` does) — enrolling their
 second factor there too when `twoFactor.required` is on and
-`twoFactor.enrolOnLogin` is off (§7.1). A deployment that has to create accounts
-over HTTP — an invitation service calling the auth API — leaves this switch off
-and closes the route **in front of** the function instead: an `AWS_IAM`-authorized
-route for `POST <prefix>/register` on the public API, which only an IAM principal
-granted `execute-api:Invoke` on it can call, plus a block at the edge. An
-invitation route in the admin API would close that gap upstream.
+`twoFactor.enrolOnLogin` is off (§7.1). **Creating accounts over HTTP is not
+supported yet:** an invitation service calling the auth API needs an invitation
+route in the core's admin API, which would close the gap upstream.
+
+An earlier revision of this section suggested the opposite shape for such a
+service — leave this switch off and put an `AWS_IAM`-authorized route for
+`POST <prefix>/register` on the public API in front of the function. **That
+advice is withdrawn.** The function serves percent-encoded spellings of the
+path: `POST /auth/%72egister` and `/auth/re%67ister` register an account exactly
+as `/auth/register` does, because the router decodes the path before matching
+it. The patch therefore holds only if API Gateway routes every such spelling to
+the IAM route too, and that has not been verified on a deployed stack; if it
+matches the encoded path, they fall to the unauthenticated `/{proxy+}` route and
+register anyone. It would also be the one IAM route on the public API, which
+§16.9 and the template otherwise keep free of them. A deployment that already
+runs the patch should verify on its own stack that each percent-encoded
+spelling of the register path is refused before the function — or block them at
+the edge on the URL-decoded path — and otherwise close the realm with this
+switch and provision through the store.
 
 **The OAuth callback is the other sign-up door.** It creates an account for any
 provider identity no account holds whenever `oauth.provisioning.autoCreate` is

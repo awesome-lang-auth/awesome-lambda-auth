@@ -275,8 +275,12 @@ Parameters:
       AWESOME_AUTH_MAILER_FROM — the address every auth mail is sent from. It
       MUST be a verified SES identity in this region, or an address under a
       verified domain, because SES rejects anything else. Empty (the default)
-      wires no mail transport at all. Placeholder is deliberately empty; never
-      commit a real domain.
+      wires no mail transport at all. Beside TwoFactorRequired "true" no magic
+      link is ever mailed — the emailed link would stand in for the TOTP code,
+      and the mailbox also receives the reset link — so the mailer carries the
+      reset, verification and email-change mails only, and the function warns
+      so at start. Placeholder is deliberately empty; never commit a real
+      domain.
 
   MailerFromName:
     Type: String
@@ -313,6 +317,9 @@ Parameters:
       Wires SMS one-time codes through SNS publish-to-phone-number. "false"
       leaves POST /sms/send answering 500 SMS_NOT_CONFIGURED, which is the
       reference's behaviour with no sms block, and grants no sns:Publish at all.
+      Beside TwoFactorRequired "true" it carries nothing: the texted code is
+      not a second factor there, POST /sms/send and /sms/verify answer 403
+      2FA_REQUIRED, and the function warns so at start.
       Turning it on has real prerequisites outside this stack: a new account is
       in the SMS sandbox and can only text numbers it has verified, spend limits
       are per-region, and several countries require a registered origination
@@ -346,7 +353,9 @@ Parameters:
       code) INSTEAD OF SES and SNS: with this set, all five credential seams go
       here and nothing is mailed or texted for them. Empty disables it. Set it
       only for a receiver you control: it is handed the credentials, and
-      EmailDeliveryWebhookSecretArn is required with it.
+      EmailDeliveryWebhookSecretArn is required with it. Beside
+      TwoFactorRequired "true" it is handed three seams, not five: no magic
+      link or SMS code is minted there.
 
   EmailDeliveryWebhookSecretArn:
     Type: String
@@ -386,11 +395,11 @@ Parameters:
       (it answers 404, the hosted UI hides its sign-up link and the OpenAPI
       document drops the path). No route then creates an account — the admin
       console has none — so accounts come from cmd/migrate, an OAuth callback
-      narrowed by a ConfigFile, or a tool of your own on the table; to create
-      them over HTTP, leave this "false" and close the route in front of the
-      function (config-reference.md §20). It does not close the OAuth
-      callback, which creates accounts for new identities by default: with an
-      OAuth client id set and no ConfigFile the Rule
+      narrowed by a ConfigFile, or a tool of your own on the table
+      (config-reference.md §20 says why an AWS_IAM route for the register path
+      in front of the function is no longer advised). It does not close the
+      OAuth callback, which creates accounts for new identities by default:
+      with an OAuth client id set and no ConfigFile the Rule
       ClosedRegistrationRefusesOAuthSignUp refuses the stack, and with a
       ConfigFile the function refuses to start (RS-19) unless
       oauth.provisioning.autoCreate is false, or allowedEmailDomains narrows it
@@ -402,18 +411,22 @@ Parameters:
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      AWESOME_AUTH_2FA_REQUIRED. "true" demands a second factor of every
-      session: a password login with a factor gets the challenge, one with
-      none answers 403 2FA_SETUP_REQUIRED and gets no session, and POST
-      /2fa/disable is refused. The magic-link and SMS logins answer 403
-      2FA_REQUIRED unless used as the second step (mode "2fa"), /link-verify
+      AWESOME_AUTH_2FA_REQUIRED. "true" demands a TOTP code of every session,
+      and TOTP is the only second factor: a password login with TOTP enrolled
+      gets the challenge, offering totp alone; one without answers 403
+      2FA_SETUP_REQUIRED and gets no session, whatever transports are wired;
+      POST /2fa/disable is refused. The emailed link and the texted code are
+      not factors: the magic-link and SMS routes answer 403 2FA_REQUIRED in
+      every mode, the second step (mode "2fa") included, and neither is
+      minted or sent, so a mailbox or a phone alone never opens a session.
+      The password reset still works and opens no session. /link-verify
       refuses loginAfterLinking, and POST /admin/login answers 404 — the
-      console admits a two-factor session from the auth login, and machine
-      access. An OAuth client id (Rule TwoFactorRequiredRefusesOAuthSignIn) or
-      AdminRootEmail (Rule TwoFactorRequiredRefusesTheRootUser) beside it is
-      refused, because neither sign-in can be made to ask for the factor
-      (RS-20). Not the same as runtimeSettings.require2fa, which only blocks
-      /2fa/disable.
+      console admits a session from the auth login and its TOTP code, and
+      machine access. An OAuth client id (Rule
+      TwoFactorRequiredRefusesOAuthSignIn) or AdminRootEmail (Rule
+      TwoFactorRequiredRefusesTheRootUser) beside it is refused, because
+      neither sign-in can be made to ask for the factor (RS-20). Not the same
+      as runtimeSettings.require2fa, which only blocks /2fa/disable.
 
   TwoFactorEnrolOnLogin:
     Type: String
@@ -421,11 +434,14 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       AWESOME_AUTH_2FA_ENROL_ON_LOGIN. "true" lets an account that must
-      present a second factor and has none enrol one at login, with the
+      present a second factor and has none enrol TOTP at login, with the
       tempToken of its 2FA_SETUP_REQUIRED answer, and opens its session when
       it does. TRUST ON FIRST USE: whoever holds the password binds the
-      factor. "false" — the default — means such accounts are enrolled out of
-      band before their first login.
+      factor — and with MailerFromAddress or EmailDeliveryWebhookUrl set, the
+      password reset puts the password in the hands of whoever reads the
+      mailbox, so the mailbox alone can claim an account that has not
+      enrolled yet. "false" — the default — means such accounts are enrolled
+      out of band before their first login.
 
   # -----------------------------------------------------------------------
   # Second factor and token claims (config-schema.md §1.1, §1.8). The TOTP

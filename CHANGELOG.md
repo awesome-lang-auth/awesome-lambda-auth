@@ -23,33 +23,47 @@ under [Unreleased].
   `ClosedRegistrationRefusesOAuthSignUp` refuses the same at changeset time when no
   `ConfigFile` is supplied. No route creates an account on a closed realm — the
   admin console has none — so accounts come from `cmd/migrate`, a domain-narrowed
-  OAuth callback or a tool on the store; a deployment that invites over HTTP
-  closes the route in front of the function instead (`docs/config-reference.md` §20).
-- **A second factor required of every session** (`twoFactor.required`, off by
-  default; `AWESOME_AUTH_2FA_REQUIRED`; SAM `TwoFactorRequired`). A password login
-  opens no session without a second factor: the challenge for an account with
-  one, `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`
-  for an account with none; `POST <prefix>/2fa/disable` is refused. Every other
-  door is held to it: the login mode of `/magic-link/{send,verify}` and
-  `/sms/{send,verify}` and `/link-verify` with `loginAfterLinking` answer
-  `403 2FA_REQUIRED` (their step-up mode and linking alone work as before), and
-  `POST <admin>/login` answers `404` — the console admits a two-factor session
-  from `POST <prefix>/login`, and machine access (product deviation
+  OAuth callback or a tool on the store. The earlier advice to keep registration
+  open and put an `AWS_IAM` route for `POST <prefix>/register` in front of the
+  function is withdrawn: the function serves percent-encoded spellings of that
+  path (`/auth/%72egister`), and whether API Gateway routes them to the IAM route
+  is unverified (`docs/config-reference.md` §20).
+- **A TOTP code required of every session** (`twoFactor.required`, off by
+  default; `AWESOME_AUTH_2FA_REQUIRED`; SAM `TwoFactorRequired`). TOTP is the only
+  second factor under the policy. A password login opens no session: an account
+  with TOTP gets the challenge, which offers `totp` alone; an account without it
+  gets `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`,
+  whatever transports are wired; `POST <prefix>/2fa/disable` is refused. The
+  emailed link and the texted code are not second factors: the magic-link and
+  SMS-code senders are not handed to the core (`GET <prefix>/ui/config` reports
+  both off), and `/magic-link/{send,verify}` and `/sms/{send,verify}` answer
+  `403 2FA_REQUIRED` in every mode, the step-up (`mode: "2fa"`) included — so a
+  mailbox, which also receives the reset link, or a phone number never opens a
+  session on its own. The password reset still works and opens no session; the
+  next login is the TOTP challenge. `/link-verify` with `loginAfterLinking`
+  answers the same `403` (linking alone works as before), and `POST <admin>/login`
+  answers `404` — the console admits a session from `POST <prefix>/login` and its
+  TOTP code, and machine access (product deviation
   `two-factor-required-refuses-one-factor-sign-ins`). New refuse-to-start rule
   **RS-20**: the policy beside `oauth.providers` (the callback opens a session with
-  no second-factor step), or beside `admin.rootUser` or `admin.bootstrapSecret` on
-  a mounted console; SAM Rules `TwoFactorRequiredRefusesOAuthSignIn` and
-  `TwoFactorRequiredRefusesTheRootUser`. The identity provider's `/authorize`
-  refuses every account under the policy, and the loader warns. Not retroactive:
-  sessions opened before it is switched on keep refreshing, so rotate the refresh
-  secret in the same deploy. Distinct from `runtimeSettings.require2fa`, which
-  reaches `/2fa/disable` alone (`docs/config-reference.md` §7.1,
+  no second-factor step), or, on a mounted console, beside `admin.rootUser`,
+  `admin.bootstrapSecret` or `admin.accessPolicy: open`; SAM Rules
+  `TwoFactorRequiredRefusesOAuthSignIn` and `TwoFactorRequiredRefusesTheRootUser`
+  (the template offers no open console). The loader warns when the policy meets a
+  mailer, the delivery webhook or an SMS transport, saying what is refused and
+  what the transport still carries, and when it meets the identity provider,
+  whose `/authorize` then refuses every account. Not retroactive: sessions opened
+  before it is switched on keep refreshing, so rotate the refresh secret in the
+  same deploy. Distinct from `runtimeSettings.require2fa`, which reaches
+  `/2fa/disable` alone (`docs/config-reference.md` §7.1,
   `docs/spec/decisions.md` D-27).
 - **Forced enrolment at login** (`twoFactor.enrolOnLogin`, off by default;
   `AWESOME_AUTH_2FA_ENROL_ON_LOGIN`; SAM `TwoFactorEnrolOnLogin`). The
-  `2FA_SETUP_REQUIRED` token enrols through `/2fa/setup` and `/2fa/verify-setup`,
-  which opens the session. Trust on first use: the loader warns whenever it is on
-  (`docs/config-reference.md` §7.2).
+  `2FA_SETUP_REQUIRED` token enrols TOTP through `/2fa/setup` and
+  `/2fa/verify-setup`, which opens the session. Trust on first use: the loader
+  warns whenever it is on, and, with the reset mail wired, that the mailbox alone
+  can set the password of an account that has not enrolled yet and then bind the
+  factor (`docs/config-reference.md` §7.2).
 - **Machine access to the admin API** (`admin.machineAccess.iam.principals`;
   `AWESOME_AUTH_ADMIN_MACHINE_ACCESS_IAM_PRINCIPALS`; SAM
   `AdminMachinePrincipalArns`, empty by default). IAM roles and users admitted to

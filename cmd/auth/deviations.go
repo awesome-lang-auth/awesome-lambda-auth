@@ -789,28 +789,38 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID: "two-factor-required-refuses-one-factor-sign-ins",
-			Surface: "under twoFactor.required: POST <prefix>/magic-link/send, /magic-link/verify, /sms/send and /sms/verify in login mode; " +
+			Surface: "under twoFactor.required: POST <prefix>/magic-link/send, /magic-link/verify, /sms/send and /sms/verify in every mode; " +
+				"the login challenge's available2faMethods and GET <prefix>/ui/config's features.magicLink and features.sms; " +
 				"POST <prefix>/link-verify with loginAfterLinking; POST <admin>/login",
 			Behaviour: "The four passwordless routes answer 403 {\"error\":\"Two-factor authentication required\",\"code\":\"2FA_REQUIRED\"} " +
-				"unless the body's mode is exactly \"2fa\" -- the step-up, carrying the password login's tempToken, which passes. " +
-				"POST <prefix>/link-verify answers the same 403 when loginAfterLinking is set, before the link token is read, and " +
-				"links without it as before. POST <admin>/login answers the router's bare 404, the core's answer wherever the " +
-				"route is not mounted; the console still admits the access token of a session that came through POST <prefix>/login, " +
-				"and admin.machineAccess. Without twoFactor.required nothing changes.",
+				"in every mode -- the login mode and the step-up (mode \"2fa\", with the password login's tempToken) alike -- " +
+				"before anything is minted, sent or consumed, and the magic-link and SMS-code senders are not handed to the core: " +
+				"the challenge lists totp alone, an account with no TOTP is answered 403 2FA_SETUP_REQUIRED whatever transports " +
+				"are wired, and ui/config reports magicLink and sms false. The reset, verification and email-change mails go out " +
+				"as before. POST <prefix>/link-verify answers the same 403 when loginAfterLinking is set, before the link token is " +
+				"read, and links without it as before. POST <admin>/login answers the router's bare 404, the core's answer wherever " +
+				"the route is not mounted; the console still admits the access token of a session that came through POST <prefix>/login " +
+				"and its TOTP code, and admin.machineAccess. Without twoFactor.required nothing changes.",
 			Reference: "There is no deployment-wide second-factor policy (the core's config-require2fa-is-a-system-policy-term): " +
 				"magic-link and SMS verify in login mode open a session on the delivered credential alone (the magic link's two " +
-				"branches at awesome-node-auth v1.10.8 auth.router.ts:1747-1767), /link-verify with loginAfterLinking opens one on " +
-				"the link token, and the console's login mints its token on a password (src/router/admin.router.ts:543-616).",
-			Why: "twoFactor.required promises that no session opens on one factor, and the core keeps that promise at POST " +
-				"<prefix>/login alone. Each of these routes opens one on a single factor -- the emailed link, the texted code, the " +
-				"link token, the password -- and each is one request the product can recognise and refuse before the core acts, " +
-				"without forking it and without taking anything else away: the step-up mode of the same routes is the factor itself, " +
-				"linking does not need a session, and the console has a door that asks for the factor. Refusing the transports at " +
-				"start instead would have taken the password reset mail and the emailed and texted factors with them, and refusing " +
-				"the console would have taken machine access. The gate classifies a request by asking the router which pattern " +
-				"serves it and reads the body with the core's own decoding, so a spelling or a body the core accepts cannot walk " +
-				"around it. cmd/auth/secondfactor_test.go pins each door against a credential that opened a session before the gate, " +
-				"with the factor's own door as the control.",
+				"branches at awesome-node-auth v1.10.8 auth.router.ts:1747-1767), the challenge offers magic-link wherever mail is " +
+				"configured and sms to an account with a number (:556-559), and either completes it; /link-verify with " +
+				"loginAfterLinking opens a session on the link token, and the console's login mints its token on a password " +
+				"(src/router/admin.router.ts:543-616).",
+			Why: "twoFactor.required promises that every session proved a TOTP code, and the core keeps a narrower promise at POST " +
+				"<prefix>/login alone: a second step of any kind, the emailed link and the texted code included. The mailbox that " +
+				"receives the link also receives the password-reset link, so with the link a second step the mailbox alone answered " +
+				"both (review of 872008e: forgot-password, reset-password, login, then the step-up link, and a session with TOTP " +
+				"never presented), and a phone number answered the second. So neither is a factor under the policy: the senders are " +
+				"withheld, which is the core's own switch for what the challenge offers, and the routes refused in every mode, which " +
+				"also covers a link or a code minted before the policy was switched on. The other doors open a session on a single " +
+				"factor -- the link token, the password -- and each is one request the product can recognise and refuse before the " +
+				"core acts, without forking it: linking does not need a session, and the console has a door that asks for the " +
+				"factor. Refusing the transports at start instead would have taken the password reset with them, and refusing the " +
+				"console would have taken machine access. The gate classifies a request by asking the router which pattern serves " +
+				"it, and reads /link-verify's body with the core's own decoding, so a spelling or a body the core accepts cannot walk " +
+				"around it. cmd/auth/secondfactor_test.go pins each door against a credential that opened a session before, with the " +
+				"TOTP code as the control.",
 			Spec: "docs/config-reference.md §7.1; docs/spec/decisions.md D-27; internal/config RS-20",
 		},
 	}
