@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -244,5 +245,39 @@ func TestInvitationOptionsRefuseADriverWithoutTheStore(t *testing.T) {
 	opts, err := invitationOptions(cfg, newMemoryStoreBundle(), discardLogger())
 	if err != nil || len(opts) != 3 {
 		t.Fatalf("memory bundle: %d options, %v", len(opts), err)
+	}
+}
+
+// The sender path: with a mailer and no reveal, the invite answer carries no
+// token, exactly one mail does, and that token is the one the accept route
+// honours. The link is built on the mailer's base (the hosted UI's path when
+// ui.enabled, the site URL otherwise); no page ships for it.
+func TestInvitationTravelsByTheMailer(t *testing.T) {
+	t.Parallel()
+	d := newDeliveryApp(t, mailerEnv(staffRealmEnv("AWESOME_AUTH_ADMIN_REVEAL_INVITATION_TOKEN", "false")))
+	t.Cleanup(d.app.Close)
+
+	invite := invokeIAM(t, d.app, http.MethodPost, "/admin/api/users/invitations", jsonHeaders(), testMachineCaller, `{"email":"mailed@example.test"}`)
+	if invite.StatusCode != http.StatusCreated {
+		t.Fatalf("invite answered %d %s, want 201", invite.StatusCode, invite.Body)
+	}
+	if strings.Contains(invite.Body, `"token"`) || strings.Contains(invite.Body, "acceptUrl") {
+		t.Fatalf("a deployment with a mailer handed the token to the admin caller: %s", invite.Body)
+	}
+	msg := d.mail.only(t)
+	if msg.To != "mailed@example.test" {
+		t.Fatalf("the invitation went to %q", msg.To)
+	}
+	match := regexp.MustCompile(`/invitations/accept\?token=([A-Za-z0-9_\-]+)`).FindStringSubmatch(msg.Body + msg.Text)
+	if match == nil {
+		t.Fatalf("the invitation mail carries no accept link: %s", msg.Body)
+	}
+	accept := invoke(t, d.app, http.MethodPost, "/auth/invitations/accept", jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil,
+		fmt.Sprintf(`{"token":%q,"password":%q}`, match[1], testPassword))
+	if accept.StatusCode != http.StatusForbidden || decodeBody(t, accept)["code"] != "2FA_SETUP_REQUIRED" {
+		t.Fatalf("the mailed token answered %d %s, want 403 2FA_SETUP_REQUIRED", accept.StatusCode, accept.Body)
+	}
+	if strings.Contains(d.log.String(), match[1]) {
+		t.Fatal("the invitation token reached the log")
 	}
 }
