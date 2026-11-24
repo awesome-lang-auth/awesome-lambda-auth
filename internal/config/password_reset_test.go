@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -154,7 +155,10 @@ func TestForgotPasswordFloorIsBounded(t *testing.T) {
 			}
 			continue
 		}
-		requireRule(t, err, "", "security.forgotPassword.minResponseMs")
+		d := requireRule(t, err, "", "security.forgotPassword.minResponseMs")
+		if !strings.Contains(d.Problem, fmt.Sprint(tc.floor)) {
+			t.Errorf("minResponseMs %d: the problem does not name the value: %s", tc.floor, d.Problem)
+		}
 	}
 }
 
