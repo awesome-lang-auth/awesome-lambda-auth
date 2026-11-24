@@ -195,6 +195,30 @@ under [Unreleased].
   resource server is not affected: it verifies no refresh token, so its refresh
   secret is neither checked nor wired, and one shorter than 32 characters still
   starts (the cold start reports it as unwired).
+- **Pinned to `awesome-go-auth` `v0.16.0`** (password reset and login
+  hardening). Four changes act on upgrade, with no configuration change:
+  `POST <prefix>/forgot-password` sends before it stores, so a refused or failed
+  delivery no longer kills the link mailed before it (a sender that spends the
+  token from inside the call now gets `ErrInvalidToken`); the ten public
+  credential routes (`/forgot-password`, `/reset-password`, `/magic-link/send`,
+  `/magic-link/verify`, `/sms/send`, `/sms/verify`, `/change-email/confirm`,
+  `/invitations/accept`, `/link-request`, `/link-verify`) answer a body over
+  16 KiB with `413 BODY_TOO_LARGE` before anything reads it, the rate limiter
+  included; `POST <prefix>/change-password` ends an outstanding reset link; and
+  every refused password login — an unknown address's included — runs one
+  bcrypt comparison at `security.password.bcryptSaltRounds`, on
+  `POST <prefix>/login`, the identity provider's login form and
+  `POST <admin>/login` alike, so the answer's time no longer tells which
+  addresses have accounts. **That last one costs CPU per refused login, and the
+  default `rateLimit` (`keyBy: email`) does not bound it: every new address is
+  a budget of its own. Put a per-client limit in front of the login routes — a
+  WAF rate rule — or a ceiling on the function (`ReservedConcurrentExecutions`)
+  before taking this release to a deployment that is reachable from the
+  internet.** Three core deviations are
+  indexed: `change-password-ends-the-reset-link`,
+  `credential-route-bodies-are-bounded` and `reset-password-can-revoke-sessions`
+  (opt-in, not set by this commit), and `forgot-password-succeeds-on-delivery-failure`
+  says what a failed send now leaves behind.
 - **Pinned to `awesome-go-auth` `v0.14.0`** (closed registration, enforced second
   factor with opt-in forced enrolment, admin machine access). Two core deviations
   are indexed, `forced-enrolment-opens-a-session` and
