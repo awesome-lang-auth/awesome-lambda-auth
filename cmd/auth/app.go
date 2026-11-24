@@ -146,6 +146,20 @@ type Options struct {
 	// is a function of awsintegration.SecretStages, a plain struct, and not a
 	// SecretsManagerAPI, for the reason IDPKeySource is not KMSAPI.
 	OriginSecret OriginSecretReader
+
+	// RateLimitClock is the wall clock the rate limiters' in-process tier
+	// counts its fixed, epoch-aligned windows on, and a local refusal's
+	// Retry-After is read from: the auth router's limiter, the console's two
+	// and the inbound-webhook one (ratelimit.go, scriptrunner.go). Nil, the
+	// zero value, is time.Now. Injected so that a test which spends a budget is
+	// not cut in two by a window boundary: since a refused password login
+	// costs a bcrypt comparison (awesome-go-auth v0.16.0), spending the default
+	// budget of ten takes seconds under -race, and a run that crossed a minute
+	// started a fresh window halfway. It does not reach the shared counter,
+	// whose window the store computes on its own clock
+	// (internal/store/dynamodb rate_limit.go), nor twoFactor.lockout's
+	// counter (secondfactor_cap.go).
+	RateLimitClock func() time.Time
 }
 
 // App is one cold start's worth of state.
@@ -444,8 +458,8 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// the cap counts what the limiter let through, and it is filled even when
 	// the limiter is off, because twoFactor.lockout is its own switch.
 	logSecondFactorCapSurface(cfg, users, log)
-	authRL := chainLimiters(newRateLimiter(cfg, counter, log), newSecondFactorCap(cfg, users, core, log))
-	if err := mountAuthSurface(mux, core, cfg, authRL, newAdminPromoteLimiter(cfg, counter, log), toolsOpts); err != nil {
+	authRL := chainLimiters(newRateLimiter(cfg, counter, opts.RateLimitClock, log), newSecondFactorCap(cfg, users, core, log))
+	if err := mountAuthSurface(mux, core, cfg, authRL, newAdminPromoteLimiter(cfg, counter, opts.RateLimitClock, log), toolsOpts); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
@@ -464,7 +478,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// D9d: the inbound-webhook limiter rides in the same slot, inside the
 	// login's; each matches its own route and passes everything else through
 	// (scriptrunner.go, newInboundWebhookLimiter).
-	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, log), newInboundWebhookLimiter(cfg, counter, log)
+	loginRL, inboundRL := newAdminLoginLimiter(cfg, counter, opts.RateLimitClock, log), newInboundWebhookLimiter(cfg, counter, opts.RateLimitClock, log)
 	handler := assembleHandler(cfg, log, mux, func(next http.Handler) http.Handler { return loginRL(inboundRL(next)) })
 
 	// D9c: the SSE function's Function URL answers GET <tools>/stream and

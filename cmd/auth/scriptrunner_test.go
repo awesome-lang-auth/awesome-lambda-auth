@@ -75,10 +75,11 @@ func newInboundAppWith(t *testing.T, env map[string]string, runner auth.InboundS
 		t.Fatalf("add webhook: %v", err)
 	}
 	app, err := New(context.Background(), Options{
-		Getenv:       envFunc(env),
-		Logger:       discardLogger(),
-		Stores:       bundle.factory,
-		ScriptRunner: runner,
+		Getenv:         envFunc(env),
+		Logger:         discardLogger(),
+		Stores:         bundle.factory,
+		ScriptRunner:   runner,
+		RateLimitClock: frozenRateLimitClock,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
