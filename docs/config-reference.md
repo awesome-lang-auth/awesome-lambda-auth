@@ -4130,7 +4130,9 @@ that already took longer is not held further, so the floor has to exceed the
 account lookup, the delivery and the token write. With `email.deliveryWebhook`
 the delivery is bounded by its `timeoutMs` (§5.4), and the loader warns when the
 floor is below that timeout plus 250 ms, its estimate of the lookup and the
-write, and names the floor that would cover it (or the lower timeout). Behind
+write, and names the lower timeout the floor would cover, and the floor that
+would cover the timeout when the 5000 ms ceiling allows one (at the webhook's
+default `timeoutMs`, 5000, it does not: lower the timeout). Behind
 `email.mailer` (SES) the send has no deadline of its own here, only the
 invocation's, and the loader says so whenever the floor is on: size it
 comfortably above the SES latency you see, or deliver through the webhook,

@@ -628,9 +628,21 @@ func collectForgotPasswordWarnings(cfg *Config) {
 		if floor >= timeout+forgotPasswordFloorAllowanceMs {
 			return
 		}
-		remedy := fmt.Sprintf("raise the floor to at least %d ms", timeout+forgotPasswordFloorAllowanceMs)
+		// Raising the floor is offered only where the ceiling allows it: at the
+		// webhook's default timeout (5000 ms) the floor it would need is above
+		// MaxForgotPasswordMinResponseMs, and the one remedy left is the
+		// timeout.
+		var remedies []string
+		if need := timeout + forgotPasswordFloorAllowanceMs; need <= MaxForgotPasswordMinResponseMs {
+			remedies = append(remedies, fmt.Sprintf("raise the floor to at least %d ms", need))
+		}
 		if lower := floor - forgotPasswordFloorAllowanceMs; lower > 0 {
-			remedy += fmt.Sprintf(", or lower email.deliveryWebhook.timeoutMs to at most %d ms", lower)
+			remedies = append(remedies, fmt.Sprintf("lower email.deliveryWebhook.timeoutMs to at most %d ms", lower))
+		}
+		remedy := strings.Join(remedies, ", or ")
+		if remedy == "" {
+			remedy = fmt.Sprintf("lower email.deliveryWebhook.timeoutMs and raise the floor until the floor exceeds the timeout by about %d ms, within the ceiling of %d ms",
+				forgotPasswordFloorAllowanceMs, MaxForgotPasswordMinResponseMs)
 		}
 		cfg.warn(path,
 			fmt.Sprintf("the floor of %d ms is below email.deliveryWebhook.timeoutMs (%d ms) plus about %d ms for the account lookup and the token write, "+

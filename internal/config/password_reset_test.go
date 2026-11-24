@@ -210,10 +210,43 @@ func TestForgotPasswordFloorWarns(t *testing.T) {
 		if !covering(ws, "below email.deliveryWebhook.timeoutMs (5000 ms)") {
 			t.Fatalf("no coverage warning for a floor under the webhook timeout: %v", ws)
 		}
+		// The floor that would cover the default timeout, 5250 ms, is above
+		// the 5000 ms ceiling, so the remedy names only the lower timeout: a
+		// remedy the loader would then refuse is no remedy.
 		for _, w := range ws {
 			if strings.Contains(w.Problem, "below email.deliveryWebhook.timeoutMs") &&
-				(!strings.Contains(w.Remedy, "at least 5250 ms") || !strings.Contains(w.Remedy, "at most 2750 ms")) {
-				t.Errorf("the remedy does not size the fix: %s", w.Remedy)
+				(strings.Contains(w.Remedy, "raise the floor") || !strings.Contains(w.Remedy, "at most 2750 ms")) {
+				t.Errorf("the remedy does not size a fix the loader accepts: %s", w.Remedy)
+			}
+		}
+	})
+	t.Run("a webhook slower than the floor, within the ceiling", func(t *testing.T) {
+		ws := load(t, 1000, func(doc Document, env map[string]string) {
+			withWebhook(doc, env)
+			set(doc, "email.deliveryWebhook.timeoutMs", 3000)
+		})
+		var found bool
+		for _, w := range ws {
+			if !strings.Contains(w.Problem, "below email.deliveryWebhook.timeoutMs (3000 ms)") {
+				continue
+			}
+			found = true
+			if !strings.Contains(w.Remedy, "at least 3250 ms") || !strings.Contains(w.Remedy, "at most 750 ms") {
+				t.Errorf("the remedy does not size both fixes: %s", w.Remedy)
+			}
+		}
+		if !found {
+			t.Fatalf("no coverage warning for a floor under the webhook timeout: %v", ws)
+		}
+	})
+	t.Run("a floor too short for either fix alone", func(t *testing.T) {
+		ws := load(t, 200, func(doc Document, env map[string]string) {
+			withWebhook(doc, env) // 5000 ms: no floor within the ceiling covers it
+		})
+		for _, w := range ws {
+			if strings.Contains(w.Problem, "below email.deliveryWebhook.timeoutMs") &&
+				(w.Remedy == "" || strings.HasPrefix(w.Remedy, ";") || !strings.Contains(w.Remedy, "within the ceiling of 5000 ms")) {
+				t.Errorf("the remedy is empty or unsized: %q", w.Remedy)
 			}
 		}
 	})
