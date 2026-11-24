@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	auth "github.com/nik2208/awesome-go-auth"
@@ -86,12 +87,28 @@ func memoryStores(_ context.Context, _ *config.Config, _ *slog.Logger) (auth.Use
 	return newMemoryStoreBundle(), auth.NewMemorySessionStore(), nil
 }
 
+// testRateLimitInstant is what every test app's rate limiters read as the time
+// (Options.RateLimitClock, frozenRateLimitClock). Midnight UTC, so it is the
+// first second of every window a test configures — 60 s, 86 400 s, every
+// divisor of a day — and a budget a test spends lands in one window however
+// long its requests take. Since awesome-go-auth v0.16.0 a refused password
+// login costs a bcrypt comparison, so spending the default budget of ten takes
+// seconds under -race; on the wall clock a run that crossed a minute boundary
+// started a fresh window halfway and its next request was not refused. The
+// clock does not move: no test waits a window out through an app, and one that
+// had to would bring a clock of its own (TestRateLimitTiersCountOnTheInjectedClock).
+var testRateLimitInstant = time.Date(2030, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+// frozenRateLimitClock is the Options.RateLimitClock of the test apps.
+func frozenRateLimitClock() time.Time { return testRateLimitInstant }
+
 func newTestApp(t *testing.T, env map[string]string) *App {
 	t.Helper()
 	app, err := New(context.Background(), Options{
-		Getenv: envFunc(env),
-		Logger: discardLogger(),
-		Stores: memoryStores,
+		Getenv:         envFunc(env),
+		Logger:         discardLogger(),
+		Stores:         memoryStores,
+		RateLimitClock: frozenRateLimitClock,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -3,7 +3,9 @@ package dynamodb
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +31,9 @@ func sampleAuthCode(codeHash string) auth.AuthCode {
 		CodeChallengeMethod: "S256",
 		Scope:               "openid email profile",
 		ExpiresAt:           time.Now().UTC().Add(5 * time.Minute).Truncate(time.Millisecond),
+		// What /authorize sets under sessions.revokeOnPasswordReset: the
+		// password fingerprint /token compares (core v0.16.0).
+		Credential: "cred-" + randomHex(16),
 	}
 }
 
@@ -62,6 +67,7 @@ func TestAuthCodeRoundTrip(t *testing.T) {
 		{"CodeChallenge", got.CodeChallenge, want.CodeChallenge},
 		{"CodeChallengeMethod", got.CodeChallengeMethod, want.CodeChallengeMethod},
 		{"Scope", got.Scope, want.Scope},
+		{"Credential", got.Credential, want.Credential},
 	} {
 		if f.got != f.want {
 			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
@@ -97,6 +103,9 @@ func TestAuthCodeItemShape(t *testing.T) {
 	// key is the hash and no attribute repeats it.
 	if got := getS(m, attrClientID); got != code.ClientID {
 		t.Errorf("clientId = %q, want %q", got, code.ClientID)
+	}
+	if got := getS(m, attrCredential); got != code.Credential {
+		t.Errorf("credential = %q, want %q", got, code.Credential)
 	}
 	if got := getS(m, attrExpiresAt); got != formatTime(code.ExpiresAt) {
 		t.Errorf("expiresAt = %q, want the fixed-width %q; the consume condition compares it lexicographically", got, formatTime(code.ExpiresAt))
@@ -243,5 +252,84 @@ func TestAuthCodeRefusesAnEmptyHash(t *testing.T) {
 	code := sampleAuthCode("")
 	if err := store.SaveCode(ctx, code); !errors.Is(err, ErrInvalidIdentifier) {
 		t.Errorf("SaveCode with an empty hash = %v, want %v", err, ErrInvalidIdentifier)
+	}
+}
+
+// TestAuthCodeWithoutACredential is the code the core mints with
+// sessions.revokeOnPasswordReset off: Credential is empty, the item carries no
+// such attribute — the omission rule, so that attribute_not_exists keeps its
+// meaning — and the record reads back with it empty, which is what the core
+// reads nothing of in that mode.
+func TestAuthCodeWithoutACredential(t *testing.T) {
+	t.Parallel()
+	store, client := newStore(t)
+	ctx := context.Background()
+
+	code := sampleAuthCode(hashOf("code-" + randomHex(8)))
+	code.Credential = ""
+	if err := store.SaveCode(ctx, code); err != nil {
+		t.Fatalf("SaveCode: %v", err)
+	}
+	m := rawItem(t, client, store.table, "OIDC#"+code.CodeHash, "CODE")
+	if _, ok := m[attrCredential]; ok {
+		t.Errorf("the item carries %q with no credential to keep: %v", attrCredential, m[attrCredential])
+	}
+	got, err := store.ConsumeCode(ctx, code.CodeHash)
+	if err != nil {
+		t.Fatalf("ConsumeCode: %v", err)
+	}
+	if got.Credential != "" {
+		t.Errorf("Credential = %q, want empty", got.Credential)
+	}
+}
+
+// TestAuthCodeKeepsEveryField fills every field of auth.AuthCode by reflection
+// and asks for each one back. The round trip above lists the fields this store
+// knew when it was written; this one fails on the first pin whose AuthCode
+// grows a field the store does not map — which is how AuthCode.Credential
+// (core v0.16.0) would have been dropped in silence, and with it every code
+// redeemed under sessions.revokeOnPasswordReset.
+func TestAuthCodeKeepsEveryField(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	var want auth.AuthCode
+	rv := reflect.ValueOf(&want).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		f, name := rv.Field(i), rv.Type().Field(i).Name
+		switch {
+		case name == "CodeHash":
+			f.SetString(hashOf("code-" + randomHex(8)))
+		case name == "TenantID":
+			f.SetString("acme") // the store validates the tenant's shape
+		case f.Kind() == reflect.String:
+			f.SetString(strings.ToLower(name) + "-" + randomHex(4))
+		case f.Type() == reflect.TypeOf(time.Time{}):
+			f.Set(reflect.ValueOf(time.Now().UTC().Add(5 * time.Minute).Truncate(time.Millisecond)))
+		default:
+			t.Fatalf("auth.AuthCode.%s is a %s, which this test does not know how to fill; teach it, and map the field in SaveCode and authCodeFromItem", name, f.Type())
+		}
+	}
+	if err := store.SaveCode(ctx, want); err != nil {
+		t.Fatalf("SaveCode: %v", err)
+	}
+	got, err := store.ConsumeCode(ctx, want.CodeHash)
+	if err != nil {
+		t.Fatalf("ConsumeCode: %v", err)
+	}
+	gv := reflect.ValueOf(got)
+	for i := 0; i < rv.NumField(); i++ {
+		name := rv.Type().Field(i).Name
+		w, g := rv.Field(i).Interface(), gv.Field(i).Interface()
+		if wt, ok := w.(time.Time); ok {
+			if !wt.Equal(g.(time.Time)) {
+				t.Errorf("AuthCode.%s = %v, want %v", name, g, w)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(w, g) {
+			t.Errorf("AuthCode.%s = %#v, want %#v: SaveCode or authCodeFromItem does not map it", name, g, w)
+		}
 	}
 }

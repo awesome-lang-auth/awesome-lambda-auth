@@ -16,6 +16,7 @@ import (
 func validate(c *Config, d *diagnostics) {
 	validateDeployment(c, d)
 	validateJWT(c, d)
+	validateForgotPassword(c, d)
 	validateTokens(c, d)
 	validateCookies(c, d)
 	validateSessions(c, d)
@@ -125,6 +126,16 @@ func validateEmail(c *Config, d *diagnostics) {
 
 	for i, u := range c.Email.SiteURLs {
 		absoluteURL(d, fmt.Sprintf("email.siteUrls[%d]", i), u, false)
+	}
+	// The core refuses to start on an entry that is not a language tag
+	// (auth.Config.validate), with a message that names neither the key nor
+	// the index; refusing here first does both.
+	for i, lang := range c.Email.Languages {
+		if !isLanguageTag(lang) {
+			d.errf("", fmt.Sprintf("email.languages[%d]", i),
+				fmt.Sprintf("%q is not a language tag: one or more subtags of letters and digits separated by - or _, the first of 2 to 8 letters and each at most 8 characters, %d characters in all at most", lang, maxLanguageTagLen),
+				`list the languages your senders render, such as ["it", "en"]`)
+		}
 	}
 
 	mailerConfigured := c.Email.Mailer.Endpoint != "" || c.Email.Mailer.From != "" || c.Email.Mailer.APIKey.configured()
@@ -325,6 +336,114 @@ func validateTwoFactor(c *Config, d *diagnostics) {
 	if c.TwoFactor.Lockout.MaxFailures > 0 {
 		windowSeconds(d, "twoFactor.lockout.windowSeconds", c.TwoFactor.Lockout.WindowSeconds)
 	}
+
+	// The enrolment window: 0 keeps the core's TempTokenTTL, anything else is
+	// the core's own range, which it would refuse at New with no key named.
+	// And only beside enrolOnLogin, the one mode that mints an enrolment
+	// token: without it a 2FA_SETUP_REQUIRED tempToken is the step-up token,
+	// which keeps TempTokenTTL, so the knob would validate and bound nothing.
+	switch ttl := c.TwoFactor.EnrolmentTokenTTLMinutes; {
+	case ttl == 0:
+	case ttl < MinEnrolmentTokenTTLMinutes || ttl > MaxEnrolmentTokenTTLMinutes:
+		d.errf("", "twoFactor.enrolmentTokenTtlMinutes",
+			fmt.Sprintf("%d minutes is outside the %d-%d the core accepts for the enrolment token", ttl, MinEnrolmentTokenTTLMinutes, MaxEnrolmentTokenTTLMinutes),
+			fmt.Sprintf("set a value between %d and %d, or 0 to keep the default of %d minutes", MinEnrolmentTokenTTLMinutes, MaxEnrolmentTokenTTLMinutes, DefaultEnrolmentTokenTTLMinutes))
+	case !c.TwoFactor.EnrolOnLogin:
+		d.errf("", "twoFactor.enrolmentTokenTtlMinutes",
+			"is set while twoFactor.enrolOnLogin is off: no enrolment token is minted, so the window bounds nothing -- the 2FA_SETUP_REQUIRED tempToken is then the step-up token, which keeps its own five minutes",
+			"set twoFactor.enrolOnLogin: true, or remove this key")
+	}
+}
+
+// MinEnrolmentTokenTTLMinutes and MaxEnrolmentTokenTTLMinutes bound
+// twoFactor.enrolmentTokenTtlMinutes. They are the core's own
+// auth.MinEnrolmentTokenTTL and auth.MaxEnrolmentTokenTTL in minutes, written
+// out because this package does not import the core; cmd/auth
+// TestTheLoaderAcceptsOnlyWhatTheCoreAccepts holds the two to each other.
+// DefaultEnrolmentTokenTTLMinutes is what 0 keeps: the core's default
+// TempTokenTTL, which this product does not configure.
+const (
+	MinEnrolmentTokenTTLMinutes     = 1
+	MaxEnrolmentTokenTTLMinutes     = 30
+	DefaultEnrolmentTokenTTLMinutes = 5
+)
+
+// MaxForgotPasswordMinResponseMs is the ceiling on
+// security.forgotPassword.minResponseMs.
+//
+// A floor holds every POST <prefix>/forgot-password inside a Lambda invocation
+// that bills the time and keeps an execution environment for it, so the ceiling
+// is set by the function it runs in rather than by the threat: half the SAM
+// template's default Timeout (10 s), and well under its DurationAlarmThresholdMs
+// (8000), which a floor near it would trip on ordinary traffic. A floor has to
+// exceed the slow branch — the lookup, the delivery and the token write — and
+// what bounds the delivery is email.deliveryWebhook.timeoutMs, so a deployment
+// that wants a longer floor than this lowers that timeout instead: the floor
+// then needs no more. The core ends the hold 100 ms before the invocation's
+// deadline whatever the value.
+const MaxForgotPasswordMinResponseMs = 5000
+
+// forgotPasswordFloorAllowanceMs is what the slow branch of
+// POST <prefix>/forgot-password adds to its delivery, for the warning that
+// compares the floor with the delivery webhook's timeout: the account lookup —
+// the email pointer, then the profile — the invitation check when invitations
+// are on, and the token write, a handful of DynamoDB requests at a few
+// milliseconds each, with room for a retry. It is an estimate the warning
+// states, not a bound anything enforces.
+const forgotPasswordFloorAllowanceMs = 250
+
+// validateForgotPassword checks security.forgotPassword.minResponseMs: 0 is
+// off and the one way to say it, a negative floor is refused by the core at
+// New with no key named, and the ceiling is MaxForgotPasswordMinResponseMs.
+func validateForgotPassword(c *Config, d *diagnostics) {
+	const path = "security.forgotPassword.minResponseMs"
+	switch floor := c.Security.ForgotPassword.MinResponseMs; {
+	case floor < 0:
+		d.errf("", path,
+			fmt.Sprintf("%d is negative, and the core refuses a negative floor", floor),
+			"set 0 to leave the floor off, or a positive number of milliseconds")
+	case floor > MaxForgotPasswordMinResponseMs:
+		d.errf("", path,
+			fmt.Sprintf("%d ms is above the ceiling of %d ms: every request would be held at least that long inside an invocation that bills it, and a floor only has to exceed the delivery, which email.deliveryWebhook.timeoutMs bounds",
+				floor, MaxForgotPasswordMinResponseMs),
+			fmt.Sprintf("set a value between 0 and %d; to hide a slower delivery, lower email.deliveryWebhook.timeoutMs rather than raising the floor", MaxForgotPasswordMinResponseMs))
+	}
+}
+
+// maxLanguageTagLen is the longest email.languages entry: the core's own
+// bound, the length RFC 5646 §4.4.1 asks every implementation to support.
+const maxLanguageTagLen = 35
+
+// isLanguageTag is the core's own shape rule for an EmailLangs entry
+// (awesome-go-auth config.go, isLanguageTag, unexported there): one or more
+// subtags of ASCII letters and digits separated by '-' or '_', the first of
+// two to eight letters and each of one to eight characters, maxLanguageTagLen
+// in all. It checks the shape and not the registry, as the core does. Copied
+// rather than approximated, because a value this accepts and the core refuses
+// is a deployment that validates and then fails its cold start; cmd/auth
+// TestTheLoaderAcceptsOnlyWhatTheCoreAccepts runs both over one table.
+func isLanguageTag(s string) bool {
+	if s == "" || len(s) > maxLanguageTagLen {
+		return false
+	}
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != '-' && s[i] != '_' {
+			c := s[i] | 0x20 // ASCII lower case; leaves digits as they are
+			letter := c >= 'a' && c <= 'z'
+			digit := s[i] >= '0' && s[i] <= '9'
+			if !letter && (!digit || start == 0) {
+				return false
+			}
+			continue
+		}
+		n := i - start
+		if n < 1 || n > 8 || (start == 0 && n < 2) {
+			return false
+		}
+		start = i + 1
+	}
+	return true
 }
 
 func validateIDProvider(c *Config, d *diagnostics) {

@@ -150,11 +150,44 @@ type Deployment struct {
 	PublicURL string `json:"publicUrl"`
 }
 
-// Security groups the token, password and CSRF knobs of spec §1.1 and §1.3.
+// Security groups the token, password and CSRF knobs of spec §1.1 and §1.3,
+// and the product's own forgot-password timing floor.
 type Security struct {
-	JWT      JWT      `json:"jwt"`
-	Password Password `json:"password"`
-	CSRF     CSRF     `json:"csrf"`
+	JWT            JWT            `json:"jwt"`
+	Password       Password       `json:"password"`
+	CSRF           CSRF           `json:"csrf"`
+	ForgotPassword ForgotPassword `json:"forgotPassword"`
+}
+
+// ForgotPassword covers security.forgotPassword.*: how long POST
+// <prefix>/forgot-password takes to answer.
+//
+// [new] — the reference has no knob for it, and nothing to hold: it answers
+// every address with the same status and body, and a known address is
+// answered only once its mail has been handed to the sender, so the time
+// alone tells an account from an unknown address. The core (v0.16.0) can hold
+// every answer to a floor, Config.ForgotPasswordMinResponseTime, off by
+// default, and this block is that floor.
+type ForgotPassword struct {
+	// MinResponseMs holds every answer of POST <prefix>/forgot-password until
+	// this many milliseconds have passed since the request reached the core:
+	// a mail sent, an unknown or invitation-reserved address, a failed send
+	// and a failed store alike (auth.WithForgotPasswordMinResponseTime). An
+	// answer that already took longer is not held further, so the floor hides
+	// the difference only when it is above the slow branch's worst case — the
+	// lookup, the sender and the token write — and the loader warns when it is
+	// below the delivery webhook's timeout plus an allowance for the other two.
+	//
+	// 0, the default, is off, as before. At most MaxForgotPasswordMinResponseMs,
+	// because a held request is a Lambda invocation that bills its duration
+	// and occupies an execution environment for it: the route then needs its
+	// request rate times the floor in concurrency, which the per-address
+	// rateLimit does not bound, so a floor wants a per-client limit (a WAF
+	// rate rule) or reserved concurrency in front of it — the loader says so
+	// whenever it is on. The core ends the hold 100 ms before the invocation's
+	// deadline, so a floor above the function's Timeout answers at that point
+	// and hides nothing more.
+	MinResponseMs int `json:"minResponseMs"`
 }
 
 // JWT covers security.jwt.* (spec §1.1).
@@ -267,6 +300,29 @@ type Sessions struct {
 	// equivalent to "refresh". Clients that rely on the SESSION_REVOKED 401 for
 	// instant logout implicitly require "allcalls".
 	CheckOn string `json:"checkOn"`
+
+	// RevokeOnPasswordReset makes a successful POST <prefix>/reset-password
+	// end every session of the account (the core's
+	// Config.RevokeSessionsOnPasswordReset, auth.WithRevokeSessionsOnPasswordReset,
+	// v0.16.0; the core deviation reset-password-can-revoke-sessions). Off by
+	// default, which is the reference's answer: the password changes and every
+	// session opened with the old one stays alive.
+	//
+	// On, the reset revokes them once the new password is stored, so their
+	// refresh tokens answer 401 SESSION_REVOKED; access tokens already issued
+	// live until they expire under checkOn refresh or none, and are refused at
+	// once under allcalls. The core also refuses an OIDC authorization code and
+	// a store account's console token minted with the old password, and a
+	// password login in flight across the reset. A revocation the store refuses
+	// fails the reset with the generic 500 after the password has changed, and
+	// the DynamoDB store has consumed the link by then, so the person asks for
+	// a new one.
+	//
+	// It needs a session store that revokes every session of an account,
+	// including one its listing would miss: StoreCapabilities.RevokeUserSessions
+	// (rules.go, checkSessionRevocation) refuses it on a driver that cannot.
+	// [new] — the reference has no such option.
+	RevokeOnPasswordReset bool `json:"revokeOnPasswordReset"`
 }
 
 // Registration covers registration.*: whether anyone may create an account
@@ -349,6 +405,27 @@ type Email struct {
 	Mailer       Mailer            `json:"mailer"`
 	Verification EmailVerification `json:"verification"`
 	TemplatesDir string            `json:"templatesDir"`
+
+	// Languages bounds the language a request's emailLang selects for the mail
+	// it triggers: the core's Config.EmailLangs (auth.WithEmailLangs, v0.16.0).
+	// Set, every mail that carries a language — the reset, verification,
+	// email-change and magic-link mails, the link-request mail, the invitation
+	// — reaches the sender with one of these entries, matched without regard
+	// to case and then by the primary subtag ("IT", "it-IT" and "it_IT" are
+	// "it"), or with none: an unlisted language, a value that is not a
+	// language tag and one longer than 35 characters are dropped, and the
+	// sender uses its default — email.mailer.defaultLang for the mailer, the
+	// receiver's own for the delivery webhook. No request is refused for its
+	// language.
+	//
+	// Empty, the default, passes emailLang through as sent, as the reference
+	// does and as every earlier release did: a delivery webhook then relays
+	// whatever a stranger typed, up to the 16 KiB body the core accepts on
+	// those routes. Each entry must have the shape of a language tag
+	// (isLanguageTag, the core's own rule), or the core refuses to start; the
+	// loader refuses it first, by index. [new] — the reference has no
+	// allowlist.
+	Languages []string `json:"languages"`
 
 	// DeliveryWebhook covers email.deliveryWebhook.* (spec §1.5, §3.8): the
 	// https receiver that is handed every minted credential instead of SES and
@@ -500,6 +577,28 @@ type TwoFactor struct {
 	// applies under Required and to accounts whose own require2FA flag is
 	// set, so it is not inert without Required, and is not refused there.
 	EnrolOnLogin bool `json:"enrolOnLogin"`
+
+	// EnrolmentTokenTTLMinutes is how long the enrolment token of
+	// EnrolOnLogin lives: the tempToken of a 2FA_SETUP_REQUIRED answer, after a
+	// login or the acceptance of an invitation, that POST <prefix>/2fa/setup
+	// and /2fa/verify-setup complete the enrolment with (the core's
+	// Config.EnrolmentTokenTTL, auth.WithEnrolmentTokenTTL, v0.16.0). 0, the
+	// default, keeps the core's TempTokenTTL, five minutes, which is also the
+	// step-up challenge's lifetime and is not changed by this knob; otherwise
+	// MinEnrolmentTokenTTLMinutes to MaxEnrolmentTokenTTLMinutes. Refused
+	// without EnrolOnLogin, where no enrolment token is minted.
+	//
+	// The window is the token's own exp, so it is the same for whoever holds a
+	// copy: for an account with no factor the token alone completes the
+	// enrolment and opens a session, and a copy that calls /2fa/setup before
+	// the owner enrols with that token learns the secret of the factor the
+	// owner then enrols — /2fa/setup answers the same secret for every call
+	// with one token and records nothing — and keeps it after the token has
+	// expired. So a longer window is a longer exposure of every token minted,
+	// and the loader warns above the default; treat a leaked enrolment token
+	// as a leaked factor: change the password, then enrol a new factor in its
+	// place. [new] — the reference has no forced enrolment.
+	EnrolmentTokenTTLMinutes int `json:"enrolmentTokenTtlMinutes"`
 
 	// Lockout caps the failed second-factor checks an account may make,
 	// whatever challenge, login or address they come through (cmd/auth

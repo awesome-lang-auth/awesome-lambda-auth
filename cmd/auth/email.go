@@ -12,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 
@@ -174,6 +175,26 @@ func emailOptions(ctx context.Context, cfg *config.Config, users auth.UserStore,
 		opts = append(opts, auth.WithTemplateStore(store))
 	}
 
+	// The two forgot-password and mail-language knobs of core v0.16.0, passed
+	// whatever their value: an empty language list and a zero floor are the
+	// core's own off, so the mapping is total and a default document builds
+	// the core it always built. Neither can refuse here — the loader has
+	// already refused every entry that is not a language tag and every floor
+	// outside 0..MaxForgotPasswordMinResponseMs, which are within what the
+	// core accepts (TestTheLoaderAcceptsOnlyWhatTheCoreAccepts).
+	floor := time.Duration(cfg.Security.ForgotPassword.MinResponseMs) * time.Millisecond
+	opts = append(opts,
+		// email.languages: the languages a request's emailLang may select.
+		auth.WithEmailLangs(cfg.Email.Languages...),
+		// security.forgotPassword.minResponseMs: the floor every answer of
+		// POST <prefix>/forgot-password is held to.
+		auth.WithForgotPasswordMinResponseTime(floor),
+	)
+
+	languages := "as sent (email.languages unset)"
+	if len(cfg.Email.Languages) > 0 {
+		languages = strings.Join(cfg.Email.Languages, ",")
+	}
 	log.Info("email flows wired",
 		slog.String("canonicalSiteUrl", canonical),
 		slog.Int("allowedOrigins", len(allowlist)),
@@ -182,7 +203,9 @@ func emailOptions(ctx context.Context, cfg *config.Config, users auth.UserStore,
 		slog.Int("mailTemplatesSeeded", len(seed.mailSeeded)),
 		slog.Int("mailTemplatesKept", len(seed.mailKept)),
 		slog.Int("uiTranslationsSeeded", len(seed.uiSeeded)),
-		slog.Int("uiTranslationsKept", len(seed.uiKept)))
+		slog.Int("uiTranslationsKept", len(seed.uiKept)),
+		slog.String("emailLanguages", languages),
+		slog.Duration("forgotPasswordMinResponseTime", floor))
 
 	return opts, nil
 }

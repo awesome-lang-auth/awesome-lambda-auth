@@ -126,6 +126,10 @@ pointer could be missing is a session that is invisible or unrotatable — and t
 is what it costs. Raising `MemorySize` to 1024 roughly halves the 301 ms for
 about the same GB-ms bill, so it moves latency and not this table.
 
+Since the `awesome-go-auth` `v0.16.0` pin a login also reads the account's
+session epoch before it writes the session: one strongly consistent read more,
+**≈ 3 RRU**, USD 0.25 more per million logins (§2.9).
+
 ### 2.3 The rate limiter — 1 WCU per limited request, allowed **or** refused
 
 D5's limiter is one conditional `UpdateItem` against an item well under 1 KB, and
@@ -317,6 +321,33 @@ table and the actions are the ones the function already holds. The SSE manager
 costs nothing in this function either way: without `EnableSse` it holds no
 connection on this runtime, and with it (D9c) every broadcast is a write to the
 event log, which §3.1 prices with the SSE function that holds the connections.
+
+### 2.9 The session epoch — the reads a revoking reset needs, paid on every session read
+
+`awesome-go-auth` `v0.16.0` lets a password reset end every session of the
+account (`sessions.revokeOnPasswordReset`, `docs/config-reference.md` §22.2).
+The DynamoDB store does it with one item per account, `USER#<t>#<u> / EPOCH`,
+that the reset raises in one write and every session read honours
+(`internal/store/dynamodb/session_epoch.go`; `docs/spec/data-model.md` #83). The
+reads are paid **whether or not the key is on**, because a marker that stopped
+being read when the key was turned off would bring the sessions a reset had
+ended back to life:
+
+| path | added | source |
+|---|---|---|
+| `CreateSession` — every session opened (login, OAuth callback, second-factor and link sign-ins) | 1 RRU (strongly consistent `GetItem`) | `sessions.go` `CreateSession` |
+| `POST /refresh` — the session read becomes a `BatchGetItem` of the session and the epoch | 1 RRU, no round trip | `sessions.go` `GetSessionByRefreshTokenHash` |
+| `POST /refresh` — the check after the rotation commits | 1 RRU, one round trip | `session_epoch.go` `rotationOutlivedARevocation` |
+| `GetSessionByID` — every protected request under `sessions.checkOn: allcalls` | 1 RRU, one round trip | `sessions.go` `GetSessionByID` |
+| `GET /sessions`, the console's session lists | 1 RRU per account listed | `sessions.go` `ListSessionsForUser`, `GetAllSessions` |
+| the reset itself, with the key on | 1 WCU | `session_epoch.go` `RevokeSessionsForUser` |
+
+At USD 0.25 per million read units that is **USD 0.25 per million logins,
+USD 0.50 per million refreshes, and USD 0.25 per million protected requests
+under `allcalls`** — the last the one that adds up on a busy realm, and one
+round trip, a few milliseconds, on each of those requests. The reset's write
+is the same whatever the number of sessions: it does not grow with the
+account.
 
 ---
 

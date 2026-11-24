@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+
 	auth "github.com/nik2208/awesome-go-auth"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
@@ -110,11 +112,28 @@ import (
 // would only be able to disagree with validation. The two policy options are
 // passed as written for the same reason: false is the core's own default, so a
 // document that sets neither builds the core it built before they existed, and
-// a gate could only make the deployed value differ from the configured one.
+// a gate could only make the deployed value differ from the configured one. The
+// enrolment window follows the same rule: 0 is the core's default.
 func twoFactorOptions(cfg *config.Config) []auth.Option {
 	return []auth.Option{
 		auth.WithTwoFactorAppName(cfg.TwoFactor.AppName),
 		auth.WithRequire2FA(cfg.TwoFactor.Required),
 		auth.WithEnrolOnLogin(cfg.TwoFactor.EnrolOnLogin),
+		// twoFactor.enrolmentTokenTtlMinutes (core v0.16.0). 0 is the core's
+		// own "keep TempTokenTTL", so it is passed whatever its value; the
+		// loader has refused anything outside 1..30 and anything set without
+		// enrolOnLogin.
+		auth.WithEnrolmentTokenTTL(time.Duration(cfg.TwoFactor.EnrolmentTokenTTLMinutes) * time.Minute),
 	}
+}
+
+// enrolmentTokenMinutes is the enrolment token's lifetime as deployed, for the
+// cold-start line: the configured window, or the core's TempTokenTTL that 0
+// keeps. Meaningful only under twoFactor.enrolOnLogin, which the same line
+// reports beside it.
+func enrolmentTokenMinutes(cfg *config.Config) int {
+	if m := cfg.TwoFactor.EnrolmentTokenTTLMinutes; m > 0 {
+		return m
+	}
+	return config.DefaultEnrolmentTokenTTLMinutes
 }

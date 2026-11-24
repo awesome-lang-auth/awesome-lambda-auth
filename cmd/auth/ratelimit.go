@@ -572,7 +572,11 @@ func resolveRateLimit(cfg *config.Config) rateLimiterConfig {
 //
 // Everything expensive happens here, once, because the returned function is
 // called once per route at mount time. See the file header.
-func newRateLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+//
+// now is the clock the local tier windows on and Retry-After is read from
+// (Options.RateLimitClock); nil is time.Now. Every constructor in this file and
+// newInboundWebhookLimiter takes the same one.
+func newRateLimiter(cfg *config.Config, counter rateLimitCounter, now func() time.Time, log *slog.Logger) func(http.Handler) http.Handler {
 	if !cfg.RateLimit.Enabled {
 		return nil
 	}
@@ -583,7 +587,7 @@ func newRateLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logg
 		return nil
 	}
 
-	tier := newRateLimitTier(rl.max, rl.window, counter, log)
+	tier := newRateLimitTier(rl.max, rl.window, counter, now, log)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -616,17 +620,27 @@ type rateLimitTier struct {
 	counter rateLimitCounter
 	log     *slog.Logger
 
+	// now is the local tier's clock, which a local refusal's Retry-After is
+	// read from too, so that the two can never name different windows. The
+	// shared counter windows on the store's clock (internal/store/dynamodb
+	// rate_limit.go), which this does not reach.
+	now func() time.Time
+
 	degradedOnce  sync.Once
 	noAddressOnce sync.Once
 }
 
-func newRateLimitTier(max int, window time.Duration, counter rateLimitCounter, log *slog.Logger) *rateLimitTier {
+func newRateLimitTier(max int, window time.Duration, counter rateLimitCounter, now func() time.Time, log *slog.Logger) *rateLimitTier {
+	if now == nil {
+		now = time.Now
+	}
 	return &rateLimitTier{
 		max:     max,
 		window:  window,
-		local:   newLocalRateLimiter(max, window, nil),
+		local:   newLocalRateLimiter(max, window, now),
 		counter: counter,
 		log:     log,
+		now:     now,
 	}
 }
 
@@ -659,7 +673,7 @@ func (t *rateLimitTier) serve(w http.ResponseWriter, r *http.Request, scope, sub
 		// The window's remaining time is recomputed rather than remembered,
 		// which keeps Retry-After honest without storing an instant per
 		// subject.
-		writeRateLimited(w, rateLimitRemaining(time.Now(), t.window))
+		writeRateLimited(w, rateLimitRemaining(t.now(), t.window))
 		return
 	}
 
@@ -745,11 +759,11 @@ func (t *rateLimitTier) serve(w http.ResponseWriter, r *http.Request, scope, sub
 //
 // Nil when the block is off, which is the reference's behaviour exactly and
 // the core's pass-through.
-func newAdminPromoteLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+func newAdminPromoteLimiter(cfg *config.Config, counter rateLimitCounter, now func() time.Time, log *slog.Logger) func(http.Handler) http.Handler {
 	if !cfg.RateLimit.Enabled {
 		return nil
 	}
-	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, log)
+	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, now, log)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tier.serve(w, r, adminPromoteScope, clientAddress(r), next)
@@ -806,13 +820,13 @@ const adminLoginScope = "admin-login"
 // dereference rather than the reference's behaviour. The login routes exist
 // only under a session policy (core AdminGuard.LoginRoutesMounted), which is
 // what a non-nil AccessPolicy means here.
-func newAdminLoginLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+func newAdminLoginLimiter(cfg *config.Config, counter rateLimitCounter, now func() time.Time, log *slog.Logger) func(http.Handler) http.Handler {
 	identity := func(next http.Handler) http.Handler { return next }
 	hc := httpConfig(cfg)
 	if !cfg.RateLimit.Enabled || !hc.AdminMounted() || hc.Admin.AccessPolicy == nil {
 		return identity
 	}
-	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, log)
+	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, now, log)
 	login := hc.AdminPath() + auth.AdminLoginPath
 	keyBy := cfg.RateLimit.KeyBy
 	return func(next http.Handler) http.Handler {

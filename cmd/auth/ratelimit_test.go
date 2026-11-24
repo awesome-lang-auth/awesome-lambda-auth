@@ -442,7 +442,7 @@ func TestRateLimiterIsOffWhenTheBlockIsOff(t *testing.T) {
 
 	cfg := config.Defaults()
 	cfg.RateLimit.Enabled = false
-	if newRateLimiter(cfg, nil, discardLogger()) != nil {
+	if newRateLimiter(cfg, nil, nil, discardLogger()) != nil {
 		t.Errorf("a disabled block still produced a limiter; nil is how the core is told there is none")
 	}
 }
@@ -453,7 +453,7 @@ func TestRateLimiterIsOffWhenTheScopeIsEmpty(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.RateLimit.Enabled = true
 	cfg.RateLimit.Scope = nil
-	if newRateLimiter(cfg, nil, discardLogger()) != nil {
+	if newRateLimiter(cfg, nil, nil, discardLogger()) != nil {
 		t.Errorf("an empty scope still produced a limiter; it would match nothing and cost a lookup per request")
 	}
 }
@@ -480,7 +480,7 @@ func TestRateLimiterFailsOpenWhenTheCounterIsUnavailable(t *testing.T) {
 	broken := counterFunc(func(context.Context, string, string, int, time.Duration) (bool, time.Duration, error) {
 		return false, 0, errors.New("dynamodb: ProvisionedThroughputExceededException")
 	})
-	h := newRateLimiter(cfg, broken, discardLogger())(okHandler())
+	h := newRateLimiter(cfg, broken, nil, discardLogger())(okHandler())
 
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
@@ -635,7 +635,7 @@ func TestRateLimitingAddsNoCoreOption(t *testing.T) {
 	cfg.RateLimit.Max = 1
 	cfg.RateLimit.KeyBy = config.RateLimitKeyByIP
 	cfg.RateLimit.Scope = []string{"login"}
-	if newRateLimiter(cfg, nil, discardLogger()) == nil {
+	if newRateLimiter(cfg, nil, nil, discardLogger()) == nil {
 		t.Fatalf("a configured block produced no limiter")
 	}
 }
@@ -665,7 +665,95 @@ func TestResolveRateLimitFollowsTheAPIPrefix(t *testing.T) {
 	}
 }
 
+// TestRateLimitTiersCountOnTheInjectedClock: the limiters New builds count
+// their windows, and read a local refusal's Retry-After, on
+// Options.RateLimitClock and on nothing else — the auth router's and the
+// console's two alike. That is what lets every other test here freeze the
+// clock (testRateLimitInstant) and spend a budget whatever the wall clock does
+// meanwhile; a tier that still read time.Now would be refused by none of these
+// assertions only by coincidence.
+//
+// The clock starts thirty seconds into a minute, so a refusal's Retry-After is
+// 30 on this clock, and moving it one window on makes every budget fresh again
+// without the test waiting for anything.
+func TestRateLimitTiersCountOnTheInjectedClock(t *testing.T) {
+	t.Parallel()
+
+	clock := &testClock{at: testRateLimitInstant.Add(30 * time.Second)}
+	app, err := New(context.Background(), Options{
+		Getenv: envFunc(adminEnv(config.AdminAccessPolicyIsAdmin,
+			"AWESOME_AUTH_RATE_LIMIT_ENABLED", "true",
+			"AWESOME_AUTH_RATE_LIMIT_MAX", "2",
+			"AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS", "60",
+		)),
+		Logger:         discardLogger(),
+		Stores:         memoryStores,
+		RateLimitClock: clock.now,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(app.Close)
+	prefix := config.Defaults().HTTP.APIPrefix
+
+	routes := []struct {
+		name, path, body string
+	}{
+		// The auth router's limiter, on a route in the default scope that
+		// costs no bcrypt: no sender is wired, so it answers at once.
+		{"forgot-password", prefix + "/forgot-password", `{"email":"clock@example.test"}`},
+		// The console's login limiter, which assembleHandler applies.
+		{"admin login", "/admin/login", `{"email":"` + testAdminRootEmail + `","password":"not-the-password"}`},
+		// The console's own slot, ahead of the guard.
+		{"promote", "/admin/users/someone/promote", `{"method":"flag"}`},
+	}
+	spend := func(name, path, body string) {
+		t.Helper()
+		for i := 1; i <= 2; i++ {
+			if resp := invoke(t, app, http.MethodPost, path, jsonHeaders(), nil, body); resp.StatusCode == http.StatusTooManyRequests {
+				t.Fatalf("%s: request %d of a budget of 2 was refused", name, i)
+			}
+		}
+	}
+	for _, rt := range routes {
+		spend(rt.name, rt.path, rt.body)
+		resp := invoke(t, app, http.MethodPost, rt.path, jsonHeaders(), nil, rt.body)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("%s: request 3 of a budget of 2 answered %d, want 429", rt.name, resp.StatusCode)
+		}
+		if got := resp.Headers["Retry-After"]; got != "30" {
+			t.Errorf("%s: Retry-After = %q, want \"30\": the refusal read a clock other than Options.RateLimitClock", rt.name, got)
+		}
+	}
+
+	// One window on, on the injected clock alone: every budget is fresh.
+	clock.advance(time.Minute)
+	for _, rt := range routes {
+		if resp := invoke(t, app, http.MethodPost, rt.path, jsonHeaders(), nil, rt.body); resp.StatusCode == http.StatusTooManyRequests {
+			t.Errorf("%s: refused after the injected clock moved a whole window on; the tier windows on another clock", rt.name)
+		}
+	}
+}
+
 // ── small fixtures ───────────────────────────────────────────────────────────
+
+// testClock is a clock a test moves by hand.
+type testClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *testClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
 
 // counterFunc adapts a function to rateLimitCounter, so a test can supply a
 // counter that fails, or one that always allows, without a type of its own.

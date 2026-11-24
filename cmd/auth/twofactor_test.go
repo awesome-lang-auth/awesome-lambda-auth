@@ -88,9 +88,10 @@ func TestTOTPIssuerDefaultsToTheSchemaLiteral(t *testing.T) {
 // TestTwoFactorOptionsIsUnconditional: there is no configuration in which the
 // issuer is not passed, because there is no configuration in which it is empty
 // — validate.go refuses that — and a gate here could only disagree with
-// validation. The two policy options ride with it, as written, so the count is
-// three on every document; TestTwoFactorOptionsCarryThePolicy (realm_test.go)
-// pins what they carry.
+// validation. The policy options ride with it, as written, so the count is
+// four on every document — the enrolment window included, whose 0 is the core's
+// own default; TestTwoFactorOptionsCarryThePolicy (realm_test.go) pins what they
+// carry.
 func TestTwoFactorOptionsIsUnconditional(t *testing.T) {
 	t.Parallel()
 
@@ -98,10 +99,11 @@ func TestTwoFactorOptionsIsUnconditional(t *testing.T) {
 		baseEnv(),
 		with(baseEnv(), "AWESOME_AUTH_2FA_APP_NAME", "Example Identity"),
 		with(baseEnv(), "AWESOME_AUTH_2FA_REQUIRED", "true", "AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "true"),
+		with(baseEnv(), "AWESOME_AUTH_2FA_REQUIRED", "true", "AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "true", "AWESOME_AUTH_2FA_ENROLMENT_TOKEN_TTL_MINUTES", "15"),
 	} {
 		cfg := loadTestConfig(t, env)
-		if got := len(twoFactorOptions(cfg)); got != 3 {
-			t.Errorf("twoFactorOptions returned %d options, want exactly 3 (issuer, require2FA, enrolOnLogin) for appName %q", got, cfg.TwoFactor.AppName)
+		if got := len(twoFactorOptions(cfg)); got != 4 {
+			t.Errorf("twoFactorOptions returned %d options, want exactly 4 (issuer, require2FA, enrolOnLogin, enrolment window) for appName %q", got, cfg.TwoFactor.AppName)
 		}
 	}
 }

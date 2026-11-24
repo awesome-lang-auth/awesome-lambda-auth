@@ -10,6 +10,51 @@ under [Unreleased].
 
 ### Added
 
+- **The four options of `awesome-go-auth` `v0.16.0` are configurable**, each off
+  or at the core's default unless set, so a document that sets none of them
+  builds what the previous pin built (`docs/config-reference.md` §5.5, §7.4,
+  §22). None has a SAM parameter: set them in the `ConfigFile`, or through the
+  variable.
+  - `email.languages` (`AWESOME_AUTH_EMAIL_LANGUAGES`, comma separated) — the
+    languages a request's `emailLang` may select for its mail; anything else
+    reaches the sender as no language. Each entry is held to the core's
+    language-tag shape and refused at load by index.
+  - `security.forgotPassword.minResponseMs`
+    (`AWESOME_AUTH_SECURITY_FORGOT_PASSWORD_MIN_RESPONSE_MS`, 0–5000) — every
+    answer of `POST <prefix>/forgot-password` held to a floor, so the time no
+    longer tells a known address from an unknown one. Warned whenever on — held
+    invocations cost concurrency the per-address limiter does not bound, so a
+    per-client limit or reserved concurrency belongs in front — and when it is
+    below the delivery webhook's timeout plus 250 ms, or in front of SES.
+  - `twoFactor.enrolmentTokenTtlMinutes`
+    (`AWESOME_AUTH_2FA_ENROLMENT_TOKEN_TTL_MINUTES`, `0` or 1–30) — the
+    enrolment token's lifetime under `twoFactor.enrolOnLogin`, refused without
+    it. Warned above five minutes: a copy of the token is worth a session for as
+    long as it lives, and the factor's secret beyond that.
+  - `sessions.revokeOnPasswordReset`
+    (`AWESOME_AUTH_SESSIONS_REVOKE_ON_PASSWORD_RESET`) — a successful reset ends
+    every session of the account. Refused at load under `STORE` on a driver
+    that cannot end every session of an account (`postgres`). Warned under
+    `sessions.checkOn` `refresh` or `none`, where an access token issued before
+    the reset works until it expires.
+- **The DynamoDB store implements `auth.UserSessionRevoker`** with a
+  per-account session epoch: one item, `USER#<t>#<u> / EPOCH`, that a revoking
+  reset raises with one write, stamped on every new session and honoured
+  wherever a session is read (refresh, lookup by id, both listings, the check
+  after a rotation). It reaches every session whose creation had returned
+  before the reset, whatever the account's count and whatever GSI1 has caught up
+  with, and it orders by a counter of the store's own rather than a clock. **The
+  reads are paid with the option off too** — one consistent read per session
+  created, one item more per refresh read, one read after each rotation, one per
+  lookup by id (every protected request under `sessions.checkOn: allcalls`) —
+  because a marker that stopped being read when the option was turned off
+  would bring ended sessions back (`docs/cost-model.md` §2.9). **A rollback to a
+  build before this one ignores the epoch**: a session a reset ended works again
+  there until it expires. The store also keeps `AuthCode.Credential` on the
+  authorization-code item, which `/token` checks under the option, and its
+  `ClearResetToken` succeeds with nothing outstanding, through the migration
+  wrapper too.
+
 - **Staff invitations** (awesome-go-auth **v0.15.0**; `invitations.enabled`, off
   by default; `AWESOME_AUTH_INVITATIONS_ENABLED`; SAM `InvitationsEnabled`). How a
   closed realm gets its accounts over HTTP: an administrator — or a back office
@@ -195,6 +240,30 @@ under [Unreleased].
   resource server is not affected: it verifies no refresh token, so its refresh
   secret is neither checked nor wired, and one shorter than 32 characters still
   starts (the cold start reports it as unwired).
+- **Pinned to `awesome-go-auth` `v0.16.0`** (password reset and login
+  hardening). Four changes act on upgrade, with no configuration change:
+  `POST <prefix>/forgot-password` sends before it stores, so a refused or failed
+  delivery no longer kills the link mailed before it (a sender that spends the
+  token from inside the call now gets `ErrInvalidToken`); the ten public
+  credential routes (`/forgot-password`, `/reset-password`, `/magic-link/send`,
+  `/magic-link/verify`, `/sms/send`, `/sms/verify`, `/change-email/confirm`,
+  `/invitations/accept`, `/link-request`, `/link-verify`) answer a body over
+  16 KiB with `413 BODY_TOO_LARGE` before anything reads it, the rate limiter
+  included; `POST <prefix>/change-password` ends an outstanding reset link; and
+  every refused password login — an unknown address's included — runs one
+  bcrypt comparison at `security.password.bcryptSaltRounds`, on
+  `POST <prefix>/login`, the identity provider's login form and
+  `POST <admin>/login` alike, so the answer's time no longer tells which
+  addresses have accounts. **That last one costs CPU per refused login, and the
+  default `rateLimit` (`keyBy: email`) does not bound it: every new address is
+  a budget of its own. Put a per-client limit in front of the login routes — a
+  WAF rate rule — or a ceiling on the function (`ReservedConcurrentExecutions`)
+  before taking this release to a deployment that is reachable from the
+  internet.** Three core deviations are
+  indexed: `change-password-ends-the-reset-link`,
+  `credential-route-bodies-are-bounded` and `reset-password-can-revoke-sessions`
+  (opt-in: `sessions.revokeOnPasswordReset`, see Added), and `forgot-password-succeeds-on-delivery-failure`
+  says what a failed send now leaves behind.
 - **Pinned to `awesome-go-auth` `v0.14.0`** (closed registration, enforced second
   factor with opt-in forced enrolment, admin machine access). Two core deviations
   are indexed, `forced-enrolment-opens-a-session` and

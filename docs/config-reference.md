@@ -283,6 +283,7 @@ is the first block with a route that writes either flag (§16.2).
 | `email.deliveryWebhook.url` | string (https) | none | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL` |
 | `email.deliveryWebhook.timeoutMs` | integer 1–10000 | `5000` | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS` |
 | `email.deliveryWebhook.secret` | secret | none; **required** with a url | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET` |
+| `email.languages` | string[] (language tags) | none: `emailLang` passes through as sent | `AWESOME_AUTH_EMAIL_LANGUAGES` (comma separated) |
 
 ### 5.1 `email.siteUrls` — where an emailed link points
 
@@ -466,6 +467,47 @@ webhook to keep credentials off SES should know this one did not move with it.
   "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}}}}
 ```
 
+### 5.5 `email.languages` — the languages a request may ask a mail in
+
+The core's `Config.EmailLangs` (`auth.WithEmailLangs`, `awesome-go-auth`
+`v0.16.0`). The routes that send a mail — `/forgot-password`,
+`/send-verification-email`, `/change-email/request`, `/magic-link/send`,
+`/link-request`, the invitation, and the email-changed notice when a caller
+asks a language for it — take an `emailLang` from the request and hand it to
+the sender, which picks the template by it. The reference passes it
+through as sent; so does this product while the list is empty, which is the
+default and every earlier release's behaviour. A delivery webhook then relays
+whatever a caller typed, up to the 16 KiB body the core accepts on those routes
+(the core deviation `credential-route-bodies-are-bounded`).
+
+Set, every mail reaches the sender with one of the listed entries or with none.
+A request's value is matched without regard to case, then by its primary
+subtag (`IT`, `it-IT` and `it_IT` all select `it`); an unlisted language, a
+value that is not a language tag and one longer than 35 characters are
+dropped, and the sender uses its own default — `email.mailer.defaultLang` for
+the mailer, the receiver's for the delivery webhook. No request is refused for
+its language. List every language your templates are keyed by: the
+`translations` of the templates seeded from `email.templatesDir` (§5.3) or
+edited in the template store, and on the delivery webhook whatever its receiver
+renders. A language your templates carry that the list leaves out is reduced to
+the sender's default as soon as the list is set. With only the built-in `it`
+and `en` templates, which fall back to their default for anything else,
+`["it", "en"]` loses nothing. The entry reaches the sender exactly as written
+here, so list it in the spelling your templates are keyed by.
+
+```json
+{"email": {"languages": ["it", "en"]}}
+```
+
+`AWESOME_AUTH_EMAIL_LANGUAGES=it,en` is the same list. Each entry must have the
+shape of a language tag — one or more subtags of letters and digits separated
+by `-` or `_`, the first of two to eight letters, each at most eight
+characters, 35 in all — which is the core's own rule: the core refuses to start
+on any other entry, so the loader refuses it first and names its index
+(`email.languages[1]`). Surrounding spaces are trimmed. The shape is checked,
+not the registry. A resource server keeps the key: `/link-request` stays
+mounted there and its mail carries the language.
+
 ## 6. `security.jwt.extraClaims` and `security.jwt.claimsWebhook` — what a token carries
 
 | Path | Type | Default | Env var |
@@ -601,6 +643,7 @@ the reference's callback can — so point this only at a receiver you own.
 | `twoFactor.enrolOnLogin` | boolean | `false` | `AWESOME_AUTH_2FA_ENROL_ON_LOGIN` | `TwoFactorEnrolOnLogin` |
 | `twoFactor.lockout.maxFailures` | integer ≥ 0 (`0` is off) | `10` | `AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES` | — |
 | `twoFactor.lockout.windowSeconds` | integer > 0 | `86400` | `AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS` | — |
+| `twoFactor.enrolmentTokenTtlMinutes` | integer, `0` or 1–30 | `0` (the core's five minutes) | `AWESOME_AUTH_2FA_ENROLMENT_TOKEN_TTL_MINUTES` | — |
 
 The SAM template sets the two policy variables only when their parameter is
 `"true"`: the environment layer wins over the document, so a `"false"` written
@@ -740,7 +783,8 @@ other route refuses. `/2fa/setup` answers a secret the server derives from the
 token; `verify-setup` with that secret and a live code stores the factor and
 **opens the session** exactly as `POST <prefix>/2fa/verify` does — cookies, or
 `accessToken`/`refreshToken` under `X-Auth-Strategy: bearer`. The token is bound
-to the password that minted it, lives the temp-token TTL (five minutes), and
+to the password that minted it, lives the temp-token TTL (five minutes) unless
+`twoFactor.enrolmentTokenTtlMinutes` says otherwise (§7.4), and
 dies the moment the account has a factor: a replay is
 `401 INVALID_TEMP_TOKEN` (body form) or the access refusal (bearer form).
 
@@ -852,6 +896,45 @@ not left unbounded either: it is counted in process instead, so while the
 outage lasts the bound is `maxFailures` per account per execution environment,
 the floor `rateLimit`'s local tier keeps for it. The cold start's log says so
 once, at `WARN`.
+
+### 7.4 `twoFactor.enrolmentTokenTtlMinutes` — how long the enrolment window stays open
+
+The core's `Config.EnrolmentTokenTTL` (`auth.WithEnrolmentTokenTTL`,
+`awesome-go-auth` `v0.16.0`): the lifetime of the enrolment token of §7.2, the
+window in which `POST <prefix>/2fa/setup` and `/2fa/verify-setup` complete the
+enrolment and open the session. It is the token's own `exp`, so `exp - iat` is
+the window a client can show. `0`, the default, keeps the core's temp-token
+TTL, five minutes, as every earlier release did; otherwise 1 to 30 minutes,
+the core's own range, which the loader enforces first so the refusal names the
+key. The step-up `tempToken` of `/2fa/verify` keeps its five minutes either way.
+It is refused without `twoFactor.enrolOnLogin`, the one mode that mints an
+enrolment token: there it would validate and bound nothing.
+
+It is for a realm whose invitees install an authenticator app during their
+first sign-in, for whom five minutes from the password to the first code can be
+too few.
+
+```json
+{"twoFactor": {"required": true, "enrolOnLogin": true, "enrolmentTokenTtlMinutes": 15}}
+```
+
+**The window is a security setting, not only a convenience.** It is the same
+for whoever holds a copy of the token. For an account with no factor the token
+alone completes the enrolment and opens a session, so a copy is worth a
+session for as long as it lives — fifteen minutes is three times the default's
+exposure. A copy is worth the factor too, and that outlives the token:
+`/2fa/setup` answers the same secret for every call with one token and records
+nothing, so a copy that calls it before the owner enrols with that token learns
+the secret of the factor the owner then enrols, and keeps it after the token has
+expired; with the password, it answers the step-up until the factor is
+replaced. Treat a leaked enrolment token as a leaked factor: change the password,
+then enrol a new factor in its place. A token is refused while the account has
+a factor but not spent, so a factor removed before `exp` without a password
+change brings the token back (reset the password together with the factor, as
+§7.2 says). Keep the window as short as your invitees need. The loader warns at
+every start while it is above five minutes, and says nothing for a shorter one,
+which only narrows the exposure, nor on a resource server, which reports the
+key as unwired.
 
 ## 8. `oauth.*`, knob by knob
 
@@ -4017,3 +4100,145 @@ beside the new one, for example
 `TestAcceptInvitationIsLimitedByClientAddress` covers this. Once an address has
 spent its budget it is answered `429`, and an invitee at another address still
 accepts.
+
+## 22. `security.forgotPassword.minResponseMs` and `sessions.revokeOnPasswordReset` — the password reset
+
+| Path | Type | Default | Env var | SAM parameter |
+|---|---|---|---|---|
+| `security.forgotPassword.minResponseMs` | integer 0–5000 (`0` is off) | `0` | `AWESOME_AUTH_SECURITY_FORGOT_PASSWORD_MIN_RESPONSE_MS` | — |
+| `sessions.revokeOnPasswordReset` | boolean | `false` | `AWESOME_AUTH_SESSIONS_REVOKE_ON_PASSWORD_RESET` | — |
+
+Two options of `awesome-go-auth` `v0.16.0`, both off by default, which is how
+every earlier release answered. Neither has a SAM parameter: set them in the
+`ConfigFile`, or through the variable. A resource server mounts neither route,
+so the cold start reports either key there as unwired, and the loader's
+warnings about them below stay silent there.
+
+### 22.1 `security.forgotPassword.minResponseMs` — one answer time for every address
+
+`POST <prefix>/forgot-password` answers every address with the same status and
+body, but not in the same time: a known address is answered once its mail has
+been handed to the sender (since `v0.16.0` the token is stored only after a good
+send), the others right after the lookup, so the time alone says which
+addresses have accounts. The core's `Config.ForgotPasswordMinResponseTime`
+(`auth.WithForgotPasswordMinResponseTime`) holds every answer — a mail sent, an
+unknown or invitation-reserved address, a failed send, a failed store — until
+this many milliseconds have passed since the request reached the core. A body
+refused before that (`400`, `413 BODY_TOO_LARGE`) is not held.
+
+```json
+{"security": {"forgotPassword": {"minResponseMs": 2500}}}
+```
+
+**It hides the difference only above the slow branch's worst case.** An answer
+that already took longer is not held further, so the floor has to exceed the
+account lookup, the delivery and the token write. With `email.deliveryWebhook`
+the delivery is bounded by its `timeoutMs` (§5.4), and the loader warns when the
+floor is below that timeout plus 250 ms, its estimate of the lookup and the
+write, and names the lower timeout the floor would cover, and the floor that
+would cover the timeout when the 5000 ms ceiling allows one (at the webhook's
+default `timeoutMs`, 5000, it does not: lower the timeout). Behind
+`email.mailer` (SES) the send has no deadline of its own here, only the
+invocation's, and the loader says so whenever the floor is on: size it
+comfortably above the SES latency you see, or deliver through the webhook,
+whose timeout the floor can be sized against. The floor reaches neither
+`/magic-link/send` nor `/sms/send`, whose known and unknown addresses differ in
+time the same way, and it does not hide the status: a store write that fails
+after a good send still answers `500`.
+
+**What it costs, and what has to come with it.** Every request on the route,
+an unknown address's included, lasts at least the floor inside a Lambda
+invocation, which bills the time and keeps an execution environment for it: the
+route needs its request rate times the floor in concurrency, and a burst of
+anonymous requests takes capacity the other routes share. `rateLimit` does not
+bound that — under `keyBy: email` every new address is a budget of its own
+(§14.2) — so **put a per-client limit in front of the route** (a WAF rate-based
+rule at the edge) **or a ceiling on the function**
+(`ReservedConcurrentExecutions`) before turning it on. The loader repeats that
+at every start while the floor is on.
+
+The ceiling, 5000 ms, is half the template's default function `Timeout` (10 s)
+and below its `DurationAlarmThresholdMs` (8000), which a floor near it would trip
+on ordinary traffic. To hide a slower delivery, lower
+`email.deliveryWebhook.timeoutMs` rather than raising the floor. The core ends
+the hold 100 ms before the invocation's deadline, and the send and the store
+behind the answer are bounded by the same moment, so no branch answers after
+it. A negative value is refused, as the core refuses it.
+
+### 22.2 `sessions.revokeOnPasswordReset` — a reset ends the account's sessions
+
+The core's `Config.RevokeSessionsOnPasswordReset`
+(`auth.WithRevokeSessionsOnPasswordReset`; the core deviation
+`reset-password-can-revoke-sessions`). Off, a successful
+`POST <prefix>/reset-password` changes the password and leaves every session
+alive, as the reference does. On, once the new password is stored:
+
+- every session of the account opened before the reset is revoked: its refresh
+  token answers `401 SESSION_REVOKED`; an access token already issued is
+  refused at once under `sessions.checkOn: allcalls` and lives until it expires
+  under `refresh` or `none`, which read no session on a protected request;
+- an OIDC authorization code minted with the old password is refused at
+  `/token` (`invalid_grant`): the code carries a fingerprint of the password its
+  login proved (`AuthCode.Credential`, which the DynamoDB store keeps on the
+  code's item);
+- a store account's console token from `POST <admin>/login` is refused at its
+  next console request, and a password login that proved the old password and
+  opens its session after the reset gives the session up;
+- what it does not end: a step-up `tempToken` minted before the reset (five
+  minutes), and an ordinary access token on the console, which reads no session
+  (§16.2). Nor, under a Cognito migration with `stores.migration.clientId` set
+  (§13), a login whose own migration write lands after the reset: that write
+  restores the old password and the login keeps its session, with or without
+  the option; the person resets again.
+
+**Under `sessions.checkOn` `refresh` or `none` an access token outlives the
+reset.** The revocation ends the refresh tokens at once, but those postures read
+no session on a protected request, so an access token issued before the reset
+works until it expires (`security.jwt.accessTokenTtl`, 15 minutes by default).
+The loader warns at every start while the key is on under either posture. If
+the window matters, set `sessions.checkOn: allcalls`, or shorten the
+access-token lifetime to the window you accept.
+
+Turning it on refuses, once, an authorization code not yet redeemed and a store
+account's console token minted before it: they carry nothing to check, and the
+holder signs in again. A revocation the store refuses fails the reset with the
+generic `500` after the password has changed; the link has been consumed by
+then, so the person asks for a new one and resets again.
+
+**It needs a store that can end every session of an account.** The loader
+refuses the key under `STORE` on a driver that cannot (`postgres`). The memory
+driver can: its session store is the core's, whose listing is complete. The
+DynamoDB driver can since this release, through `auth.UserSessionRevoker`; its
+listing could not do it, because it is read from GSI1, which is eventually
+consistent, and refuses past `MaxSessionsPerUser`.
+
+**How DynamoDB does it: the account's session epoch.** Each account has a
+counter, one item `USER#<t>#<u> / EPOCH` in its own partition, that a revoking
+reset raises with one `UpdateItem`. A new session reads it, consistently, and
+carries it as a stamp; wherever a session is read — the refresh, the lookup by
+id behind `checkOn: allcalls`, the account's and the console's listings — one
+stamped below the account's current epoch is reported revoked, with the time of
+the latest raise. The order is the store's own counter, not a clock, so a
+session whose creation had returned before the reset began is always ended, one
+racing the reset may be ended with it, and one opened after it lives. The
+revocation is one write whatever the number of sessions, reads no index, and
+has no cap. The cost is paid whether or not the key is on, because a marker
+that stopped being read when the key was turned off would bring every session a
+reset had ended back to life: one consistent read more per session created, one
+item more in the read every refresh already makes, one read after each
+rotation, and one per lookup by id — every protected request under
+`checkOn: allcalls`. `docs/cost-model.md` prices it.
+
+A refresh that read its session before the reset and rotates it after is
+refused too, by a read of the epoch once the rotation has committed. If that one
+read fails (a throttled or failed `GetItem`), the store logs a warning and lets
+the rotation stand rather than throw away tokens already minted: the new refresh
+token is refused at its first use, and the new access token lives as any other
+issued before the reset does — refused at once under `allcalls`, until it
+expires otherwise.
+
+Two things to know before relying on it. Ended sessions keep their index
+entries until they expire, so an account over `MaxSessionsPerUser` is still
+refused by the session listing after a reset, as it was before — the reset
+itself is not. And a rollback to a build that predates this one does not read
+the epoch: a session a reset ended works again there, until it expires.

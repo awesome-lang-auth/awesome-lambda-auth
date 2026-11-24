@@ -121,12 +121,18 @@ func newAdminSurface(t *testing.T, cfg *config.Config, opts Options, counter rat
 	if err := checkAdminMounted(cfg, httpConfig(cfg)); err != nil {
 		t.Fatalf("checkAdminMounted: %v", err)
 	}
+	// The limiters count on the test apps' frozen clock unless the caller
+	// brought one, for the reason testRateLimitInstant gives.
+	clock := opts.RateLimitClock
+	if clock == nil {
+		clock = frozenRateLimitClock
+	}
 	mux := http.NewServeMux()
-	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log), auth.ToolsOptions{}); err != nil {
+	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, clock, log), newAdminPromoteLimiter(cfg, counter, clock, log), auth.ToolsOptions{}); err != nil {
 		t.Fatalf("mountAuthSurface: %v", err)
 	}
 	logAdminSurface(cfg, httpConfig(cfg), log)
-	return &adminSurface{handler: assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log)), stores: users, core: core}
+	return &adminSurface{handler: assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, clock, log)), stores: users, core: core}
 }
 
 // call issues one request against the surface. body is JSON when non-nil.
@@ -846,10 +852,10 @@ func TestAdminPromoteRouteIsRateLimited(t *testing.T) {
 		t.Errorf("another address answered %d on its first promote, want 401", otherRec.Code)
 	}
 
-	if newAdminPromoteLimiter(mustLoad(t, baseEnv()), nil, discardLogger()) == nil {
+	if newAdminPromoteLimiter(mustLoad(t, baseEnv()), nil, nil, discardLogger()) == nil {
 		t.Error("the promote limiter is nil with rateLimit.enabled at its default of true")
 	}
-	if newAdminPromoteLimiter(mustLoad(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false")), nil, discardLogger()) != nil {
+	if newAdminPromoteLimiter(mustLoad(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false")), nil, nil, discardLogger()) != nil {
 		t.Error("the promote limiter is built with rateLimit.enabled off; nil is the reference's own default")
 	}
 }
@@ -1007,8 +1013,8 @@ func TestAdminLoginIsRateLimited(t *testing.T) {
 
 	// Off with the block, identity with the console unmounted: never nil,
 	// because assembleHandler always wraps.
-	if newAdminLoginLimiter(mustLoad(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false")), nil, discardLogger()) == nil ||
-		newAdminLoginLimiter(mustLoad(t, baseEnv()), nil, discardLogger()) == nil {
+	if newAdminLoginLimiter(mustLoad(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false")), nil, nil, discardLogger()) == nil ||
+		newAdminLoginLimiter(mustLoad(t, baseEnv()), nil, nil, discardLogger()) == nil {
 		t.Error("newAdminLoginLimiter returned nil; assembleHandler wraps unconditionally and wants the identity")
 	}
 }

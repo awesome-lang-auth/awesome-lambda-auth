@@ -163,12 +163,12 @@ const inboundWebhookScope = "inbound-webhook"
 // one.
 //
 // Identity when rateLimit is off or the route is not mounted.
-func newInboundWebhookLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+func newInboundWebhookLimiter(cfg *config.Config, counter rateLimitCounter, now func() time.Time, log *slog.Logger) func(http.Handler) http.Handler {
 	identity := func(next http.Handler) http.Handler { return next }
 	if !cfg.RateLimit.Enabled || !cfg.Tools.Enabled || !cfg.Tools.InboundWebhooks.Enabled {
 		return identity
 	}
-	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, log)
+	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, now, log)
 	prefix := toolsPath(cfg) + "/webhook/"
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

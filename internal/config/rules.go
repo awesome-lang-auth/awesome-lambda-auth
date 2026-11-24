@@ -46,6 +46,36 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS20TwoFactorRequiredSignIn(c, d)
 	checkRS21ClosedRegistrationDualRead(c, d)
 	checkStoreRequirements(c, d)
+	checkSessionRevocation(c, capabilities, d)
+}
+
+// checkSessionRevocation: sessions.revokeOnPasswordReset needs a session store
+// that can end every session of an account, and is refused on a driver whose
+// store cannot.
+//
+// The core accepts the option on any store that can list an account's sessions
+// (SessionAdminStore) and revokes what the listing returns, so a store whose
+// listing is capped or eventually consistent would load and then fail the
+// promise quietly: a reset of an account past the cap answers 500 with nothing
+// revoked, and a session opened just before the reset, not yet in the index,
+// keeps working with the old password's authority. The core's way out is
+// auth.UserSessionRevoker — one call that reaches every session whose
+// creation had returned — and whether a driver has it, or a listing exact
+// enough not to need it, is StoreCapabilities.RevokeUserSessions: the store
+// layer's truth, as RS-13 reads MigrationMarker.
+//
+// Reported under STORE, the cross-store requirements' rule, because it is the
+// same shape of fault: a switch whose backing store cannot do what the switch
+// promises.
+func checkSessionRevocation(c *Config, capabilities func(string) StoreCapabilities, d *diagnostics) {
+	if !c.Sessions.RevokeOnPasswordReset || capabilities(c.Stores.Driver).RevokeUserSessions {
+		return
+	}
+	d.errf(RuleStoreRequired, "sessions.revokeOnPasswordReset",
+		fmt.Sprintf("is on, and the %q store driver cannot end every session of an account at once -- it neither implements auth.UserSessionRevoker nor lists an account's sessions completely and consistently -- "+
+			"so a reset could leave a session it did not find working with the old password's authority, or fail with the password changed and nothing revoked",
+			c.Stores.Driver),
+		"turn sessions.revokeOnPasswordReset off on this driver until its store implements auth.UserSessionRevoker")
 }
 
 // checkRS21ClosedRegistrationDualRead: a closed realm that dual-reads a
