@@ -595,7 +595,30 @@ func collectWarnings(cfg *Config) {
 			"leave cookies.domain unset unless subdomains genuinely need to share the session")
 	}
 	collectForgotPasswordWarnings(cfg)
+	collectSessionRevocationWarnings(cfg)
 	collectRealmWarnings(cfg)
+}
+
+// collectSessionRevocationWarnings says what sessions.revokeOnPasswordReset
+// leaves alive under a sessions.checkOn that reads no session on a protected
+// request. The revocation ends the refresh tokens at once; an access token
+// already issued is refused at once only under allcalls, and under refresh or
+// none it is honoured until it expires. Not refused: a short access-token
+// lifetime is an answer too, and it is the operator's to size.
+//
+// A resource server mounts no /reset-password, and cmd/auth reports the key as
+// unwired there (resourceServerCredentialKnobGaps); a warning about what the
+// reset leaves alive would contradict that report.
+func collectSessionRevocationWarnings(cfg *Config) {
+	if !cfg.Sessions.RevokeOnPasswordReset || cfg.ResourceServer.Enabled || cfg.Sessions.CheckOn == SessionCheckOnAllCalls {
+		return
+	}
+	cfg.warn("sessions.revokeOnPasswordReset",
+		fmt.Sprintf("a password reset revokes the account's sessions, but under sessions.checkOn %q no protected request reads its session, "+
+			"so an access token issued before the reset keeps working until it expires (security.jwt.accessTokenTtl, %s)",
+			cfg.Sessions.CheckOn, cfg.Security.JWT.AccessTokenTTL),
+		"set sessions.checkOn: allcalls so a revoked session's access tokens are refused at once, or shorten security.jwt.accessTokenTtl to the window you accept after a reset; "+
+			"an access token on the admin console is honoured until it expires under every checkOn")
 }
 
 // collectForgotPasswordWarnings says what security.forgotPassword.minResponseMs
@@ -605,7 +628,10 @@ func collectWarnings(cfg *Config) {
 // Timeout, what sits in front of the route.
 func collectForgotPasswordWarnings(cfg *Config) {
 	floor := cfg.Security.ForgotPassword.MinResponseMs
-	if floor <= 0 {
+	// A resource server mounts no /forgot-password: cmd/auth reports the key
+	// as unwired there (resourceServerCredentialKnobGaps), and that report is
+	// the only thing to say about it.
+	if floor <= 0 || cfg.ResourceServer.Enabled {
 		return
 	}
 	const path = "security.forgotPassword.minResponseMs"
@@ -730,7 +756,9 @@ func collectRealmWarnings(cfg *Config) {
 		// The enrolment window, longer than the core's default. A shorter one
 		// narrows every exposure below and says nothing; a longer one widens
 		// it for every token minted, and that is what the operator has to hear.
-		if ttl := cfg.TwoFactor.EnrolmentTokenTTLMinutes; ttl > DefaultEnrolmentTokenTTLMinutes {
+		// Not on a resource server, which mounts no enrolment route and
+		// reports the key as unwired (cmd/auth resourceServerCredentialKnobGaps).
+		if ttl := cfg.TwoFactor.EnrolmentTokenTTLMinutes; ttl > DefaultEnrolmentTokenTTLMinutes && !cfg.ResourceServer.Enabled {
 			cfg.warn("twoFactor.enrolmentTokenTtlMinutes",
 				fmt.Sprintf("the enrolment token lives %d minutes rather than the default %d, and the window is the same for whoever holds a copy of the token: "+
 					"for an account with no factor the token alone completes the enrolment and opens a session, and a copy that calls POST <prefix>/2fa/setup before the owner enrols with that token "+

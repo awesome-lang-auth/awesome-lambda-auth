@@ -387,3 +387,109 @@ func TestBuiltinSessionRevocationCapabilities(t *testing.T) {
 		}
 	}
 }
+
+// TestRevokeOnPasswordResetWarnsWhatItLeavesAlive: the revocation ends the
+// refresh tokens at once, and an access token at once only under allcalls.
+// Under refresh or none the loader says how long one keeps working, and under
+// allcalls, or with the key off, it says nothing.
+func TestRevokeOnPasswordResetWarnsWhatItLeavesAlive(t *testing.T) {
+	const path = "sessions.revokeOnPasswordReset"
+	for _, tc := range []struct {
+		revoke  bool
+		checkOn string
+		ttl     string
+		warns   bool
+	}{
+		{true, "", "", true}, // checkOn defaults to refresh
+		{true, SessionCheckOnRefresh, "5m", true},
+		{true, SessionCheckOnNone, "", true},
+		{true, SessionCheckOnAllCalls, "", false},
+		{false, SessionCheckOnRefresh, "", false},
+	} {
+		doc := baseDoc()
+		set(doc, path, tc.revoke)
+		if tc.checkOn != "" {
+			set(doc, "sessions.checkOn", tc.checkOn)
+		}
+		if tc.ttl != "" {
+			set(doc, "security.jwt.accessTokenTtl", tc.ttl)
+		}
+		cfg, err := Load(t.Context(), Options{
+			Document: doc,
+			Getenv:   getenvFrom(baseEnv()),
+			Capabilities: func(string) StoreCapabilities {
+				return StoreCapabilities{ListUsers: true, MigrationMarker: true, RevokeUserSessions: true}
+			},
+		})
+		if err != nil {
+			t.Fatalf("revoke=%v checkOn=%q: load: %v", tc.revoke, tc.checkOn, err)
+		}
+		ws := warningsAt(cfg, path)
+		if got := len(ws) > 0; got != tc.warns {
+			t.Errorf("revoke=%v checkOn=%q: warned %v, want %v (%v)", tc.revoke, tc.checkOn, got, tc.warns, ws)
+			continue
+		}
+		for _, w := range ws {
+			wantTTL := tc.ttl
+			if wantTTL == "" {
+				wantTTL = "15m"
+			}
+			if !strings.Contains(w.Problem, fmt.Sprintf("checkOn %q", cfg.Sessions.CheckOn)) ||
+				!strings.Contains(w.Problem, "security.jwt.accessTokenTtl, "+wantTTL) {
+				t.Errorf("checkOn=%q: the warning does not name the posture and the window: %s", tc.checkOn, w.Problem)
+			}
+			if !strings.Contains(w.Remedy, "sessions.checkOn: allcalls") || !strings.Contains(w.Remedy, "admin console") {
+				t.Errorf("checkOn=%q: the remedy does not name allcalls and the console: %s", tc.checkOn, w.Remedy)
+			}
+		}
+	}
+}
+
+// TestAResourceServerIsNotWarnedAboutTheResetKnobs: a resource server mounts
+// none of the routes the floor, the revocation and the enrolment window shape,
+// and cmd/auth reports each as unwired there. The loader's warnings about what
+// they cost or leave alive would contradict that report, so they stay silent.
+func TestAResourceServerIsNotWarnedAboutTheResetKnobs(t *testing.T) {
+	paths := []string{"security.forgotPassword.minResponseMs", "sessions.revokeOnPasswordReset", "twoFactor.enrolmentTokenTtlMinutes"}
+	build := func(rs bool) Document {
+		doc := baseDoc()
+		set(doc, "security.forgotPassword.minResponseMs", 1000)
+		set(doc, "sessions.revokeOnPasswordReset", true)
+		set(doc, "twoFactor.enrolOnLogin", true)
+		set(doc, "twoFactor.enrolmentTokenTtlMinutes", 15)
+		if rs {
+			set(doc, "resourceServer.enabled", true)
+			set(doc, "resourceServer.jwksUrl", "https://idp.example.com/.well-known/jwks.json")
+		}
+		return doc
+	}
+	load := func(t *testing.T, rs bool) *Config {
+		t.Helper()
+		doc, env := build(rs), baseEnv()
+		withWebhook(doc, env) // a floor under its timeout warns twice off a resource server
+		cfg, err := Load(t.Context(), Options{
+			Document:           doc,
+			Getenv:             getenvFrom(env),
+			AllowUnimplemented: true,
+			Capabilities: func(string) StoreCapabilities {
+				return StoreCapabilities{ListUsers: true, MigrationMarker: true, RevokeUserSessions: true}
+			},
+		})
+		if err != nil {
+			t.Fatalf("resource server %v: load: %v", rs, err)
+		}
+		return cfg
+	}
+	issuing := load(t, false)
+	for _, path := range paths {
+		if len(warningsAt(issuing, path)) == 0 {
+			t.Errorf("the issuing deployment is not warned about %s", path)
+		}
+	}
+	rs := load(t, true)
+	for _, path := range paths {
+		if ws := warningsAt(rs, path); len(ws) != 0 {
+			t.Errorf("a resource server is warned about %s, which it reports as unwired: %v", path, ws)
+		}
+	}
+}

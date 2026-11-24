@@ -34,7 +34,9 @@ under [Unreleased].
   - `sessions.revokeOnPasswordReset`
     (`AWESOME_AUTH_SESSIONS_REVOKE_ON_PASSWORD_RESET`) — a successful reset ends
     every session of the account. Refused at load under `STORE` on a driver
-    that cannot end every session of an account (`postgres`).
+    that cannot end every session of an account (`postgres`). Warned under
+    `sessions.checkOn` `refresh` or `none`, where an access token issued before
+    the reset works until it expires.
 - **The DynamoDB store implements `auth.UserSessionRevoker`** with a
   per-account session epoch: one item, `USER#<t>#<u> / EPOCH`, that a revoking
   reset raises with one write, stamped on every new session and honoured
