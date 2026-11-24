@@ -247,11 +247,18 @@ func TestForgotPasswordFloorWarns(t *testing.T) {
 		ws := load(t, 200, func(doc Document, env map[string]string) {
 			withWebhook(doc, env) // 5000 ms: no floor within the ceiling covers it
 		})
+		var found bool
 		for _, w := range ws {
-			if strings.Contains(w.Problem, "below email.deliveryWebhook.timeoutMs") &&
-				(w.Remedy == "" || strings.HasPrefix(w.Remedy, ";") || !strings.Contains(w.Remedy, "within the ceiling of 5000 ms")) {
+			if !strings.Contains(w.Problem, "below email.deliveryWebhook.timeoutMs") {
+				continue
+			}
+			found = true
+			if w.Remedy == "" || strings.HasPrefix(w.Remedy, ";") || !strings.Contains(w.Remedy, "within the ceiling of 5000 ms") {
 				t.Errorf("the remedy is empty or unsized: %q", w.Remedy)
 			}
+		}
+		if !found {
+			t.Fatalf("no coverage warning for a floor under the webhook timeout: %v", ws)
 		}
 	})
 	t.Run("a webhook the floor covers", func(t *testing.T) {
