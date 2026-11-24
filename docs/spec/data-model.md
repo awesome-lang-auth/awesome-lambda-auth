@@ -46,15 +46,16 @@ Conventions: `<t>` = tenant id, `<u>` = user id, `<sid>` = session id, `<h>` = `
 
 | # | Pattern | Trigger | Key condition | Index | Items |
 |---|---|---|---|---|---|
-| 10 | Create session | `CreateSession` ← login, refresh, OAuth callback, `/2fa/verify`, `/magic-link/verify`, `/sms/verify`, `/link-verify` | Tx: Put `SESSION#<sid>` / `SESSION`; Put `REFRESH#<h>` / `REFRESH` if `attribute_not_exists(PK)` | main | 2 w |
-| 11 | Resolve by refresh hash | `GetSessionByRefreshTokenHash` ← `POST /refresh`, `POST /logout` | GetItem `PK=REFRESH#<h>` → GetItem `PK=SESSION#<sid>` | main | 2 r |
-| 12 | Rotate | `UpdateSession` ← `POST /refresh` | Tx: Put `REFRESH#<newH>` if `attribute_not_exists(PK)`; Update `SESSION#<sid>` `SET refreshHash, expiresAt, gen = gen+1` if `attribute_not_exists(revokedAt)` (+ `refreshHash = :oldH`, §4.3) | main | 2 w |
+| 10 | Create session | `CreateSession` ← login, refresh, OAuth callback, `/2fa/verify`, `/magic-link/verify`, `/sms/verify`, `/link-verify` | consistent GetItem `USER#<t>#<u>` / `EPOCH` (the stamp, #83); Tx: Put `SESSION#<sid>` / `SESSION` with `epoch`; Put `REFRESH#<h>` / `REFRESH` if `attribute_not_exists(PK)` | main | 1 r + 2 w |
+| 11 | Resolve by refresh hash | `GetSessionByRefreshTokenHash` ← `POST /refresh`, `POST /logout` | GetItem `PK=REFRESH#<h>` → BatchGetItem `PK=SESSION#<sid>` + `USER#<t>#<u>` / `EPOCH` (the pointer names the account; #83) | main | 3 r |
+| 12 | Rotate | `UpdateSession` ← `POST /refresh` | Tx: Put `REFRESH#<newH>` if `attribute_not_exists(PK)`; Update `SESSION#<sid>` `SET refreshHash, expiresAt, gen = gen+1` if `attribute_not_exists(revokedAt)` (+ `refreshHash = :oldH`, §4.3); then consistent GetItem `USER#<t>#<u>` / `EPOCH`, answering `ErrSessionRevoked` when a revocation (#83) landed between the read and the commit | main | 2 w + 1 r |
 | 13 | Revoke on logout | `UpdateSession` (RevokedAt set) ← `POST /logout` | UpdateItem `SET revokedAt` if `attribute_not_exists(revokedAt)` | main | 1 w |
-| 14 | Session check | `GetSessionByID` ← `authMiddleware` with `checkOn: allcalls` | GetItem `PK=SESSION#<sid>` | main | 1 r |
-| 15 | List for user | `ListSessionsForUser` ← `GET /sessions`, `GET /admin/api/sessions` | Query GSI1 `GSI1PK=USER#<t>#<u>` AND `begins_with(GSI1SK,'SESSION#')` → BatchGetItem | GSI1 | N r |
+| 14 | Session check | `GetSessionByID` ← `authMiddleware` with `checkOn: allcalls` | GetItem `PK=SESSION#<sid>` → GetItem `USER#<t>#<u>` / `EPOCH` (skipped for a session already revoked; #83) | main | 2 r |
+| 15 | List for user | `ListSessionsForUser` ← `GET /sessions`, `GET /admin/api/sessions` | Query GSI1 `GSI1PK=USER#<t>#<u>` AND `begins_with(GSI1SK,'SESSION#')` → BatchGetItem (+ `USER#<t>#<u>` / `EPOCH`, #83) | GSI1 | N+1 r |
 | 16 | Revoke by id | `RevokeSessionByID` ← `DELETE /sessions/:handle`, `DELETE /admin/api/sessions/:handle` | UpdateItem `SET revokedAt` if `attribute_exists(PK)` | main | 1 w |
 | 17 | Expire | `DeleteExpiredSessions` ← `POST /sessions/cleanup` (public cron route) | **none** — DynamoDB TTL (§4.5) | — | 0 |
 | 18 | Replay response | rotated-out refresh presented at `POST /refresh` | detected in #11; UpdateItem `SESSION#<sid>` `SET revokedAt, revokedReason='refresh_replay'` | main | 1 w |
+| 83 | Revoke every session of an account (core v0.16.0) | `RevokeSessionsForUser` (`auth.UserSessionRevoker`) ← `POST /reset-password` under `sessions.revokeOnPasswordReset` | UpdateItem `USER#<t>#<u>` / `EPOCH` `ADD epoch 1 SET revokedAt, revokedReason='password_reset'`, unconditional; every read in #11, #12, #14, #15 and `GetAllSessions` reports a session whose `epoch` stamp is below the account's as revoked | main | 1 w |
 
 ### 1.3 Single-use email/SMS token families
 
@@ -275,6 +276,7 @@ The sketch proposed GSI1 for email/phone, GSI2 for tenant scan, GSI3 for `provid
 | Entity | PK | SK | GSI1PK | GSI1SK | TTL |
 |---|---|---|---|---|---|
 | User profile | `USER#<t>#<u>` | `PROFILE` | `USER` | `<t>#<u>` | no |
+| Session epoch (core v0.16.0) | `USER#<t>#<u>` | `EPOCH` | — | — | no |
 | Email uniqueness | `EMAIL#<t>#<normalizedEmail>` | `EMAIL` | — | — | no |
 | Metadata entry | `USERMETA#<u>` | `META#<key>` | — | — | no |
 | Role assignment | `USER#<t>#<u>` | `ROLE#<role>` | `ROLE#<role>` | `USER#<t>#<u>` | no |
@@ -301,7 +303,7 @@ The sketch proposed GSI1 for email/phone, GSI2 for tenant scan, GSI3 for `provid
 | Rate-limit counter | `RL#<scope>#<subject>#<window>` | `RL` | — | — | yes |
 | Webhook delivery ledger (D9b) | `IDEM#webhook#<deliveryId>` | `IDEM` | — | — | yes |
 
-**Item-collection discipline.** Only two child types live under `USER#<t>#<u>`: `PROFILE` and `ROLE#*`. Their ASCII order is `PROFILE < ROLE#`, both have bounded cardinality, and an unconditioned `Query` on the user partition is therefore always safe. Metadata used to be the third and could not stay — `UserMetadataStore` carries no tenant id, so nothing can address `META#` under a tenant-scoped partition (§1.4, corrected) — so the `/me` bundle (#4) is now that Query plus one on `USERMETA#<u>`, two round trips rather than one. Sessions, API keys and linked accounts are deliberately **not** in this collection: they are unbounded, and putting them there would turn the hottest read in the system into a paginated scan of the user's history. Any future child type must be named so it sorts inside `[META#, ROLE~]` if it belongs to the bundle, and outside if it does not.
+**Item-collection discipline.** Only three child types live under `USER#<t>#<u>`: `EPOCH` (one item, the account's session epoch, #83), `PROFILE` and `ROLE#*`. Their ASCII order is `EPOCH < PROFILE < ROLE#`, all have bounded cardinality, and an unconditioned `Query` on the user partition is therefore always safe. Metadata used to be the third and could not stay — `UserMetadataStore` carries no tenant id, so nothing can address `META#` under a tenant-scoped partition (§1.4, corrected) — so the `/me` bundle (#4) is now that Query plus one on `USERMETA#<u>`, two round trips rather than one. Sessions, API keys and linked accounts are deliberately **not** in this collection: they are unbounded, and putting them there would turn the hottest read in the system into a paginated scan of the user's history. Any future child type must be named so it sorts inside `[META#, ROLE~]` if it belongs to the bundle, and outside if it does not.
 
 ### 2.3 Where the sketch is changed or rejected
 
