@@ -57,6 +57,21 @@ type StoreCapabilities struct {
 	// store layer, and a rule written as `driver != "dynamodb"` would have to be
 	// found and edited the day a second driver grows the marker.
 	MigrationMarker bool
+
+	// RevokeUserSessions reports whether the driver's session store can end
+	// every session of an account at once, including the ones its listing
+	// would miss — the contract of the core's UserSessionRevoker: every
+	// session whose creation had returned when the call began.
+	// sessions.revokeOnPasswordReset needs it (checkSessionRevocation).
+	//
+	// A capability for the reason MigrationMarker is one. A store whose
+	// listing is complete and consistent has it without the interface — the
+	// core's MemorySessionStore, whose listing the core revokes one by one —
+	// and a store whose listing is capped, or read from an eventually
+	// consistent index, has it only once it implements the interface: the
+	// listing path would fail every reset of an account over the cap with
+	// nothing revoked, and could miss a session opened just before the reset.
+	RevokeUserSessions bool
 }
 
 // builtinCapabilities is the P1 capability table. It is a var, not a const map,
@@ -69,9 +84,15 @@ var builtinCapabilities = map[string]StoreCapabilities{
 	// store is per execution environment, so an imported row written by
 	// cmd/migrate would simply not be there, and the postgres driver is a
 	// declared driver with no implementation behind it.
+	//
+	// The DynamoDB driver lists an account's sessions from GSI1, which is
+	// eventually consistent, and refuses past its MaxSessionsPerUser (1000 by
+	// default), so it cannot revoke on a password reset until its store
+	// implements auth.UserSessionRevoker. The memory driver's session store is the core's
+	// MemorySessionStore, whose listing is complete.
 	StoreDriverDynamoDB: {ListUsers: true, MigrationMarker: true},
 	StoreDriverPostgres: {ListUsers: true},
-	StoreDriverMemory:   {ListUsers: true},
+	StoreDriverMemory:   {ListUsers: true, RevokeUserSessions: true},
 }
 
 // ParseJSON decodes a JSON configuration document.
@@ -453,6 +474,17 @@ func derive(cfg *Config) {
 	if cfg.HTTP.OriginVerify.Header == "" {
 		cfg.HTTP.OriginVerify.Header = DefaultOriginVerifyHeader
 	}
+
+	// An email.languages entry is handed to the sender exactly as written
+	// whenever a request's emailLang matches it, so a stray space from a
+	// hand-edited document must not become part of the language a receiver is
+	// told to render — nor make the core refuse to start, which it would: a
+	// space is not part of a language tag. The variable's entries arrive
+	// trimmed already (envList). Case is left alone, for the same reason the
+	// core leaves it: the entry as configured is what reaches the sender.
+	for i, lang := range cfg.Email.Languages {
+		cfg.Email.Languages[i] = strings.TrimSpace(lang)
+	}
 }
 
 // collectWarnings records the deploy-time warnings the spec asks for: things an
@@ -560,7 +592,55 @@ func collectWarnings(cfg *Config) {
 			"setting a cookie domain forfeits the __Host- prefix, so cookies fall back to __Secure-",
 			"leave cookies.domain unset unless subdomains genuinely need to share the session")
 	}
+	collectForgotPasswordWarnings(cfg)
 	collectRealmWarnings(cfg)
+}
+
+// collectForgotPasswordWarnings says what security.forgotPassword.minResponseMs
+// costs and how much of the difference it hides. Neither is refused: the cost
+// is the price of the floor and the coverage is the operator's to size, and
+// both depend on things the loader cannot see — the traffic, the function's
+// Timeout, what sits in front of the route.
+func collectForgotPasswordWarnings(cfg *Config) {
+	floor := cfg.Security.ForgotPassword.MinResponseMs
+	if floor <= 0 {
+		return
+	}
+	const path = "security.forgotPassword.minResponseMs"
+
+	// What it costs, whenever it is on: the same sentence the enrolment
+	// warning makes about trust, made here about money and capacity.
+	cfg.warn(path,
+		fmt.Sprintf("every POST <prefix>/forgot-password is held at least %d ms inside its Lambda invocation, which bills the time and keeps an execution environment for it: "+
+			"the route needs its request rate times the floor in concurrency, and the rateLimit budget does not bound that -- it counts per address, and a caller naming a new address each time is held every time",
+			floor),
+		"put a per-client limit in front of the route (a WAF rate-based rule) or a ceiling on the function (ReservedConcurrentExecutions), "+
+			"and keep the floor well below the function's Timeout and DurationAlarmThresholdMs; the core ends the hold 100 ms before the invocation's deadline")
+
+	// How much of the difference it hides: the slow branch is the lookup, the
+	// delivery and the token write, and the delivery is what a floor has to
+	// outlast. The webhook has a deadline of its own; SES does not.
+	switch {
+	case cfg.DeliveryWebhookConfigured():
+		timeout := cfg.Email.DeliveryWebhook.TimeoutMs
+		if floor >= timeout+forgotPasswordFloorAllowanceMs {
+			return
+		}
+		remedy := fmt.Sprintf("raise the floor to at least %d ms", timeout+forgotPasswordFloorAllowanceMs)
+		if lower := floor - forgotPasswordFloorAllowanceMs; lower > 0 {
+			remedy += fmt.Sprintf(", or lower email.deliveryWebhook.timeoutMs to at most %d ms", lower)
+		}
+		cfg.warn(path,
+			fmt.Sprintf("the floor of %d ms is below email.deliveryWebhook.timeoutMs (%d ms) plus about %d ms for the account lookup and the token write, "+
+				"so a delivery that runs toward its timeout is answered later than an unknown address is, and the time tells the two apart again",
+				floor, timeout, forgotPasswordFloorAllowanceMs),
+			remedy+"; the floor hides the difference only above the slow branch's worst case")
+	case cfg.MailerConfigured():
+		cfg.warn(path,
+			"the reset mail goes out through Amazon SES, whose call has no deadline of its own here, only the invocation's: "+
+				"a send that takes longer than the floor -- a slow SES answer, a retried request -- is answered later than an unknown address is, and the time shows it",
+			"keep the floor comfortably above the SES latency this deployment sees, or deliver through email.deliveryWebhook, whose timeoutMs bounds the send and which the floor can then be sized against")
+	}
 }
 
 // collectRealmWarnings says what the realm knobs do where they meet a surface
@@ -632,6 +712,18 @@ func collectRealmWarnings(cfg *Config) {
 			"forced enrolment is trust on first use: when "+scope+" has no factor yet, whoever presents its password binds a factor of their choosing and gets a full session, "+
 				"and the owner's next login is a challenge they cannot answer -- "+enough,
 			"keep it only where the first sign-in with the password is the owner's by construction, and reset the password together with the factor; enrol out of band and leave it off otherwise")
+
+		// The enrolment window, longer than the core's default. A shorter one
+		// narrows every exposure below and says nothing; a longer one widens
+		// it for every token minted, and that is what the operator has to hear.
+		if ttl := cfg.TwoFactor.EnrolmentTokenTTLMinutes; ttl > DefaultEnrolmentTokenTTLMinutes {
+			cfg.warn("twoFactor.enrolmentTokenTtlMinutes",
+				fmt.Sprintf("the enrolment token lives %d minutes rather than the default %d, and the window is the same for whoever holds a copy of the token: "+
+					"for an account with no factor the token alone completes the enrolment and opens a session, and a copy that calls POST <prefix>/2fa/setup before the owner enrols with that token "+
+					"learns the secret of the factor the owner then enrols, and keeps it after the token has expired",
+					ttl, DefaultEnrolmentTokenTTLMinutes),
+				"keep it as short as an invitee needs to install an authenticator app; treat a leaked enrolment token as a leaked factor -- change the password, then enrol a new factor in its place")
+		}
 	}
 
 	// twoFactor.required beside a credential transport. Under the policy a

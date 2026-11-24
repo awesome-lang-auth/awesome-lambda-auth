@@ -161,6 +161,10 @@ func envBindings() []envBinding {
 		envInt("AWESOME_AUTH_TOKENS_EMAIL_CHANGE_TTL_MINUTES", "tokens.emailChangeTtlMinutes", func(c *Config, v int) { c.Tokens.EmailChangeTTLMinutes = v }),
 		envInt("AWESOME_AUTH_TOKENS_ACCOUNT_LINK_TTL_MINUTES", "tokens.accountLinkTtlMinutes", func(c *Config, v int) { c.Tokens.AccountLinkTTLMinutes = v }),
 		envInt("AWESOME_AUTH_TOKENS_MAGIC_LINK_TTL_MINUTES", "tokens.magicLinkTtlMinutes", func(c *Config, v int) { c.Tokens.MagicLinkTTLMinutes = v }),
+		// security.forgotPassword.* is product-only (config.go, ForgotPassword),
+		// so the name is invented to the AWESOME_AUTH_ + upper-snaked-path
+		// convention the §1.19 seeds use.
+		envInt("AWESOME_AUTH_SECURITY_FORGOT_PASSWORD_MIN_RESPONSE_MS", "security.forgotPassword.minResponseMs", func(c *Config, v int) { c.Security.ForgotPassword.MinResponseMs = v }),
 
 		// §1.2 cookies
 		envBool("AWESOME_AUTH_COOKIES_SECURE", "cookies.secure", func(c *Config, v bool) { c.Cookies.Secure = v }),
@@ -175,6 +179,8 @@ func envBindings() []envBinding {
 
 		// §1.4 sessions
 		envString("AWESOME_AUTH_SESSIONS_CHECK_ON", "sessions.checkOn", func(c *Config, v string) { c.Sessions.CheckOn = v }),
+		// [new], named after its block as AWESOME_AUTH_SESSIONS_CHECK_ON is.
+		envBool("AWESOME_AUTH_SESSIONS_REVOKE_ON_PASSWORD_RESET", "sessions.revokeOnPasswordReset", func(c *Config, v bool) { c.Sessions.RevokeOnPasswordReset = v }),
 
 		// registration.* is product-only (config.go, Registration), so the name is
 		// invented to the AWESOME_AUTH_ + upper-snaked-path convention the §1.19
@@ -197,6 +203,9 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_EMAIL_VERIFICATION_MODE", "email.verification.mode", func(c *Config, v string) { c.Email.Verification.Mode = v }),
 		envString("AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL", "email.deliveryWebhook.url", func(c *Config, v string) { c.Email.DeliveryWebhook.URL = v }),
 		envInt("AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS", "email.deliveryWebhook.timeoutMs", func(c *Config, v int) { c.Email.DeliveryWebhook.TimeoutMs = v }),
+		// [new], to the upper-snaked-path convention. Comma separated like every
+		// list here: AWESOME_AUTH_EMAIL_LANGUAGES=it,en.
+		envList("AWESOME_AUTH_EMAIL_LANGUAGES", "email.languages", func(c *Config, v []string) { c.Email.Languages = v }),
 
 		// §1.6 SMS
 		envString("AWESOME_AUTH_SMS_ENDPOINT", "sms.endpoint", func(c *Config, v string) { c.SMS.Endpoint = v }),
@@ -221,6 +230,7 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_2FA_APP_NAME", "twoFactor.appName", func(c *Config, v string) { c.TwoFactor.AppName = v }),
 		envBool("AWESOME_AUTH_2FA_REQUIRED", "twoFactor.required", func(c *Config, v bool) { c.TwoFactor.Required = v }),
 		envBool("AWESOME_AUTH_2FA_ENROL_ON_LOGIN", "twoFactor.enrolOnLogin", func(c *Config, v bool) { c.TwoFactor.EnrolOnLogin = v }),
+		envInt("AWESOME_AUTH_2FA_ENROLMENT_TOKEN_TTL_MINUTES", "twoFactor.enrolmentTokenTtlMinutes", func(c *Config, v int) { c.TwoFactor.EnrolmentTokenTTLMinutes = v }),
 		envInt("AWESOME_AUTH_2FA_LOCKOUT_MAX_FAILURES", "twoFactor.lockout.maxFailures", func(c *Config, v int) { c.TwoFactor.Lockout.MaxFailures = v }),
 		envInt("AWESOME_AUTH_2FA_LOCKOUT_WINDOW_SECONDS", "twoFactor.lockout.windowSeconds", func(c *Config, v int) { c.TwoFactor.Lockout.WindowSeconds = v }),
 

@@ -539,7 +539,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()),
 		slog.Bool("registrationClosed", cfg.Registration.Closed),
 		slog.Bool("twoFactorRequired", cfg.TwoFactor.Required),
-		slog.Bool("twoFactorEnrolOnLogin", cfg.TwoFactor.EnrolOnLogin))
+		slog.Bool("twoFactorEnrolOnLogin", cfg.TwoFactor.EnrolOnLogin),
+		slog.Int("twoFactorEnrolmentTokenTtlMinutes", enrolmentTokenMinutes(cfg)),
+		slog.Bool("sessionsRevokeOnPasswordReset", cfg.Sessions.RevokeOnPasswordReset))
 
 	return app, nil
 }
@@ -792,6 +794,13 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 		// disagree about a value that loaded.
 		auth.WithBcryptCost(cfg.Security.Password.BcryptSaltRounds),
 		auth.WithSessionCheckOn(cfg.Sessions.CheckOn),
+		// sessions.revokeOnPasswordReset (core v0.16.0), passed as written:
+		// false is the core's default. The loader refuses it on a driver whose
+		// session store cannot end every session of an account at once
+		// (checkSessionRevocation), and the core refuses it on a store that can
+		// neither revoke in one call nor list (NewService) — so a deployment
+		// that loaded and built has a store the option is sound on.
+		auth.WithRevokeSessionsOnPasswordReset(cfg.Sessions.RevokeOnPasswordReset),
 		auth.WithUserStore(users),
 		auth.WithSessionStore(sessions),
 		// The core logs through a printf callback; funnelling it into slog keeps
@@ -1463,6 +1472,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 		})
 	}
 
+	gaps = append(gaps, resourceServerCredentialKnobGaps(cfg)...)
 	gaps = append(gaps, deliveryKnobGaps(cfg)...)
 	gaps = append(gaps, oauthKnobGaps(cfg)...)
 	gaps = append(gaps, idpKnobGaps(cfg)...)
@@ -1473,6 +1483,44 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, scriptRunnerKnobGaps(cfg)...) // D9d
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
+	return gaps
+}
+
+// resourceServerCredentialKnobGaps reports the credential knobs of core
+// v0.16.0 that a resource server reaches nothing with. Resource-server mode
+// unmounts the routes they shape (auth.ResourceServerGatedRoutes):
+// /forgot-password for the floor, /reset-password for the revocation, and the
+// login and /2fa enrolment routes for the enrolment window, whose other
+// minting route, /invitations/accept, the loader refuses in this mode. They
+// are reported rather than refused, for the reason the refresh secret above
+// is: the same document configures the issuing deployment, where they act.
+//
+// email.languages is not among them: /link-request stays mounted on a
+// resource server and its mail carries the request's emailLang, which the
+// list bounds there too.
+func resourceServerCredentialKnobGaps(cfg *config.Config) []knobGap {
+	if !cfg.ResourceServer.Enabled {
+		return nil
+	}
+	const remedy = "leave it unset on a resource server; it takes effect in the deployment that issues the credentials"
+	var gaps []knobGap
+	for _, row := range []struct {
+		path, routes string
+		set          bool
+	}{
+		{"security.forgotPassword.minResponseMs", "POST <prefix>/forgot-password", cfg.Security.ForgotPassword.MinResponseMs != 0},
+		{"sessions.revokeOnPasswordReset", "POST <prefix>/reset-password", cfg.Sessions.RevokeOnPasswordReset},
+		{"twoFactor.enrolmentTokenTtlMinutes", "POST <prefix>/login, /2fa/setup or /2fa/verify-setup", cfg.TwoFactor.EnrolmentTokenTTLMinutes != 0},
+	} {
+		if !row.set {
+			continue
+		}
+		gaps = append(gaps, knobGap{
+			Path:    row.path,
+			Problem: "resource-server mode mounts no credential route, " + row.routes + " among them, so this knob reaches nothing in this deployment",
+			Remedy:  remedy,
+		})
+	}
 	return gaps
 }
 
