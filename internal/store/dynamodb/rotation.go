@@ -35,6 +35,12 @@ type rotationPrecondition struct {
 	oldHash string
 	gen     int64
 	hasGen  bool
+
+	// epoch is the session's stamp as the read found it, for the check
+	// rotate makes against the account's session epoch once it has committed
+	// (session_epoch.go). Without it the check reads the stamp itself.
+	epoch    int64
+	hasEpoch bool
 }
 
 type rotationScopeKey struct{}

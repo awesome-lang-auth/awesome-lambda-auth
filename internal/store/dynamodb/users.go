@@ -142,7 +142,8 @@ var reservedMetadataKeys = []struct{ key, attr string }{
 }
 
 // maxUserCollectionItems caps the unconditioned Query over USER#<t>#<u>. The
-// collection is bounded by design — only PROFILE and ROLE# live there, metadata
+// collection is bounded by design — only PROFILE, ROLE# and the one EPOCH item
+// of the account's session epoch (session_epoch.go) live there, metadata
 // having moved to its own partition because UserMetadataStore carries no tenant
 // (§1.4, corrected) — so this is a tripwire for a future child type that broke
 // that rule, not a paging limit anyone should hit.
@@ -606,8 +607,11 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 		return err
 	}
 
-	// The user collection holds only META#, PROFILE and ROLE# — all bounded —
-	// so an unconditioned Query on the partition is safe (§2.2).
+	// The user collection holds only PROFILE, ROLE# and the session epoch's
+	// EPOCH item — all bounded — so an unconditioned Query on the partition is
+	// safe (§2.2). Everything but the profile goes in the batch below, the
+	// epoch included: the account's sessions go with it, and an id is never
+	// reused.
 	collection, err := s.queryAll(ctx, &awsddb.QueryInput{
 		TableName:                 aws.String(s.table),
 		KeyConditionExpression:    aws.String("#PK = :pk"),

@@ -87,10 +87,12 @@ var builtinCapabilities = map[string]StoreCapabilities{
 	//
 	// The DynamoDB driver lists an account's sessions from GSI1, which is
 	// eventually consistent, and refuses past its MaxSessionsPerUser (1000 by
-	// default), so it cannot revoke on a password reset until its store
-	// implements auth.UserSessionRevoker. The memory driver's session store is the core's
-	// MemorySessionStore, whose listing is complete.
-	StoreDriverDynamoDB: {ListUsers: true, MigrationMarker: true},
+	// default) — so it revokes on a password reset through
+	// auth.UserSessionRevoker instead: one raise of the account's session
+	// epoch, honoured wherever a session is read
+	// (internal/store/dynamodb/session_epoch.go). The memory driver's session
+	// store is the core's MemorySessionStore, whose listing is complete.
+	StoreDriverDynamoDB: {ListUsers: true, MigrationMarker: true, RevokeUserSessions: true},
 	StoreDriverPostgres: {ListUsers: true},
 	StoreDriverMemory:   {ListUsers: true, RevokeUserSessions: true},
 }

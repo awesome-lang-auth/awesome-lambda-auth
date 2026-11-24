@@ -329,12 +329,13 @@ func TestRevokeOnPasswordResetNeedsTheCapability(t *testing.T) {
 
 // TestBuiltinSessionRevocationCapabilities pins the built-in table: the memory
 // driver's store is the core's, whose listing the core revokes from; the
+// DynamoDB store implements auth.UserSessionRevoker (its session epoch); the
 // postgres driver has no implementation at all.
 func TestBuiltinSessionRevocationCapabilities(t *testing.T) {
 	want := map[string]bool{
 		StoreDriverMemory:   true,
 		StoreDriverPostgres: false,
-		StoreDriverDynamoDB: false,
+		StoreDriverDynamoDB: true,
 	}
 	for driver, capable := range want {
 		if got := builtinCapabilities[driver].RevokeUserSessions; got != capable {

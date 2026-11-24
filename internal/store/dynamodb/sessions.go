@@ -41,7 +41,11 @@ const firstGen int64 = 1
 // attached (userAgent, ipAddress, lastActiveAt) has no home on auth.Session, so
 // rotation must never PutItem over a session — see rotate, which uses UpdateItem
 // with an explicit attribute list precisely so those extras survive (§5).
-func (s *Store) sessionItem(sess auth.Session, gen int64) item {
+//
+// epoch is the account's session epoch as CreateSession read it: the stamp a
+// later RevokeSessionsForUser ends the session by (session_epoch.go). Neither
+// rotation nor revocation touches it.
+func (s *Store) sessionItem(sess auth.Session, gen, epoch int64) item {
 	createdAt := formatTime(sess.CreatedAt)
 	it := item{}.
 		sAlways(attrPK, sessionPK(sess.ID)).
@@ -52,6 +56,7 @@ func (s *Store) sessionItem(sess auth.Session, gen int64) item {
 		sAlways(attrTenantID, sess.TenantID).
 		sAlways(attrRefreshHash, sess.RefreshTokenHash).
 		n(attrGen, gen).
+		n(attrEpoch, epoch).
 		sAlways(attrCreatedAt, createdAt).
 		sAlways(attrExpiresAt, formatTime(sess.ExpiresAt)).
 		sAlways(attrGSI1PK, userPK(sess.TenantID, sess.UserID)).
@@ -180,16 +185,29 @@ var (
 // CreateSession writes the session and its first refresh pointer in one
 // transaction (data-model.md #10), so a session can never exist without a way to
 // resolve it from the token that was already handed to the client.
+//
+// The account's session epoch is read first, consistently, and stamped on the
+// session (session_epoch.go). Read before the write and not with it, which is
+// the read-then-write this store otherwise avoids, and deliberately: what the
+// read can race is a revocation, and losing that race stamps the session below
+// the new epoch — the session is revoked with the ones before it, which is the
+// over-revocation the contract allows and never the reverse. A read that fails
+// fails the create, since a session with no trustworthy stamp is one the next
+// reset might not end.
 func (s *Store) CreateSession(ctx context.Context, sess auth.Session) (auth.Session, error) {
 	if err := s.checkSession(sess); err != nil {
 		return auth.Session{}, err
 	}
-	err := s.transactWrite(ctx, &awsddb.TransactWriteItemsInput{
+	epoch, err := s.readSessionEpoch(ctx, sess.TenantID, sess.UserID)
+	if err != nil {
+		return auth.Session{}, err
+	}
+	err = s.transactWrite(ctx, &awsddb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
 			// Unconditional, matching MemorySessionStore.CreateSession
 			// (memory_store.go:414-420). Session ids are 128 bits of randomness,
 			// so an overwrite is not a case that arises.
-			{Put: &types.Put{TableName: aws.String(s.table), Item: s.sessionItem(sess, firstGen)}},
+			{Put: &types.Put{TableName: aws.String(s.table), Item: s.sessionItem(sess, firstGen, epoch.epoch)}},
 			// The directory entry, in the same transaction and unconditional for
 			// the same reason: a session that existed without one would be
 			// invisible to GetAllSessions for its whole life, and there is no
@@ -238,6 +256,11 @@ func (s *Store) CreateSession(ctx context.Context, sess auth.Session) (auth.Sess
 // ErrSessionNotFound (service.go:129-131) and would therefore swallow
 // ErrSessionRevoked; returning the populated struct is what puts the right status
 // on the wire.
+//
+// That includes a session the account's epoch has ended (session_epoch.go),
+// which is decided before the replay check: the pointer names the account, so
+// the session and the epoch are read in one consistent BatchGetItem — one item
+// more than the GetItem it replaces, and no round trip more.
 func (s *Store) GetSessionByRefreshTokenHash(ctx context.Context, tokenHash string) (auth.Session, error) {
 	if err := checkHash("refresh token hash", tokenHash); err != nil {
 		return auth.Session{}, auth.ErrSessionNotFound
@@ -258,7 +281,8 @@ func (s *Store) GetSessionByRefreshTokenHash(ctx context.Context, tokenHash stri
 	}
 	pointerGen := getN(ptr.Item, attrGen)
 
-	current, err := s.getSessionItem(ctx, getS(ptr.Item, attrSessionID))
+	current, epoch, err := s.sessionWithEpoch(ctx, getS(ptr.Item, attrSessionID),
+		getS(ptr.Item, attrTenantID), getS(ptr.Item, attrUserID))
 	if err != nil {
 		return auth.Session{}, err
 	}
@@ -266,6 +290,7 @@ func (s *Store) GetSessionByRefreshTokenHash(ctx context.Context, tokenHash stri
 	if err != nil {
 		return auth.Session{}, err
 	}
+	epoch.honour(&sess, current)
 	if sess.RevokedAt != nil {
 		return sess, nil
 	}
@@ -280,17 +305,61 @@ func (s *Store) GetSessionByRefreshTokenHash(ctx context.Context, tokenHash stri
 	// to pass it to. See rotation.go.
 	if scope := rotationScopeFrom(ctx); scope != nil {
 		scope.record(sess.ID, rotationPrecondition{
-			oldHash: tokenHash,
-			gen:     getN(current, attrGen),
-			hasGen:  true,
+			oldHash:  tokenHash,
+			gen:      getN(current, attrGen),
+			hasGen:   true,
+			epoch:    getN(current, attrEpoch),
+			hasEpoch: true,
 		})
 	}
 	return sess, nil
 }
 
+// sessionWithEpoch reads a session item and its account's session epoch in one
+// consistent BatchGetItem, the account named by the caller — the refresh
+// pointer carries it. A session item whose owner is not the account named is
+// not one this store wrote; its own account's epoch is read for it then, so a
+// mismatch cannot honour the wrong marker.
+func (s *Store) sessionWithEpoch(ctx context.Context, sessionID, tenantID, userID string) (map[string]types.AttributeValue, sessionEpoch, error) {
+	items, err := s.batchGet(ctx, []map[string]types.AttributeValue{
+		key(sessionPK(sessionID), skSession),
+		sessionEpochKey(tenantID, userID),
+	})
+	if err != nil {
+		return nil, sessionEpoch{}, wrap("get session", err)
+	}
+	var (
+		current   map[string]types.AttributeValue
+		epochItem map[string]types.AttributeValue
+	)
+	for _, m := range items {
+		switch getS(m, attrSK) {
+		case skSession:
+			current = m
+		case skSessionEpoch:
+			epochItem = m
+		}
+	}
+	if current == nil {
+		return nil, sessionEpoch{}, auth.ErrSessionNotFound
+	}
+	if getS(current, attrTenantID) != tenantID || getS(current, attrUserID) != userID {
+		e, err := s.readSessionEpoch(ctx, getS(current, attrTenantID), getS(current, attrUserID))
+		return current, e, err
+	}
+	e, err := epochFromItem(epochItem)
+	return current, e, err
+}
+
 // GetSessionByID implements SessionLookupStore. An expired-but-not-yet-reaped
 // item is returned as-is: TTL is best effort, and the core owns the expiry
 // decision (service.go:136).
+//
+// A session the account's epoch has ended is reported revoked (session_epoch.go):
+// this is the read sessions.checkOn: allcalls makes on every request, so it is
+// what refuses an access token at once after a revoking reset. The epoch is a
+// second GetItem, after the session's, since only the session names the
+// account; a session already revoked skips it.
 func (s *Store) GetSessionByID(ctx context.Context, sessionID string) (auth.Session, error) {
 	if err := checkID("session id", sessionID); err != nil {
 		return auth.Session{}, auth.ErrSessionNotFound
@@ -299,7 +368,16 @@ func (s *Store) GetSessionByID(ctx context.Context, sessionID string) (auth.Sess
 	if err != nil {
 		return auth.Session{}, err
 	}
-	return sessionFromItem(m)
+	sess, err := sessionFromItem(m)
+	if err != nil || sess.RevokedAt != nil {
+		return sess, err
+	}
+	epoch, err := s.readSessionEpoch(ctx, sess.TenantID, sess.UserID)
+	if err != nil {
+		return auth.Session{}, err
+	}
+	epoch.honour(&sess, m)
+	return sess, nil
 }
 
 func (s *Store) getSessionItem(ctx context.Context, sessionID string) (map[string]types.AttributeValue, error) {
@@ -376,6 +454,13 @@ func rotationPreFor(ctx context.Context, sessionID string) (rotationPrecondition
 // attribute_not_exists(revokedAt), both callers succeed, and the loser's token
 // becomes a stale generation that the next use will catch. That is the residual
 // documented in §4.3.3, and it is why WithRotationScope exists.
+//
+// A committed rotation is then checked against the account's session epoch
+// (rotationOutlivedARevocation): a refresh that read the session before a
+// revoking reset and rotated it after is answered ErrSessionRevoked, as one
+// that lost to a revocation by id is. The transaction cannot check the epoch
+// itself — that would be a ConditionCheck on a second item, an action the
+// function's role does not grant — so it is one GetItem after the commit.
 func (s *Store) rotate(ctx context.Context, sess auth.Session, pre rotationPrecondition, havePre bool) error {
 	cond := "attribute_exists(#PK) AND attribute_not_exists(#revokedAt)"
 	names := map[string]string{
@@ -427,7 +512,7 @@ func (s *Store) rotate(ctx context.Context, sess auth.Session, pre rotationPreco
 		},
 	})
 	if err == nil {
-		return nil
+		return s.rotationOutlivedARevocation(ctx, sess, pre)
 	}
 	reasons, cancelled := txConditionFailures(err)
 	if !cancelled {
@@ -463,6 +548,16 @@ func (s *Store) classifyRotationLoss(ctx context.Context, sessionID string, pre 
 		preImage = out.Item
 	}
 	if getS(preImage, attrRevokedAt) != "" {
+		return auth.ErrSessionRevoked
+	}
+	// A session the account's epoch has ended is revoked too, and is answered
+	// as one: it is not a replay to revoke a family for, and relabelling it
+	// one would bury the reset in the audit trail.
+	epoch, err := s.readSessionEpoch(ctx, getS(preImage, attrTenantID), getS(preImage, attrUserID))
+	if err != nil {
+		return wrap("classify rotation failure", err)
+	}
+	if epoch.ends(getN(preImage, attrEpoch)) {
 		return auth.ErrSessionRevoked
 	}
 	if !havePre {
@@ -546,6 +641,12 @@ func (s *Store) revokeFamily(ctx context.Context, sessionID, reason string, gen 
 //
 // Results come back oldest-first, because GSI1SK embeds the creation timestamp.
 // The reference iterates a map and returns them in no order at all.
+//
+// A session the account's session epoch has ended is listed revoked
+// (session_epoch.go); the epoch item rides in the same BatchGetItem. The core
+// does not revoke from this listing on this store — RevokeSessionsForUser is
+// the reset's path — so the listing is what an account and an administrator
+// see, and it has to agree with what a refresh would answer.
 func (s *Store) ListSessionsForUser(ctx context.Context, userID, tenantID string) ([]auth.Session, error) {
 	keys, err := s.sessionKeysForUser(ctx, userID, tenantID)
 	if err != nil {
@@ -556,16 +657,28 @@ func (s *Store) ListSessionsForUser(ctx context.Context, userID, tenantID string
 	}
 	// GSI1 projects three attributes on purpose — no secret is ever in a second
 	// physical copy (§5) — so the full items come from the main table.
-	items, err := s.batchGet(ctx, keys)
+	items, err := s.batchGet(ctx, append(keys, sessionEpochKey(tenantID, userID)))
 	if err != nil {
 		return nil, wrap("list sessions", err)
 	}
-	out := make([]auth.Session, 0, len(items))
+	var epoch sessionEpoch
+	sessions := make([]map[string]types.AttributeValue, 0, len(items))
 	for _, m := range items {
+		if getS(m, attrSK) == skSessionEpoch {
+			if epoch, err = epochFromItem(m); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		sessions = append(sessions, m)
+	}
+	out := make([]auth.Session, 0, len(sessions))
+	for _, m := range sessions {
 		sess, err := sessionFromItem(m)
 		if err != nil {
 			return nil, err
 		}
+		epoch.honour(&sess, m)
 		out = append(out, sess)
 	}
 	// BatchGetItem does not preserve request order, so the ordering the index
@@ -634,12 +747,19 @@ func (s *Store) GetAllSessions(ctx context.Context, limit, offset int) ([]auth.S
 		}
 		return nil, wrap("list all sessions", err)
 	}
+	// The page spans accounts, so their session epochs are read in one batch
+	// and each session is held to its own account's (session_epoch.go).
+	epochs, err := s.sessionEpochs(ctx, items)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]auth.Session, 0, len(items))
 	for _, m := range items {
 		sess, err := sessionFromItem(m)
 		if err != nil {
 			return nil, err
 		}
+		epochs[userPK(sess.TenantID, sess.UserID)].honour(&sess, m)
 		out = append(out, sess)
 	}
 	return out, nil

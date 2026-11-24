@@ -76,6 +76,12 @@ const (
 	// half of them away, and the two have nothing in common but the key prefix.
 	typeSessionIndex = "sessionidx"
 
+	// typeSessionEpoch is an account's session epoch (session_epoch.go): the
+	// counter auth.UserSessionRevoker raises, in the account's own partition.
+	// Its own type because it is neither a session nor a profile, and a sweep
+	// over either must not have to tell it apart by its sort key.
+	typeSessionEpoch = "sessionepoch"
+
 	// typeAPIKey is the canonical API-key record, keyed by prefix, and
 	// typeAPIKeyID its by-id pointer (data-model.md §1.5 #48).
 	typeAPIKey   = "apikey"
@@ -312,6 +318,13 @@ const (
 
 	skProfile = "PROFILE"
 	skEmail   = "EMAIL"
+
+	// skSessionEpoch is the sort key of an account's session epoch, under
+	// USER#<t>#<u> beside PROFILE and ROLE#. It sorts before META#, outside
+	// the [META#, ROLE~] range the /me bundle owns (data-model.md §3), and
+	// carries no GSI1 attribute, so no listing meets it; DeleteUser's sweep of
+	// the partition takes it with the account.
+	skSessionEpoch = "EPOCH"
 
 	// skSessionIndex is the sort key of the session's directory entry, in the
 	// session's own partition. Chosen to sort *after* skSession ("SIDX" >
