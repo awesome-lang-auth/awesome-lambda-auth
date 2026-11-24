@@ -76,6 +76,17 @@ func (s *Store) AuthCodes() auth.AuthCodeStore { return s }
 // PKCE pair and the scope as data it does not verify yet (store.go, AuthCode),
 // and storing them now is what lets it start verifying them without a schema
 // change.
+//
+// credential is AuthCode.Credential (core v0.16.0): under
+// sessions.revokeOnPasswordReset the core sets it at /authorize to an HMAC,
+// under the access-token secret, of the password hash the login proved, and
+// /token refuses a code whose credential is empty or no longer the account's —
+// which is how a code minted before a revoking reset opens no session after
+// it. A store that dropped it would make every code redeemed under the option
+// fail, so it is kept like the rest. It is a fingerprint and not the hash: it
+// reveals nothing about the password without the secret, and it lives as long
+// as the code does. With the option off the core leaves it empty and the item
+// carries no such attribute.
 const (
 	attrClientID            = "clientId"
 	attrRedirectURI         = "redirectUri"
@@ -83,6 +94,7 @@ const (
 	attrScope               = "scope"
 	attrCodeChallenge       = "codeChallenge"
 	attrCodeChallengeMethod = "codeChallengeMethod"
+	attrCredential          = "credential"
 )
 
 // SaveCode writes one authorization code.
@@ -120,6 +132,7 @@ func (s *Store) SaveCode(ctx context.Context, code auth.AuthCode) error {
 		s(attrScope, code.Scope).
 		s(attrCodeChallenge, code.CodeChallenge).
 		s(attrCodeChallengeMethod, code.CodeChallengeMethod).
+		s(attrCredential, code.Credential).
 		t(attrExpiresAt, code.ExpiresAt).
 		t(attrCreatedAt, s.nowUTC())
 	if !code.ExpiresAt.IsZero() {
@@ -180,6 +193,7 @@ func authCodeFromItem(codeHash string, m map[string]types.AttributeValue) (auth.
 		CodeChallenge:       getS(m, attrCodeChallenge),
 		CodeChallengeMethod: getS(m, attrCodeChallengeMethod),
 		Scope:               getS(m, attrScope),
+		Credential:          getS(m, attrCredential),
 	}
 	var err error
 	if code.ExpiresAt, err = getTime(m, attrExpiresAt); err != nil {
