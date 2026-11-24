@@ -486,11 +486,14 @@ subtag (`IT`, `it-IT` and `it_IT` all select `it`); an unlisted language, a
 value that is not a language tag and one longer than 35 characters are
 dropped, and the sender uses its own default — `email.mailer.defaultLang` for
 the mailer, the receiver's for the delivery webhook. No request is refused for
-its language. The core's own mailers render `it` and `en` and fall back to
-their default for anything else, so a deployment on `email.mailer` loses nothing
-with `["it", "en"]`; one on the delivery webhook lists what its receiver
-renders. The entry reaches the sender exactly as written here, so list it
-in the spelling your templates are keyed by.
+its language. List every language your templates are keyed by: the
+`translations` of the templates seeded from `email.templatesDir` (§5.3) or
+edited in the template store, and on the delivery webhook whatever its receiver
+renders. A language your templates carry that the list leaves out is reduced to
+the sender's default as soon as the list is set. With only the built-in `it`
+and `en` templates, which fall back to their default for anything else,
+`["it", "en"]` loses nothing. The entry reaches the sender exactly as written
+here, so list it in the spelling your templates are keyed by.
 
 ```json
 {"email": {"languages": ["it", "en"]}}
@@ -930,7 +933,8 @@ a factor but not spent, so a factor removed before `exp` without a password
 change brings the token back (reset the password together with the factor, as
 §7.2 says). Keep the window as short as your invitees need. The loader warns at
 every start while it is above five minutes, and says nothing for a shorter one,
-which only narrows the exposure.
+which only narrows the exposure, nor on a resource server, which reports the
+key as unwired.
 
 ## 8. `oauth.*`, knob by knob
 
@@ -4107,7 +4111,8 @@ accepts.
 Two options of `awesome-go-auth` `v0.16.0`, both off by default, which is how
 every earlier release answered. Neither has a SAM parameter: set them in the
 `ConfigFile`, or through the variable. A resource server mounts neither route,
-so the cold start reports either key there as unwired.
+so the cold start reports either key there as unwired, and the loader's
+warnings about them below stay silent there.
 
 ### 22.1 `security.forgotPassword.minResponseMs` — one answer time for every address
 
@@ -4181,7 +4186,18 @@ alive, as the reference does. On, once the new password is stored:
   opens its session after the reset gives the session up;
 - what it does not end: a step-up `tempToken` minted before the reset (five
   minutes), and an ordinary access token on the console, which reads no session
-  (§16.2).
+  (§16.2). Nor, under a Cognito migration with `stores.migration.clientId` set
+  (§13), a login whose own migration write lands after the reset: that write
+  restores the old password and the login keeps its session, with or without
+  the option; the person resets again.
+
+**Under `sessions.checkOn` `refresh` or `none` an access token outlives the
+reset.** The revocation ends the refresh tokens at once, but those postures read
+no session on a protected request, so an access token issued before the reset
+works until it expires (`security.jwt.accessTokenTtl`, 15 minutes by default).
+The loader warns at every start while the key is on under either posture. If
+the window matters, set `sessions.checkOn: allcalls`, or shorten the
+access-token lifetime to the window you accept.
 
 Turning it on refuses, once, an authorization code not yet redeemed and a store
 account's console token minted before it: they carry nothing to check, and the
@@ -4212,6 +4228,14 @@ reset had ended back to life: one consistent read more per session created, one
 item more in the read every refresh already makes, one read after each
 rotation, and one per lookup by id — every protected request under
 `checkOn: allcalls`. `docs/cost-model.md` prices it.
+
+A refresh that read its session before the reset and rotates it after is
+refused too, by a read of the epoch once the rotation has committed. If that one
+read fails (a throttled or failed `GetItem`), the store logs a warning and lets
+the rotation stand rather than throw away tokens already minted: the new refresh
+token is refused at its first use, and the new access token lives as any other
+issued before the reset does — refused at once under `allcalls`, until it
+expires otherwise.
 
 Two things to know before relying on it. Ended sessions keep their index
 entries until they expire, so an account over `MaxSessionsPerUser` is still
